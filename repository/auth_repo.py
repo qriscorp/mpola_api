@@ -1,21 +1,12 @@
-"""
-Authentication repository — FINTECH-GRADE SECURITY
-───────────────────────────────────────────────────
-Security measures:
-  • Passwords: bcrypt (12 rounds) with min-strength validation
-  • OTP: secrets module (CSPRNG), bcrypt-hashed in DB, 10-min expiry, max 5 attempts
-  • JWT: 15-min access tokens with jti+iss, 7-day refresh tokens, rotation on use
-  • Login: account lockout after 5 failed attempts (15 min window)
-  • Role escalation: blocked at registration (only borrower/lender allowed)
-  • Audit: all sensitive actions logged to audit_logs table
-  • No OTP codes in logs (only debug level for dev)
-"""
-
 import json
 import re
 import secrets
+import smtplib
+import ssl
 import threading
 from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import bcrypt
 import jwt
@@ -23,7 +14,9 @@ from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from config import JWT_SECRET, EGOSMS_USERNAME, EGOSMS_APIKEY
+from comms_sdk import CommsSDK
+
+from config import JWT_SECRET, EGOSMS_USERNAME, EGOSMS_APIKEY, SMTP_USERNAME, SMTP_PASSWORD, SMTP_SERVER, SMTP_PORT
 from database.tables import User, OTP, LoginAttempt, AuditLog
 from helpers import generateUniqueId, normalizePhoneNumber
 from logging_module import logger
@@ -147,40 +140,100 @@ def _audit(db: Session, action: str, username: str | None = None, user_id: str |
             details=json.dumps(details) if details else None,
         )
         db.add(entry)
-        db.flush()  # Don't commit — let the caller's transaction handle it
+        # Don't flush here: flushing can trigger unrelated pending writes and
+        # poison the active transaction if one of them fails.
     except Exception as e:
         logger.error(f"Audit log write failed: {e}")
 
 
 # ═══════════════════════════════════════════════
-#  SMS VIA EGOSMS
+#  EMAIL VIA SMTP
 # ═══════════════════════════════════════════════
 
 
-def send_sms(phone_number: str, message: str):
-    """Send SMS via EgoSMS API."""
+def _send_email(to_email: str, subject: str, html_body: str):
+    """Send HTML email via SMTP (SSL, port 465)."""
+    if not SMTP_USERNAME or not SMTP_PASSWORD:
+        logger.warning("SMTP credentials not configured — email not sent")
+        return
     try:
-        import requests as req_lib
-        url = "https://www.egosms.co/api/v1/json/"
-        payload = {
-            "method": "SendSms",
-            "userdata": {
-                "username": EGOSMS_USERNAME,
-                "password": EGOSMS_APIKEY,
-            },
-            "msgdata": [
-                {
-                    "number": phone_number,
-                    "message": message,
-                    "senderid": "LendFlow",
-                }
-            ],
-        }
-        resp = req_lib.post(url, json=payload, timeout=15)
-        logger.info(f"EgoSMS response: {resp.status_code}")  # Don't log message content
-        return resp.json()
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"LendFlow <{SMTP_USERNAME}>"
+        msg["To"] = to_email
+        msg.attach(MIMEText(html_body, "html"))
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(SMTP_USERNAME, to_email, msg.as_string())
+        logger.info(f"Email sent successfully")
     except Exception as e:
-        logger.error(f"EgoSMS send error: {type(e).__name__}")
+        logger.error(f"Email send error: {type(e).__name__}: {e}")
+
+
+def _build_otp_email_html(username: str, code: str, purpose: str = "verification") -> str:
+    action_text = "verify your account" if purpose == "verification" else "reset your password"
+    year = datetime.now().year
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"><title>LendFlow OTP</title></head>
+    <body style="font-family:Arial,sans-serif;margin:0;padding:0;background:#f4f8f7;">
+      <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f8f7;padding:30px 0;">
+        <tr><td align="center">
+          <table width="560" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;border-radius:8px;overflow:hidden;">
+            <tr><td style="background:#2BB5A0;padding:24px 32px;">
+              <h1 style="margin:0;color:#ffffff;font-size:22px;letter-spacing:-0.5px;">LendFlow</h1>
+              <p style="margin:4px 0 0;color:#d0f5ef;font-size:13px;">Peer-to-Peer Lending Platform</p>
+            </td></tr>
+            <tr><td style="padding:32px;">
+              <p style="color:#1B2B3A;font-size:15px;">Hello <strong>{username}</strong>,</p>
+              <p style="color:#444;font-size:14px;">Use the code below to {action_text}. It expires in 10 minutes.</p>
+              <div style="margin:24px 0;text-align:center;">
+                <span style="display:inline-block;background:#2BB5A0;color:#ffffff;font-size:32px;font-weight:bold;letter-spacing:8px;padding:14px 32px;border-radius:6px;">{code}</span>
+              </div>
+              <p style="color:#888;font-size:12px;">If you did not request this code, please ignore this email. Do not share this code with anyone.</p>
+            </td></tr>
+            <tr><td style="background:#f9f9f9;padding:16px 32px;border-top:1px solid #eee;">
+              <p style="margin:0;color:#aaa;font-size:11px;text-align:center;">&copy; {year} LendFlow Uganda Ltd. &middot; All rights reserved.</p>
+            </td></tr>
+          </table>
+        </td></tr>
+      </table>
+    </body>
+    </html>
+    """
+
+
+# ═══════════════════════════════════════════════
+#  SMS VIA EGOSMS (CommsSDK)
+# ═══════════════════════════════════════════════
+
+try:
+    if EGOSMS_USERNAME and EGOSMS_APIKEY:
+        _sms_sdk = CommsSDK.authenticate(EGOSMS_USERNAME, EGOSMS_APIKEY)
+        logger.info("CommsSDK (EgoSMS) initialized successfully")
+    else:
+        logger.warning("SMS credentials not found — SMS disabled")
+        _sms_sdk = None
+except Exception as _e:
+    logger.error(f"Failed to initialize CommsSDK: {_e}")
+    _sms_sdk = None
+
+
+def send_sms(phone_number: str, message: str):
+    """Send SMS via EgoSMS CommsSDK."""
+    try:
+        if _sms_sdk is None:
+            logger.error("SMS SDK not initialized")
+            return None
+        # CommsSDK requires E.164 format (+256XXXXXXXXX)
+        if not phone_number.startswith('+'):
+            phone_number = '+' + phone_number
+        _sms_sdk.send_sms(phone_number, message)
+        logger.info(f"SMS sent via CommsSDK to {phone_number[:8]}...")
+    except Exception as e:
+        logger.error(f"EgoSMS send error: {type(e).__name__}: {e}")
         return None
 
 
@@ -356,20 +409,27 @@ class AuthRepo:
         # Normalize phone if user is logging in with a phone number
         normalized_phone = normalizePhoneNumber(identifier)
 
-        # Find user (case-insensitive email/username, or normalized phone)
-        user = db.query(User).filter(
+        # Find user: case-insensitive email/username, or normalized phone (256XXXXXXXXX),
+        # or raw phone as stored (backward compat with pre-normalization registrations)
+        lookup = (
             (func.lower(User.username) == identifier.lower())
             | (func.lower(User.email) == identifier.lower())
-            | (User.phone_number == normalized_phone) if normalized_phone else
-            (func.lower(User.username) == identifier.lower())
-            | (func.lower(User.email) == identifier.lower())
-        ).first()
+        )
+        if normalized_phone:
+            lookup = lookup | (User.phone_number == normalized_phone)
+        # Also match raw identifier as phone (handles users stored before normalization)
+        if identifier != normalized_phone:
+            lookup = lookup | (User.phone_number == identifier)
+        user = db.query(User).filter(lookup).first()
 
         if not user:
-            # Record failed attempt even if user doesn't exist (prevent enumeration timing)
+            # Explicit message requested by product team
             AuthRepo._record_login_attempt(db, identifier, False, ip_address)
             db.commit()
-            raise HTTPException(status_code=400, detail="Invalid credentials")
+            raise HTTPException(
+                status_code=404,
+                detail="Account does not exist. Please sign up first.",
+            )
 
         if not user.is_active:
             AuthRepo._record_login_attempt(db, identifier, False, ip_address)
@@ -381,7 +441,10 @@ class AuthRepo:
             _audit(db, "login_failed", username=user.username, user_id=user.id,
                    resource_type="user", ip_address=ip_address)
             db.commit()
-            raise HTTPException(status_code=400, detail="Invalid credentials")
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid credentials. Please check your password and try again.",
+            )
 
         # Successful login
         AuthRepo._record_login_attempt(db, identifier, True, ip_address)
@@ -469,16 +532,18 @@ class AuthRepo:
                     purpose="verification",
                 ))
             s.commit()
-
-            # Don't log the actual OTP code in production
             logger.info(f"OTP generated for user (verification)")
-
-            # TODO: Send actual email via SMTP/SES
-            # For dev only — remove in production:
             logger.debug(f"[DEV ONLY] OTP code for {username}: {code}")
 
+            # Send email
+            _send_email(
+                to_email=email,
+                subject="LendFlow — Verify Your Email Address",
+                html_body=_build_otp_email_html(username, code, purpose="verification"),
+            )
+
         except Exception as e:
-            logger.error(f"OTP background send error: {type(e).__name__}")
+            logger.error(f"OTP background send error: {type(e).__name__}: {e}")
         finally:
             s.close()
 
@@ -508,8 +573,17 @@ class AuthRepo:
             ))
         db.commit()
 
-        logger.info(f"OTP sent for user verification")
+        logger.info(f"OTP generated for resend")
         logger.debug(f"[DEV ONLY] OTP code for {username}: {code}")
+
+        # Send email in background thread (non-blocking)
+        threading.Thread(
+            target=_send_email,
+            args=(user.email, "LendFlow \u2014 Verify Your Email Address",
+                  _build_otp_email_html(username, code, purpose="verification")),
+            daemon=True,
+        ).start()
+
         return {"status": 200, "message": "OTP sent to email"}
 
     @staticmethod
@@ -522,8 +596,8 @@ class AuthRepo:
         if not otp:
             raise HTTPException(status_code=400, detail="No OTP found. Request a new one.")
 
-        # Check expiration
-        if otp.expires_at < datetime.now(timezone.utc):
+        # MySQL stores DateTime as naive UTC — compare with naive utcnow()
+        if otp.expires_at < datetime.utcnow():
             db.delete(otp)
             db.commit()
             raise HTTPException(status_code=400, detail="OTP expired. Request a new one.")
@@ -562,43 +636,55 @@ class AuthRepo:
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
+        # Normalize phone upfront — store and send to 256XXXXXXXXX format
+        normalized = normalizePhoneNumber(phone_number)
+        if not normalized:
+            raise HTTPException(status_code=400, detail="Invalid phone number")
+
         code = _generate_otp_code()
         hashed = _hash_otp(code)
 
+        # Upsert OTP keyed by normalized phone
         existing = db.query(OTP).filter(
-            OTP.username == username, OTP.phone_number == phone_number, OTP.purpose == "phone"
+            OTP.username == username, OTP.purpose == "phone"
         ).first()
         if existing:
             existing.code_hash = hashed
+            existing.phone_number = normalized
             existing.expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES)
             existing.attempts = 0
         else:
             db.add(OTP(
                 username=username,
-                phone_number=phone_number,
+                phone_number=normalized,
                 code_hash=hashed,
                 expires_at=datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES),
                 purpose="phone",
             ))
         db.commit()
 
-        # Send SMS
-        normalized = normalizePhoneNumber(phone_number)
-        full_phone = f"256{normalized}" if normalized else phone_number
+        logger.debug(f"[DEV ONLY] Phone OTP for {username}: {code}")
+
+        # Send SMS via EgoSMS (normalized already has 256 prefix)
+        sms_number = normalized  # 256XXXXXXXXX
         message = f"Your LendFlow verification code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
-        threading.Thread(target=send_sms, args=(full_phone, message), daemon=True).start()
+        threading.Thread(target=send_sms, args=(sms_number, message), daemon=True).start()
 
         return {"status": 200, "message": "OTP sent to phone"}
 
     @staticmethod
     def verify_phone_otp(db: Session, username: str, phone_number: str, code: str):
+        # Normalize so it matches what was stored in send_phone_otp
+        normalized = normalizePhoneNumber(phone_number) or phone_number
+
         otp = db.query(OTP).filter(
-            OTP.username == username, OTP.phone_number == phone_number, OTP.purpose == "phone"
+            OTP.username == username, OTP.purpose == "phone"
         ).first()
 
         if not otp:
             raise HTTPException(status_code=400, detail="No OTP found. Request a new one.")
-        if otp.expires_at < datetime.now(timezone.utc):
+        # MySQL stores DateTime as naive UTC — compare with naive utcnow()
+        if otp.expires_at < datetime.utcnow():
             db.delete(otp)
             db.commit()
             raise HTTPException(status_code=400, detail="OTP expired. Request a new one.")
@@ -618,7 +704,7 @@ class AuthRepo:
         user = db.query(User).filter(User.username == username).first()
         if user:
             user.is_phone_verified = True
-            user.phone_number = phone_number
+            user.phone_number = normalized
         db.delete(otp)
         db.commit()
         return {"status": 200, "message": "Phone verified successfully"}
@@ -668,7 +754,8 @@ class AuthRepo:
 
         if not otp:
             raise HTTPException(status_code=400, detail="No reset code found. Request a new one.")
-        if otp.expires_at < datetime.now(timezone.utc):
+        # MySQL stores DateTime as naive UTC — compare with naive utcnow()
+        if otp.expires_at < datetime.utcnow():
             db.delete(otp)
             db.commit()
             raise HTTPException(status_code=400, detail="Code expired. Request a new one.")

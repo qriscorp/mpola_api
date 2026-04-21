@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from database.tables import (
     User, DeactivatedAccount, Wallet, WalletTransaction,
     LoanApplication, LoanOffer, Loan, Repayment,
-    Notification, PlatformSetting, AuditLog,
+    Notification, PlatformSetting, AuditLog, LoginAttempt,
 )
 from repository.auth_repo import get_password_hash, _audit
 from repository.dependencies import get_db
@@ -474,3 +474,29 @@ def get_audit_logs(
             for l in logs
         ],
     }
+
+
+# ═══════════════════════════════════════════════
+#  LOCKOUT MANAGEMENT
+# ═══════════════════════════════════════════════
+
+@router.delete("/lockout/{identifier}")
+def clear_lockout(
+    identifier: str,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Clear login lockout for a given identifier (email, username, or phone)."""
+    deleted = (
+        db.query(LoginAttempt)
+        .filter(
+            LoginAttempt.identifier == identifier.lower(),
+            LoginAttempt.success == False,
+        )
+        .delete()
+    )
+    db.commit()
+    _audit(db, "clear_lockout", username=admin.username,
+           resource_type="user", details={"identifier": identifier, "records_removed": deleted})
+    db.commit()
+    return {"message": f"Lockout cleared. {deleted} failed attempt(s) removed.", "identifier": identifier}

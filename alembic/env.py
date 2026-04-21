@@ -1,6 +1,13 @@
 from logging.config import fileConfig
+import sys
+from pathlib import Path
 from sqlalchemy import engine_from_config, pool
 from alembic import context
+
+# Ensure project root is importable when alembic is run from CLI.
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 # this is the Alembic Config object
 config = context.config
@@ -9,8 +16,12 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Import all models so Alembic can detect them
+from config import DATABASE_URL
 from database.tables import Base
 target_metadata = Base.metadata
+
+if DATABASE_URL:
+    config.set_main_option("sqlalchemy.url", DATABASE_URL)
 
 
 def run_migrations_offline() -> None:

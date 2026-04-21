@@ -12,7 +12,11 @@ else:
     load_dotenv()
 
 DATABASE_URL = os.getenv('DATABASE_URL')
-BASE_URL = os.getenv('BASE_URL', 'http://localhost:8000')
-JWT_SECRET = os.getenv('JWT_SECRET', 'LENDFLOW_SECRET_2025')
+BASE_URL = os.getenv('BASE_URL')
+JWT_SECRET = os.getenv('JWT_SECRET')
 EGOSMS_USERNAME = os.getenv('EGOSMS_USERNAME')
 EGOSMS_APIKEY = os.getenv('EGOSMS_APIKEY')
+SMTP_USERNAME = os.getenv('SMTP_USERNAME')
+SMTP_PASSWORD = os.getenv('SMTP_PASSWORD')
+SMTP_SERVER = os.getenv('SMTP_SERVER')
+SMTP_PORT = int(os.getenv('SMTP_PORT'))

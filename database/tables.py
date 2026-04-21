@@ -52,7 +52,8 @@ class User(Base, TimestampMixin):
     kyc_status = Column(String(20), default="pending")  # pending, verified, rejected
     credit_score = Column(Integer, default=0)
     fcm_token = Column(Text, nullable=True)
-    refresh_token = Column(String(255), nullable=True)
+    # JWT refresh tokens can exceed 255 chars once claims/signature are included.
+    refresh_token = Column(Text, nullable=True)
     refresh_token_expires_at = Column(DateTime, nullable=True)
     two_factor_enabled = Column(Boolean, default=False)
 
