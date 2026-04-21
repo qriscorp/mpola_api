@@ -1,0 +1,18 @@
+import os
+from dotenv import load_dotenv
+from pathlib import Path
+
+base = Path(__file__).resolve().parents[1]
+
+if os.environ.get('PYTEST_RUNNING') == '1':
+    example = base / '.env.example'
+    if example.exists():
+        load_dotenv(dotenv_path=str(example), override=False)
+else:
+    load_dotenv()
+
+DATABASE_URL = os.getenv('DATABASE_URL')
+BASE_URL = os.getenv('BASE_URL', 'http://localhost:8000')
+JWT_SECRET = os.getenv('JWT_SECRET', 'LENDFLOW_SECRET_2025')
+EGOSMS_USERNAME = os.getenv('EGOSMS_USERNAME')
+EGOSMS_APIKEY = os.getenv('EGOSMS_APIKEY')
