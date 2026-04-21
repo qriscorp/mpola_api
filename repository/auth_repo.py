@@ -712,12 +712,23 @@ class AuthRepo:
     # ── Password reset (secure) ─────────────────
 
     @staticmethod
-    def send_password_reset_code(db: Session, email: str):
-        validate_email_format(email)
-        user = db.query(User).filter(func.lower(User.email) == email.lower()).first()
+    def _find_user_by_identifier(db: Session, identifier: str):
+        """Look up a user by email or phone number (auto-detected)."""
+        if "@" in identifier:
+            return db.query(User).filter(func.lower(User.email) == identifier.lower()).first()
+        # Treat as phone — normalize and try both raw and normalized
+        normalized = normalizePhoneNumber(identifier) or identifier
+        return (
+            db.query(User).filter(User.phone_number == normalized).first()
+            or db.query(User).filter(User.phone_number == identifier).first()
+        )
+
+    @staticmethod
+    def send_password_reset_code(db: Session, identifier: str):
+        user = AuthRepo._find_user_by_identifier(db, identifier)
+        _generic_ok = {"status": 200, "message": "If this account exists, a reset code has been sent."}
         if not user:
-            # Don't reveal whether the email exists (enumeration protection)
-            return {"status": 200, "message": "If this email is registered, a reset code has been sent."}
+            return _generic_ok
 
         code = _generate_otp_code()
         hashed = _hash_otp(code)
@@ -738,13 +749,25 @@ class AuthRepo:
             ))
         db.commit()
 
-        logger.info(f"Password reset code generated")
-        logger.debug(f"[DEV ONLY] Reset code for {email}: {code}")
-        return {"status": 200, "message": "If this email is registered, a reset code has been sent."}
+        logger.debug(f"[DEV ONLY] Reset code for {user.username}: {code}")
+
+        # Send via the channel the user chose
+        if "@" in identifier:
+            html = _build_otp_email_html(user.username, code, purpose="password_reset")
+            threading.Thread(
+                target=_send_email,
+                args=(user.email, "LendFlow — Password Reset Code", html),
+                daemon=True,
+            ).start()
+        else:
+            message = f"Your LendFlow password reset code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
+            threading.Thread(target=send_sms, args=(user.phone_number, message), daemon=True).start()
+
+        return _generic_ok
 
     @staticmethod
-    def verify_password_reset_code(db: Session, email: str, code: str):
-        user = db.query(User).filter(func.lower(User.email) == email.lower()).first()
+    def verify_password_reset_code(db: Session, identifier: str, code: str):
+        user = AuthRepo._find_user_by_identifier(db, identifier)
         if not user:
             raise HTTPException(status_code=400, detail="Invalid code")
 
@@ -754,7 +777,6 @@ class AuthRepo:
 
         if not otp:
             raise HTTPException(status_code=400, detail="No reset code found. Request a new one.")
-        # MySQL stores DateTime as naive UTC — compare with naive utcnow()
         if otp.expires_at < datetime.utcnow():
             db.delete(otp)
             db.commit()
@@ -781,33 +803,133 @@ class AuthRepo:
         return {"status": 200, "access_token": token, "message": "Code verified"}
 
     @staticmethod
-    def reset_password(db: Session, email: str, new_password: str, access_token: str | None = None):
+    def reset_password(db: Session, new_password: str, access_token: str):
         validate_password_strength(new_password)
-
-        user = db.query(User).filter(func.lower(User.email) == email.lower()).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="Email not found")
-
-        if not access_token:
-            raise HTTPException(status_code=400, detail="Reset token required")
 
         try:
             payload = jwt.decode(access_token, JWT_SECRET, algorithms=[ALGORITHM], issuer="lendflow-api")
-            if payload.get("sub") != user.username:
-                raise HTTPException(status_code=401, detail="Token mismatch")
             if payload.get("purpose") != "password_reset":
                 raise HTTPException(status_code=401, detail="Invalid token purpose")
+            username = payload.get("sub")
         except jwt.InvalidTokenError:
             raise HTTPException(status_code=401, detail="Invalid reset token")
 
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
         user.password_hash = get_password_hash(new_password)
-        # Invalidate all sessions after password reset
         user.refresh_token = None
         user.refresh_token_expires_at = None
 
         _audit(db, "password_reset", username=user.username, user_id=user.id, resource_type="user")
         db.commit()
         return {"status": 200, "message": "Password reset successful"}
+
+    # ── Login via phone OTP ──────────────────────
+
+    @staticmethod
+    def send_login_phone_otp(db: Session, phone_number: str):
+        normalized = normalizePhoneNumber(phone_number)
+        if not normalized:
+            raise HTTPException(status_code=400, detail="Invalid phone number")
+
+        user = (
+            db.query(User).filter(User.phone_number == normalized).first()
+            or db.query(User).filter(User.phone_number == phone_number).first()
+        )
+        if not user:
+            # Enumerate-safe: always return 200
+            return {"status": 200, "message": "If this number is registered, a code has been sent."}
+
+        code = _generate_otp_code()
+        hashed = _hash_otp(code)
+
+        existing = db.query(OTP).filter(
+            OTP.username == user.username, OTP.purpose == "login_otp"
+        ).first()
+        if existing:
+            existing.code_hash = hashed
+            existing.phone_number = normalized
+            existing.expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES)
+            existing.attempts = 0
+        else:
+            db.add(OTP(
+                username=user.username,
+                phone_number=normalized,
+                code_hash=hashed,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES),
+                purpose="login_otp",
+            ))
+        db.commit()
+
+        logger.debug(f"[DEV ONLY] Login OTP for {user.username}: {code}")
+        message = f"Your LendFlow sign-in code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
+        threading.Thread(target=send_sms, args=(normalized, message), daemon=True).start()
+
+        return {"status": 200, "message": "If this number is registered, a code has been sent."}
+
+    @staticmethod
+    def verify_login_phone_otp(db: Session, phone_number: str, code: str, ip_address: str = "unknown"):
+        normalized = normalizePhoneNumber(phone_number) or phone_number
+
+        user = (
+            db.query(User).filter(User.phone_number == normalized).first()
+            or db.query(User).filter(User.phone_number == phone_number).first()
+        )
+        if not user:
+            raise HTTPException(status_code=400, detail="Invalid code")
+
+        otp = db.query(OTP).filter(
+            OTP.username == user.username, OTP.purpose == "login_otp"
+        ).first()
+        if not otp:
+            raise HTTPException(status_code=400, detail="No code found. Request a new one.")
+        if otp.expires_at < datetime.utcnow():
+            db.delete(otp)
+            db.commit()
+            raise HTTPException(status_code=400, detail="Code expired. Request a new one.")
+        if otp.attempts >= OTP_MAX_ATTEMPTS:
+            db.delete(otp)
+            db.commit()
+            raise HTTPException(status_code=429, detail="Too many attempts. Request a new code.")
+
+        otp.attempts += 1
+        db.flush()
+
+        if not _verify_otp_hash(code, otp.code_hash):
+            db.commit()
+            raise HTTPException(status_code=400, detail="Invalid code")
+
+        db.delete(otp)
+
+        # Issue tokens
+        access_token = create_access_token({"sub": user.username, "role": user.role})
+        refresh = secrets.token_urlsafe(64)
+        user.refresh_token = refresh
+        user.refresh_token_expires_at = datetime.utcnow() + timedelta(days=7)
+
+        _audit(db, "login_otp", username=user.username, user_id=user.id, ip_address=ip_address)
+        db.commit()
+
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh,
+            "user": {
+                "id": str(user.id),
+                "username": user.username,
+                "email": user.email,
+                "full_name": user.full_name,
+                "phone_number": user.phone_number,
+                "role": user.role,
+                "is_active": user.is_active,
+                "is_verified": user.is_verified,
+                "is_phone_verified": user.is_phone_verified,
+                "is_kyc_verified": user.is_kyc_verified,
+                "kyc_status": user.kyc_status,
+                "credit_score": user.credit_score,
+            },
+        }
 
     @staticmethod
     def change_password(db: Session, user: User, old_password: str, new_password: str):

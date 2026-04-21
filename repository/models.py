@@ -1,3 +1,7 @@
+"""
+Pydantic request/response models for LendFlow API.
+"""
+
 import re
 from datetime import datetime
 from typing import Optional, List
@@ -70,9 +74,8 @@ class UserUpdate(BaseModel):
 
 
 class ResetPasswordModel(BaseModel):
-    email: str = Field(..., max_length=255)
     new_password: str = Field(..., min_length=8, max_length=128)
-    access_token: Optional[str] = None
+    access_token: str = Field(...)
 
 
 class ChangePasswordModel(BaseModel):
@@ -81,7 +84,21 @@ class ChangePasswordModel(BaseModel):
 
 
 class SendPasswordResetCodeModel(BaseModel):
-    email: str
+    identifier: str  # email address OR phone number
+
+
+class VerifyPasswordResetCodeModel(BaseModel):
+    identifier: str  # same email or phone used in send step
+    code: str
+
+
+class SendLoginPhoneOTPModel(BaseModel):
+    phone_number: str
+
+
+class VerifyLoginPhoneOTPModel(BaseModel):
+    phone_number: str
+    code: str
 
 
 class SendOTPModel(BaseModel):

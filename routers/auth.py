@@ -11,7 +11,9 @@ from repository.dependencies import get_db, current_active_user
 from repository.models import (
     Login, UserCreate, SendOTPModel, VerifyOTPModel,
     SendPhoneOTPModel, VerifyPhoneOTPModel,
-    SendPasswordResetCodeModel, ResetPasswordModel, ChangePasswordModel,
+    SendPasswordResetCodeModel, VerifyPasswordResetCodeModel,
+    ResetPasswordModel, ChangePasswordModel,
+    SendLoginPhoneOTPModel, VerifyLoginPhoneOTPModel,
 )
 from database.tables import User
 
@@ -62,17 +64,27 @@ async def verify_phone_otp(data: VerifyPhoneOTPModel, db: Session = Depends(get_
 
 @router.post("/send_password_reset_code")
 async def send_reset_code(data: SendPasswordResetCodeModel, db: Session = Depends(get_db)):
-    return AuthRepo.send_password_reset_code(db, data.email)
+    return AuthRepo.send_password_reset_code(db, data.identifier)
 
 
 @router.post("/verify_password_reset_code")
-async def verify_reset_code(email: str, code: str, db: Session = Depends(get_db)):
-    return AuthRepo.verify_password_reset_code(db, email, code)
+async def verify_reset_code(data: VerifyPasswordResetCodeModel, db: Session = Depends(get_db)):
+    return AuthRepo.verify_password_reset_code(db, data.identifier, data.code)
 
 
 @router.post("/reset_password")
 async def reset_password(data: ResetPasswordModel, db: Session = Depends(get_db)):
-    return AuthRepo.reset_password(db, data.email, data.new_password, data.access_token)
+    return AuthRepo.reset_password(db, data.new_password, data.access_token)
+
+
+@router.post("/send_login_phone_otp")
+async def send_login_phone_otp(data: SendLoginPhoneOTPModel, db: Session = Depends(get_db)):
+    return AuthRepo.send_login_phone_otp(db, data.phone_number)
+
+
+@router.post("/verify_login_phone_otp")
+async def verify_login_phone_otp(data: VerifyLoginPhoneOTPModel, request: Request, db: Session = Depends(get_db)):
+    return AuthRepo.verify_login_phone_otp(db, data.phone_number, data.code, ip_address=_get_ip(request))
 
 
 @router.post("/change_password")
