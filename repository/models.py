@@ -1,7 +1,3 @@
-"""
-Pydantic request/response models for LendFlow API.
-"""
-
 import re
 from datetime import datetime
 from typing import Optional, List

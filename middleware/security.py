@@ -87,6 +87,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Attach request ID for tracing
         request_id = str(uuid.uuid4())
         request.state.request_id = request_id
+        path = request.url.path
 
         response = await call_next(request)
 
@@ -95,7 +96,17 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        response.headers["Content-Security-Policy"] = "default-src 'self'"
+        # Docs UIs need inline scripts/styles and CDN assets. Keep strict CSP for all other routes.
+        if path.startswith("/docs") or path.startswith("/redoc") or path == "/openapi.json":
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                "img-src 'self' data: https:; "
+                "font-src 'self' data: https:"
+            )
+        else:
+            response.headers["Content-Security-Policy"] = "default-src 'self'"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"

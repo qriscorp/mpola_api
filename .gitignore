@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 # .env
 venv/
+.venv/
 logs/*.log
 uploads/*
 !uploads/.gitkeep

@@ -5,7 +5,6 @@ Core dependencies used throughout the API — follows kumpi_api pattern.
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
-
 from database import SessionLocal
 from database.tables import User
 from repository.models import AuthUser

@@ -91,3 +91,5 @@ def on_startup():
 # git add .
 # git commit -m "message"
 # git push
+
+# ./.venv/Scripts/Activate

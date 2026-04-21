@@ -1,15 +1,3 @@
-"""
-Admin router — FULL PLATFORM CONTROL.
-─────────────────────────────────────
-• Suspend/unsuspend/ban users
-• Separate borrowers vs lenders filtering
-• Make/revoke admin
-• Approve/reject loan applications
-• View all loans, payments, platform stats
-• Platform settings management
-• Audit log viewer
-"""
-
 import json
 import secrets
 from datetime import datetime, timedelta, timezone
