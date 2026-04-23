@@ -161,7 +161,7 @@ def _send_email(to_email: str, subject: str, html_body: str):
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
-        msg["From"] = f"LendFlow <{SMTP_USERNAME}>"
+        msg["From"] = f"Welend <{SMTP_USERNAME}>"
         msg["To"] = to_email
         msg.attach(MIMEText(html_body, "html"))
         context = ssl.create_default_context()
@@ -179,13 +179,13 @@ def _build_otp_email_html(username: str, code: str, purpose: str = "verification
     return f"""
     <!DOCTYPE html>
     <html>
-    <head><meta charset="UTF-8"><title>LendFlow OTP</title></head>
+    <head><meta charset="UTF-8"><title>Welend OTP</title></head>
     <body style="font-family:Arial,sans-serif;margin:0;padding:0;background:#f4f8f7;">
       <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f4f8f7;padding:30px 0;">
         <tr><td align="center">
           <table width="560" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;border-radius:8px;overflow:hidden;">
             <tr><td style="background:#2BB5A0;padding:24px 32px;">
-              <h1 style="margin:0;color:#ffffff;font-size:22px;letter-spacing:-0.5px;">LendFlow</h1>
+              <h1 style="margin:0;color:#ffffff;font-size:22px;letter-spacing:-0.5px;">Welend</h1>
               <p style="margin:4px 0 0;color:#d0f5ef;font-size:13px;">Peer-to-Peer Lending Platform</p>
             </td></tr>
             <tr><td style="padding:32px;">
@@ -197,7 +197,7 @@ def _build_otp_email_html(username: str, code: str, purpose: str = "verification
               <p style="color:#888;font-size:12px;">If you did not request this code, please ignore this email. Do not share this code with anyone.</p>
             </td></tr>
             <tr><td style="background:#f9f9f9;padding:16px 32px;border-top:1px solid #eee;">
-              <p style="margin:0;color:#aaa;font-size:11px;text-align:center;">&copy; {year} LendFlow Uganda Ltd. &middot; All rights reserved.</p>
+              <p style="margin:0;color:#aaa;font-size:11px;text-align:center;">&copy; {year} Welend Uganda Ltd. &middot; All rights reserved.</p>
             </td></tr>
           </table>
         </td></tr>
@@ -456,7 +456,7 @@ class AuthRepo:
             target=_send_email,
             args=(
                 draft.email,
-                "LendFlow — Verify Your Email Address",
+                "Welend — Verify Your Email Address",
                 _build_otp_email_html(draft.username, email_code, purpose="verification"),
             ),
             daemon=True,
@@ -483,7 +483,7 @@ class AuthRepo:
             target=_send_email,
             args=(
                 draft.email,
-                "LendFlow — Verify Your Email Address",
+                "Welend — Verify Your Email Address",
                 _build_otp_email_html(draft.username, email_code, purpose="verification"),
             ),
             daemon=True,
@@ -540,7 +540,7 @@ class AuthRepo:
         db.commit()
 
         logger.debug(f"[DEV ONLY] Signup phone OTP for draft {draft.id}: {phone_code}")
-        message = f"Your LendFlow verification code is: {phone_code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
+        message = f"Your Welend verification code is: {phone_code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
         threading.Thread(target=send_sms, args=(normalized, message), daemon=True).start()
         return {"status": 200, "message": "OTP sent to phone"}
 
@@ -878,7 +878,7 @@ class AuthRepo:
             # Send email
             _send_email(
                 to_email=email,
-                subject="LendFlow — Verify Your Email Address",
+                subject="Welend — Verify Your Email Address",
                 html_body=_build_otp_email_html(username, code, purpose="verification"),
             )
 
@@ -919,7 +919,7 @@ class AuthRepo:
         # Send email in background thread (non-blocking)
         threading.Thread(
             target=_send_email,
-            args=(user.email, "LendFlow \u2014 Verify Your Email Address",
+            args=(user.email, "Welend \u2014 Verify Your Email Address",
                   _build_otp_email_html(username, code, purpose="verification")),
             daemon=True,
         ).start()
@@ -1007,7 +1007,7 @@ class AuthRepo:
 
         # Send SMS via EgoSMS (normalized already has 256 prefix)
         sms_number = normalized  # 256XXXXXXXXX
-        message = f"Your LendFlow verification code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
+        message = f"Your Welend verification code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
         threading.Thread(target=send_sms, args=(sms_number, message), daemon=True).start()
 
         return {"status": 200, "message": "OTP sent to phone"}
@@ -1096,11 +1096,11 @@ class AuthRepo:
             html = _build_otp_email_html(user.username, code, purpose="password_reset")
             threading.Thread(
                 target=_send_email,
-                args=(user.email, "LendFlow — Password Reset Code", html),
+                args=(user.email, "Welend — Password Reset Code", html),
                 daemon=True,
             ).start()
         else:
-            message = f"Your LendFlow password reset code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
+            message = f"Your Welend password reset code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
             threading.Thread(target=send_sms, args=(user.phone_number, message), daemon=True).start()
 
         return _generic_ok
@@ -1204,7 +1204,7 @@ class AuthRepo:
         db.commit()
 
         logger.debug(f"[DEV ONLY] Login OTP for {user.username}: {code}")
-        message = f"Your LendFlow sign-in code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
+        message = f"Your Welend sign-in code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
         threading.Thread(target=send_sms, args=(normalized, message), daemon=True).start()
 
         return {"status": 200, "message": "If this number is registered, a code has been sent."}

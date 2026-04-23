@@ -12,7 +12,7 @@ from database import ENGINE
 from database.tables import Base
 
 app = FastAPI(
-    title="LendFlow API",
+    title="Welend API",
     description="Peer-to-peer lending platform — fintech-grade security",
     version="1.0.0",
     docs_url="/docs",
@@ -94,7 +94,7 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 @app.get("/", tags=["Health"])
 async def health():
-    return {"status": "ok", "service": "LendFlow API", "version": "1.0.0"}
+    return {"status": "ok", "service": "Welend API", "version": "1.0.0"}
 
 
 @app.get("/health", tags=["Health"])

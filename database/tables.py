@@ -1,10 +1,3 @@
-"""
-LendFlow Database Models
-─────────────────────────
-All ORM tables for the peer-to-peer lending platform.
-Follows the kumpi_api pattern: declarative_base + TimestampMixin + generateUniqueId.
-"""
-
 from datetime import datetime, timezone
 from sqlalchemy import (
     Column, String, Integer, Float, Boolean, Text, DateTime,

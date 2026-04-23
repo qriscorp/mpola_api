@@ -1,12 +1,3 @@
-"""
-Security middleware for LendFlow API (fintech-grade).
-─────────────────────────────────────────────────────
-• Rate limiting (in-memory token bucket per IP)
-• Security headers (HSTS, X-Content-Type, X-Frame-Options, CSP, etc.)
-• Request ID tracking
-• IP extraction from X-Forwarded-For (proxy-aware)
-"""
-
 import time
 import uuid
 from collections import defaultdict
