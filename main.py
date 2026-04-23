@@ -32,8 +32,8 @@ DEFAULT_ALLOWED_ORIGINS = [
     "http://localhost:8081",       # Expo dev
     "http://localhost:19006",      # Expo web
     "https://welend.qriscorp.com", # Production web
-    "https://admin.qriscorp.com",  # Production admin
-    "https://api.qriscorp.com",    # API docs/tools
+    "https://admin.welend.qriscorp.com",  # Production admin
+    "https://api.welend.qriscorp.com",    # API docs/tools
     "https://lendflow.app",       # Production web
     "https://admin.lendflow.app", # Production admin
 ]
