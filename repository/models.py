@@ -71,6 +71,52 @@ class UserCreate(BaseModel):
         from_attributes = True
 
 
+class RegisterStart(BaseModel):
+    email: str = Field(..., max_length=255)
+    full_name: Optional[str] = Field(None, max_length=200)
+    phone_number: Optional[str] = Field(None, max_length=20)
+    password: str = Field(..., min_length=8, max_length=128)
+    nin: Optional[str] = Field(None, max_length=50)
+    account_type: Optional[str] = "individual"
+    role: Optional[str] = "borrower"  # borrower or lender
+
+    @field_validator('email')
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(pattern, v):
+            raise ValueError('Invalid email format')
+        return v.lower().strip()
+
+    @field_validator('role')
+    @classmethod
+    def validate_role(cls, v: Optional[str]) -> Optional[str]:
+        allowed = {'borrower', 'lender'}
+        if v and v.lower() not in allowed:
+            return 'borrower'
+        return v.lower() if v else 'borrower'
+
+
+class SignupDraftRequest(BaseModel):
+    draft_id: str
+
+
+class SignupDraftPhoneRequest(BaseModel):
+    draft_id: str
+    phone_number: str
+
+
+class SignupDraftVerifyRequest(BaseModel):
+    draft_id: str
+    code: str
+
+
+class SignupDraftVerifyPhoneRequest(BaseModel):
+    draft_id: str
+    phone_number: str
+    code: str
+
+
 class UserUpdate(BaseModel):
     full_name: Optional[str] = None
     phone_number: Optional[str] = None

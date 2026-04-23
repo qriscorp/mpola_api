@@ -60,6 +60,8 @@ _auth_limiter = _TokenBucket(rate=10 / 60, capacity=10)
 _AUTH_PATHS = {
     "/auth/login", "/auth/register", "/auth/send_otp", "/auth/verify_otp",
     "/auth/send_phone_otp", "/auth/verify_phone_otp",
+    "/auth/register_start", "/auth/send_signup_email_otp", "/auth/verify_signup_email_otp",
+    "/auth/send_signup_phone_otp", "/auth/verify_signup_phone_otp",
     "/auth/send_password_reset_code", "/auth/reset_password",
     "/auth/refresh",
 }

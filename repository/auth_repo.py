@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from comms_sdk import CommsSDK
 
 from config import JWT_SECRET, EGOSMS_USERNAME, EGOSMS_APIKEY, SMTP_USERNAME, SMTP_PASSWORD, SMTP_SERVER, SMTP_PORT
-from database.tables import User, OTP, LoginAttempt, AuditLog
+from database.tables import User, OTP, LoginAttempt, AuditLog, SignupDraft
 from helpers import generateUniqueId, normalizePhoneNumber
 from logging_module import logger
 from repository.models import AuthUser
@@ -32,6 +32,7 @@ LOGIN_LOCKOUT_MINUTES = 15
 PASSWORD_MIN_LENGTH = 8
 ALLOWED_REGISTRATION_ROLES = {"borrower", "lender"}  # Users CANNOT register as admin
 ALLOWED_LOGIN_PORTALS = {"borrower", "lender"}
+SIGNUP_DRAFT_EXPIRE_HOURS = 24
 
 
 # ═══════════════════════════════════════════════
@@ -321,6 +322,316 @@ class AuthRepo:
                 status_code=403,
                 detail="This account is registered as a borrower. Please sign in from the borrower portal.",
             )
+
+    @staticmethod
+    def _generate_unique_username(db: Session, email: str) -> str:
+        raw = re.sub(r'[^a-zA-Z0-9_]', '', email.split("@")[0])
+        username = raw[:50] if raw else "user"
+        base_username = username
+        counter = 1
+        while db.query(User).filter(func.lower(User.username) == username.lower()).first():
+            username = f"{base_username}{counter}"
+            counter += 1
+        return username
+
+    @staticmethod
+    def _get_active_signup_draft(db: Session, draft_id: str) -> SignupDraft:
+        draft = db.query(SignupDraft).filter(SignupDraft.id == draft_id).first()
+        if not draft:
+            raise HTTPException(status_code=404, detail="Signup session not found")
+
+        if draft.is_completed:
+            raise HTTPException(status_code=400, detail="Signup already completed. Please sign in.")
+
+        if draft.expires_at < datetime.utcnow():
+            db.query(OTP).filter(OTP.username == draft.id).delete(synchronize_session=False)
+            db.delete(draft)
+            db.commit()
+            raise HTTPException(status_code=400, detail="Signup session expired. Please register again.")
+
+        return draft
+
+    @staticmethod
+    def _upsert_signup_otp(db: Session, draft_id: str, purpose: str, code: str, phone_number: str | None = None):
+        hashed = _hash_otp(code)
+        existing = db.query(OTP).filter(
+            OTP.username == draft_id,
+            OTP.purpose == purpose,
+        ).first()
+        if existing:
+            existing.code_hash = hashed
+            existing.phone_number = phone_number
+            existing.expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES)
+            existing.attempts = 0
+        else:
+            db.add(
+                OTP(
+                    username=draft_id,
+                    phone_number=phone_number,
+                    code_hash=hashed,
+                    expires_at=datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES),
+                    purpose=purpose,
+                )
+            )
+
+    @staticmethod
+    def register_start(db: Session, data, ip_address: str | None = None):
+        validate_email_format(data.email)
+        validate_password_strength(data.password)
+
+        requested_role = (data.role or "borrower").lower()
+        if requested_role not in ALLOWED_REGISTRATION_ROLES:
+            requested_role = "borrower"
+
+        normalized_phone = None
+        if data.phone_number:
+            normalized_phone = normalizePhoneNumber(data.phone_number)
+            if not normalized_phone:
+                raise HTTPException(status_code=400, detail="Invalid phone number")
+
+        existing_user = db.query(User).filter(func.lower(User.email) == data.email.lower()).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Email already registered")
+
+        if normalized_phone:
+            existing_phone = db.query(User).filter(User.phone_number == normalized_phone).first()
+            if existing_phone:
+                raise HTTPException(status_code=400, detail="Phone number already registered")
+
+        draft = db.query(SignupDraft).filter(
+            func.lower(SignupDraft.email) == data.email.lower(),
+            SignupDraft.is_completed == False,
+        ).first()
+
+        if draft and draft.expires_at < datetime.utcnow():
+            db.query(OTP).filter(OTP.username == draft.id).delete(synchronize_session=False)
+            db.delete(draft)
+            draft = None
+
+        if not draft:
+            draft = SignupDraft(
+                id=generateUniqueId(),
+                username=AuthRepo._generate_unique_username(db, data.email),
+                email=data.email.lower().strip(),
+                phone_number=normalized_phone,
+                password_hash=get_password_hash(data.password),
+                full_name=data.full_name,
+                nin=data.nin,
+                account_type=data.account_type or "individual",
+                role=requested_role,
+                email_verified=False,
+                phone_verified=False,
+                expires_at=datetime.utcnow() + timedelta(hours=SIGNUP_DRAFT_EXPIRE_HOURS),
+            )
+            db.add(draft)
+        else:
+            draft.username = AuthRepo._generate_unique_username(db, data.email)
+            draft.phone_number = normalized_phone
+            draft.password_hash = get_password_hash(data.password)
+            draft.full_name = data.full_name
+            draft.nin = data.nin
+            draft.account_type = data.account_type or "individual"
+            draft.role = requested_role
+            draft.email_verified = False
+            draft.phone_verified = False
+            draft.expires_at = datetime.utcnow() + timedelta(hours=SIGNUP_DRAFT_EXPIRE_HOURS)
+            db.query(OTP).filter(OTP.username == draft.id).delete(synchronize_session=False)
+
+        email_code = _generate_otp_code()
+        AuthRepo._upsert_signup_otp(db, draft.id, "signup_email", email_code)
+
+        _audit(
+            db,
+            "signup_started",
+            username=draft.username,
+            resource_type="signup_draft",
+            resource_id=draft.id,
+            ip_address=ip_address,
+            details={"role": requested_role, "email": draft.email},
+        )
+        db.commit()
+
+        logger.debug(f"[DEV ONLY] Signup email OTP for draft {draft.id}: {email_code}")
+        threading.Thread(
+            target=_send_email,
+            args=(
+                draft.email,
+                "LendFlow — Verify Your Email Address",
+                _build_otp_email_html(draft.username, email_code, purpose="verification"),
+            ),
+            daemon=True,
+        ).start()
+
+        return {
+            "status": 200,
+            "message": "Registration started. Verify your email to continue.",
+            "draft_id": draft.id,
+            "email": draft.email,
+            "phone_number": draft.phone_number,
+            "role": draft.role,
+        }
+
+    @staticmethod
+    def send_signup_email_otp(db: Session, draft_id: str):
+        draft = AuthRepo._get_active_signup_draft(db, draft_id)
+        email_code = _generate_otp_code()
+        AuthRepo._upsert_signup_otp(db, draft.id, "signup_email", email_code)
+        db.commit()
+
+        logger.debug(f"[DEV ONLY] Signup email OTP resend for draft {draft.id}: {email_code}")
+        threading.Thread(
+            target=_send_email,
+            args=(
+                draft.email,
+                "LendFlow — Verify Your Email Address",
+                _build_otp_email_html(draft.username, email_code, purpose="verification"),
+            ),
+            daemon=True,
+        ).start()
+
+        return {"status": 200, "message": "OTP sent to email"}
+
+    @staticmethod
+    def verify_signup_email_otp(db: Session, draft_id: str, code: str):
+        draft = AuthRepo._get_active_signup_draft(db, draft_id)
+        otp = db.query(OTP).filter(
+            OTP.username == draft.id,
+            OTP.purpose == "signup_email",
+        ).first()
+
+        if not otp:
+            raise HTTPException(status_code=400, detail="No OTP found. Request a new one.")
+        if otp.expires_at < datetime.utcnow():
+            db.delete(otp)
+            db.commit()
+            raise HTTPException(status_code=400, detail="OTP expired. Request a new one.")
+        if otp.attempts >= OTP_MAX_ATTEMPTS:
+            db.delete(otp)
+            db.commit()
+            raise HTTPException(status_code=429, detail="Too many attempts. Request a new OTP.")
+
+        otp.attempts += 1
+        db.flush()
+
+        if not _verify_otp_hash(code, otp.code_hash):
+            db.commit()
+            remaining = OTP_MAX_ATTEMPTS - otp.attempts
+            raise HTTPException(status_code=400, detail=f"Invalid OTP. {remaining} attempts remaining.")
+
+        draft.email_verified = True
+        db.delete(otp)
+        db.commit()
+        return {"status": 200, "message": "Email verified successfully"}
+
+    @staticmethod
+    def send_signup_phone_otp(db: Session, draft_id: str, phone_number: str):
+        draft = AuthRepo._get_active_signup_draft(db, draft_id)
+        normalized = normalizePhoneNumber(phone_number)
+        if not normalized:
+            raise HTTPException(status_code=400, detail="Invalid phone number")
+
+        existing_phone = db.query(User).filter(User.phone_number == normalized).first()
+        if existing_phone:
+            raise HTTPException(status_code=400, detail="Phone number already registered")
+
+        draft.phone_number = normalized
+        phone_code = _generate_otp_code()
+        AuthRepo._upsert_signup_otp(db, draft.id, "signup_phone", phone_code, phone_number=normalized)
+        db.commit()
+
+        logger.debug(f"[DEV ONLY] Signup phone OTP for draft {draft.id}: {phone_code}")
+        message = f"Your LendFlow verification code is: {phone_code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
+        threading.Thread(target=send_sms, args=(normalized, message), daemon=True).start()
+        return {"status": 200, "message": "OTP sent to phone"}
+
+    @staticmethod
+    def _finalize_signup_draft(db: Session, draft: SignupDraft, ip_address: str | None = None):
+        existing_email = db.query(User).filter(func.lower(User.email) == draft.email.lower()).first()
+        if existing_email:
+            raise HTTPException(status_code=400, detail="Email already registered")
+
+        if draft.phone_number:
+            existing_phone = db.query(User).filter(User.phone_number == draft.phone_number).first()
+            if existing_phone:
+                raise HTTPException(status_code=400, detail="Phone number already registered")
+
+        username = draft.username
+        base_username = username
+        while db.query(User).filter(func.lower(User.username) == username.lower()).first():
+            username = f"{base_username}{secrets.randbelow(9) + 1}"
+
+        user = User(
+            username=username,
+            email=draft.email,
+            full_name=draft.full_name,
+            phone_number=draft.phone_number,
+            password_hash=draft.password_hash,
+            nin=draft.nin,
+            account_type=draft.account_type or "individual",
+            role=draft.role or "borrower",
+            is_verified=True,
+            is_phone_verified=True,
+        )
+        db.add(user)
+        db.flush()
+
+        draft.is_completed = True
+        draft.created_user_id = user.id
+
+        _audit(
+            db,
+            "register",
+            username=user.username,
+            user_id=user.id,
+            resource_type="user",
+            ip_address=ip_address,
+            details={"role": user.role, "email": user.email, "source": "signup_draft"},
+        )
+        db.commit()
+        db.refresh(user)
+        return user
+
+    @staticmethod
+    def verify_signup_phone_otp(db: Session, draft_id: str, phone_number: str, code: str, ip_address: str | None = None):
+        draft = AuthRepo._get_active_signup_draft(db, draft_id)
+        normalized = normalizePhoneNumber(phone_number)
+        if not normalized:
+            raise HTTPException(status_code=400, detail="Invalid phone number")
+
+        otp = db.query(OTP).filter(
+            OTP.username == draft.id,
+            OTP.purpose == "signup_phone",
+        ).first()
+
+        if not otp:
+            raise HTTPException(status_code=400, detail="No OTP found. Request a new one.")
+        if otp.expires_at < datetime.utcnow():
+            db.delete(otp)
+            db.commit()
+            raise HTTPException(status_code=400, detail="OTP expired. Request a new one.")
+        if otp.attempts >= OTP_MAX_ATTEMPTS:
+            db.delete(otp)
+            db.commit()
+            raise HTTPException(status_code=429, detail="Too many attempts. Request a new OTP.")
+
+        otp.attempts += 1
+        db.flush()
+
+        if not _verify_otp_hash(code, otp.code_hash):
+            db.commit()
+            remaining = OTP_MAX_ATTEMPTS - otp.attempts
+            raise HTTPException(status_code=400, detail=f"Invalid OTP. {remaining} attempts remaining.")
+
+        draft.phone_verified = True
+        draft.phone_number = normalized
+        db.delete(otp)
+
+        if not draft.email_verified:
+            db.commit()
+            return {"status": 200, "message": "Phone verified. Please verify email to finish signup."}
+
+        AuthRepo._finalize_signup_draft(db, draft, ip_address=ip_address)
+        return {"status": 200, "message": "Account created successfully. Please sign in."}
 
     # ── register ────────────────────────────────
 

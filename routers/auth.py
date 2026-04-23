@@ -14,6 +14,8 @@ from repository.models import (
     SendPasswordResetCodeModel, VerifyPasswordResetCodeModel,
     ResetPasswordModel, ChangePasswordModel,
     SendLoginPhoneOTPModel, VerifyLoginPhoneOTPModel,
+    RegisterStart, SignupDraftRequest, SignupDraftPhoneRequest,
+    SignupDraftVerifyRequest, SignupDraftVerifyPhoneRequest,
 )
 from database.tables import User
 
@@ -30,6 +32,37 @@ def _get_ip(request: Request) -> str:
 @router.post("/register")
 async def register(data: UserCreate, request: Request, db: Session = Depends(get_db)):
     return AuthRepo.register(db, data, ip_address=_get_ip(request))
+
+
+@router.post("/register_start")
+async def register_start(data: RegisterStart, request: Request, db: Session = Depends(get_db)):
+    return AuthRepo.register_start(db, data, ip_address=_get_ip(request))
+
+
+@router.post("/send_signup_email_otp")
+async def send_signup_email_otp(data: SignupDraftRequest, db: Session = Depends(get_db)):
+    return AuthRepo.send_signup_email_otp(db, data.draft_id)
+
+
+@router.post("/verify_signup_email_otp")
+async def verify_signup_email_otp(data: SignupDraftVerifyRequest, db: Session = Depends(get_db)):
+    return AuthRepo.verify_signup_email_otp(db, data.draft_id, data.code)
+
+
+@router.post("/send_signup_phone_otp")
+async def send_signup_phone_otp(data: SignupDraftPhoneRequest, db: Session = Depends(get_db)):
+    return AuthRepo.send_signup_phone_otp(db, data.draft_id, data.phone_number)
+
+
+@router.post("/verify_signup_phone_otp")
+async def verify_signup_phone_otp(data: SignupDraftVerifyPhoneRequest, request: Request, db: Session = Depends(get_db)):
+    return AuthRepo.verify_signup_phone_otp(
+        db,
+        data.draft_id,
+        data.phone_number,
+        data.code,
+        ip_address=_get_ip(request),
+    )
 
 
 @router.post("/login")

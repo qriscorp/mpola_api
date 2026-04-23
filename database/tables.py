@@ -76,6 +76,25 @@ class DeactivatedAccount(Base, TimestampMixin):
     scheduled_deletion_date = Column(DateTime, nullable=True)
 
 
+class SignupDraft(Base, TimestampMixin):
+    __tablename__ = "signup_drafts"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    username = Column(String(100), nullable=False, index=True)
+    email = Column(String(255), nullable=False, index=True)
+    phone_number = Column(String(20), nullable=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    full_name = Column(String(200), nullable=True)
+    nin = Column(String(50), nullable=True)
+    account_type = Column(String(20), default="individual")
+    role = Column(String(30), default="borrower")
+    email_verified = Column(Boolean, default=False)
+    phone_verified = Column(Boolean, default=False)
+    is_completed = Column(Boolean, default=False)
+    created_user_id = Column(String(50), nullable=True)
+    expires_at = Column(DateTime, nullable=False)
+
+
 # ═══════════════════════════════════════
 #  OTP
 # ═══════════════════════════════════════
