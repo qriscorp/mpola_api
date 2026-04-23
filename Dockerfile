@@ -1,25 +1,25 @@
+# Use an official Python runtime as a parent image
 FROM python:3.12-slim
 
-WORKDIR /app
-
-# Install system dependencies for MySQL
+# Install system dependencies for MySQL and general build
 RUN apt-get update && apt-get install -y \
-    default-libmysqlclient-dev \
-    build-essential \
+    gcc \
+    libc-dev \
+    libmariadb-dev-compat \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Set the working directory in the container
+WORKDIR /app
 
-COPY . .
+# Copy the current directory contents into the container at /app
+COPY . /app
 
-RUN mkdir -p static uploads logs
+# Install any needed packages specified in requirements.txt
+RUN pip install -r requirements.txt
 
+# Make port 8000 available to the world outside this container
 EXPOSE 8000
 
-# Non-root user for security
-RUN adduser --disabled-password --gecos '' appuser && chown -R appuser:appuser /app
-USER appuser
-
-CMD ["gunicorn", "main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000"]
+# Run Gunicorn with Uvicorn workers
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:8000"]

@@ -31,6 +31,7 @@ LOGIN_MAX_ATTEMPTS = 5
 LOGIN_LOCKOUT_MINUTES = 15
 PASSWORD_MIN_LENGTH = 8
 ALLOWED_REGISTRATION_ROLES = {"borrower", "lender"}  # Users CANNOT register as admin
+ALLOWED_LOGIN_PORTALS = {"borrower", "lender"}
 
 
 # ═══════════════════════════════════════════════
@@ -296,6 +297,31 @@ class AuthRepo:
         db.add(attempt)
         db.flush()
 
+    @staticmethod
+    def _enforce_portal_role(user: User, portal: str | None):
+        if not portal:
+            return
+
+        requested_portal = portal.strip().lower()
+        if requested_portal not in ALLOWED_LOGIN_PORTALS:
+            raise HTTPException(status_code=400, detail="Invalid login portal")
+
+        role = (user.role or "borrower").lower()
+        if role in {"admin", "super_admin"}:
+            return
+
+        if requested_portal == "borrower" and role == "lender":
+            raise HTTPException(
+                status_code=403,
+                detail="This account is registered as a lender. Please sign in from the lender portal.",
+            )
+
+        if requested_portal == "lender" and role == "borrower":
+            raise HTTPException(
+                status_code=403,
+                detail="This account is registered as a borrower. Please sign in from the borrower portal.",
+            )
+
     # ── register ────────────────────────────────
 
     @staticmethod
@@ -445,6 +471,9 @@ class AuthRepo:
                 status_code=401,
                 detail="Invalid credentials. Please check your password and try again.",
             )
+
+        # Enforce portal-specific sign-in for borrower/lender accounts.
+        AuthRepo._enforce_portal_role(user, getattr(login_data, "portal", None))
 
         # Successful login
         AuthRepo._record_login_attempt(db, identifier, True, ip_address)
@@ -870,7 +899,13 @@ class AuthRepo:
         return {"status": 200, "message": "If this number is registered, a code has been sent."}
 
     @staticmethod
-    def verify_login_phone_otp(db: Session, phone_number: str, code: str, ip_address: str = "unknown"):
+    def verify_login_phone_otp(
+        db: Session,
+        phone_number: str,
+        code: str,
+        ip_address: str = "unknown",
+        portal: str | None = None,
+    ):
         normalized = normalizePhoneNumber(phone_number) or phone_number
 
         user = (
@@ -900,6 +935,8 @@ class AuthRepo:
         if not _verify_otp_hash(code, otp.code_hash):
             db.commit()
             raise HTTPException(status_code=400, detail="Invalid code")
+
+        AuthRepo._enforce_portal_role(user, portal)
 
         db.delete(otp)
 

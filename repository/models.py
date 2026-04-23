@@ -18,6 +18,17 @@ class AuthUser(BaseModel):
 class Login(BaseModel):
     username: str = Field(..., min_length=1, max_length=255)  # email or username
     password: str = Field(..., min_length=1, max_length=128)
+    portal: Optional[str] = Field(None, description="borrower or lender")
+
+    @field_validator('portal')
+    @classmethod
+    def validate_portal(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        portal = v.lower().strip()
+        if portal not in {'borrower', 'lender'}:
+            raise ValueError('portal must be either borrower or lender')
+        return portal
 
 
 class UserCreate(BaseModel):
@@ -99,6 +110,17 @@ class SendLoginPhoneOTPModel(BaseModel):
 class VerifyLoginPhoneOTPModel(BaseModel):
     phone_number: str
     code: str
+    portal: Optional[str] = Field(None, description="borrower or lender")
+
+    @field_validator('portal')
+    @classmethod
+    def validate_portal(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        portal = v.lower().strip()
+        if portal not in {'borrower', 'lender'}:
+            raise ValueError('portal must be either borrower or lender')
+        return portal
 
 
 class SendOTPModel(BaseModel):

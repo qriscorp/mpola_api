@@ -1,13 +1,7 @@
-"""
-LendFlow API — FastAPI Application
-───────────────────────────────────
-Peer-to-peer lending platform backend.
-Security: Rate limiting, security headers, JWT auth, RBAC, audit logging.
-"""
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+import os
 
 from middleware.security import SecurityHeadersMiddleware, RateLimitMiddleware
 from routers import (
@@ -30,23 +24,53 @@ app = FastAPI(
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RateLimitMiddleware)
 
-# ─── CORS — restrict to known origins (not wildcard *) ──────
+# ─── CORS — strict allowlist by default; supports ALLOWED_ORIGINS=* ───
 
-ALLOWED_ORIGINS = [
+DEFAULT_ALLOWED_ORIGINS = [
     "http://localhost:3000",       # Next.js dev
     "http://localhost:3001",       # Next.js alt
     "http://localhost:8081",       # Expo dev
     "http://localhost:19006",      # Expo web
+    "https://welend.qriscorp.com", # Production web
+    "https://admin.qriscorp.com",  # Production admin
+    "https://api.qriscorp.com",    # API docs/tools
     "https://lendflow.app",       # Production web
     "https://admin.lendflow.app", # Production admin
 ]
 
+
+
+
+raw_allowed_origins = os.getenv("ALLOWED_ORIGINS", "")
+if raw_allowed_origins.strip():
+    parsed_allowed_origins = [
+        origin.strip()
+        for origin in raw_allowed_origins.split(",")
+        if origin.strip()
+    ]
+else:
+    parsed_allowed_origins = DEFAULT_ALLOWED_ORIGINS
+
+allow_all_origins = len(parsed_allowed_origins) == 1 and parsed_allowed_origins[0] == "*"
+
+if allow_all_origins:
+    cors_allow_origins = ["*"]
+    # Browsers do not allow credentialed requests with wildcard origins.
+    cors_allow_credentials = False
+    cors_allow_methods = ["*"]
+    cors_allow_headers = ["*"]
+else:
+    cors_allow_origins = parsed_allowed_origins
+    cors_allow_credentials = True
+    cors_allow_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    cors_allow_headers = ["Authorization", "Content-Type", "X-Request-ID"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    allow_origins=cors_allow_origins,
+    allow_credentials=cors_allow_credentials,
+    allow_methods=cors_allow_methods,
+    allow_headers=cors_allow_headers,
     expose_headers=["X-Request-ID"],
 )
 
@@ -60,8 +84,6 @@ app.include_router(notifications_router)
 app.include_router(admin_router)
 
 # ─── Static files ───────────────────────────────────────────
-
-import os
 os.makedirs("static", exist_ok=True)
 os.makedirs("uploads", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")

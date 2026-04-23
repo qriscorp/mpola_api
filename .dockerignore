@@ -1,0 +1,46 @@
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+.env
+
+# Logs
+*.log
+logs/
+
+# Data / exports
+*.csv
+*.xlsx
+exports/
+news/
+
+# IDE
+.vscode/
+.idea/
+
+# System
+.DS_Store
+
+# Docker
+Dockerfile
+docker-compose.yml
+
+# Anything large (IMPORTANT)
+core.*
+*.zip
+*.tar
+*.gz
+
+media/
+uploads/
+staticfiles/
+
+*.db
+*.sqlite

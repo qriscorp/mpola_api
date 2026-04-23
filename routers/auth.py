@@ -84,7 +84,13 @@ async def send_login_phone_otp(data: SendLoginPhoneOTPModel, db: Session = Depen
 
 @router.post("/verify_login_phone_otp")
 async def verify_login_phone_otp(data: VerifyLoginPhoneOTPModel, request: Request, db: Session = Depends(get_db)):
-    return AuthRepo.verify_login_phone_otp(db, data.phone_number, data.code, ip_address=_get_ip(request))
+    return AuthRepo.verify_login_phone_otp(
+        db,
+        data.phone_number,
+        data.code,
+        ip_address=_get_ip(request),
+        portal=data.portal,
+    )
 
 
 @router.post("/change_password")
