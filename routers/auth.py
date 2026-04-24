@@ -39,6 +39,11 @@ async def register_start(data: RegisterStart, request: Request, db: Session = De
     return AuthRepo.register_start(db, data, ip_address=_get_ip(request))
 
 
+@router.get("/signup_draft/{draft_id}")
+async def get_signup_draft_status(draft_id: str, db: Session = Depends(get_db)):
+    return AuthRepo.get_signup_draft_status(db, draft_id)
+
+
 @router.post("/send_signup_email_otp")
 async def send_signup_email_otp(data: SignupDraftRequest, db: Session = Depends(get_db)):
     return AuthRepo.send_signup_email_otp(db, data.draft_id)

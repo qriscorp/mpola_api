@@ -335,12 +335,40 @@ class AuthRepo:
         return username
 
     @staticmethod
-    def _get_active_signup_draft(db: Session, draft_id: str) -> SignupDraft:
+    def _signup_draft_payload(draft: SignupDraft) -> dict:
+        next_step = "completed"
+        if not draft.is_completed:
+            if not draft.email_verified:
+                next_step = "verify_email"
+            elif not draft.phone_verified:
+                next_step = "verify_phone"
+            else:
+                # Defensive fallback: avoid signin/login loops on inconsistent state.
+                next_step = "verify_email"
+
+        return {
+            "draft_id": draft.id,
+            "email": draft.email,
+            "phone_number": draft.phone_number,
+            "role": draft.role,
+            "email_verified": bool(draft.email_verified),
+            "phone_verified": bool(draft.phone_verified),
+            "is_completed": bool(draft.is_completed),
+            "next_step": next_step,
+            "expires_at": draft.expires_at.isoformat() if draft.expires_at else None,
+        }
+
+    @staticmethod
+    def _get_active_signup_draft(
+        db: Session,
+        draft_id: str,
+        allow_completed: bool = False,
+    ) -> SignupDraft:
         draft = db.query(SignupDraft).filter(SignupDraft.id == draft_id).first()
         if not draft:
             raise HTTPException(status_code=404, detail="Signup session not found")
 
-        if draft.is_completed:
+        if draft.is_completed and not allow_completed:
             raise HTTPException(status_code=400, detail="Signup already completed. Please sign in.")
 
         if draft.expires_at < datetime.utcnow():
@@ -350,6 +378,20 @@ class AuthRepo:
             raise HTTPException(status_code=400, detail="Signup session expired. Please register again.")
 
         return draft
+
+    @staticmethod
+    def get_signup_draft_status(db: Session, draft_id: str):
+        draft = AuthRepo._get_active_signup_draft(
+            db,
+            draft_id,
+            allow_completed=True,
+        )
+        return {
+            "status": 200,
+            "message": "Signup draft fetched",
+            "account_created": bool(draft.is_completed),
+            "draft": AuthRepo._signup_draft_payload(draft),
+        }
 
     @staticmethod
     def _upsert_signup_otp(db: Session, draft_id: str, purpose: str, code: str, phone_number: str | None = None):
@@ -469,11 +511,22 @@ class AuthRepo:
             "email": draft.email,
             "phone_number": draft.phone_number,
             "role": draft.role,
+            "account_created": False,
+            "draft": AuthRepo._signup_draft_payload(draft),
         }
 
     @staticmethod
     def send_signup_email_otp(db: Session, draft_id: str):
         draft = AuthRepo._get_active_signup_draft(db, draft_id)
+
+        if draft.email_verified:
+            return {
+                "status": 200,
+                "message": "Email already verified",
+                "account_created": bool(draft.is_completed),
+                "draft": AuthRepo._signup_draft_payload(draft),
+            }
+
         email_code = _generate_otp_code()
         AuthRepo._upsert_signup_otp(db, draft.id, "signup_email", email_code)
         db.commit()
@@ -489,11 +542,25 @@ class AuthRepo:
             daemon=True,
         ).start()
 
-        return {"status": 200, "message": "OTP sent to email"}
+        return {
+            "status": 200,
+            "message": "OTP sent to email",
+            "account_created": bool(draft.is_completed),
+            "draft": AuthRepo._signup_draft_payload(draft),
+        }
 
     @staticmethod
     def verify_signup_email_otp(db: Session, draft_id: str, code: str):
         draft = AuthRepo._get_active_signup_draft(db, draft_id)
+
+        if draft.email_verified:
+            return {
+                "status": 200,
+                "message": "Email already verified",
+                "account_created": bool(draft.is_completed),
+                "draft": AuthRepo._signup_draft_payload(draft),
+            }
+
         otp = db.query(OTP).filter(
             OTP.username == draft.id,
             OTP.purpose == "signup_email",
@@ -520,12 +587,40 @@ class AuthRepo:
 
         draft.email_verified = True
         db.delete(otp)
+
+        account_created = False
+        if draft.phone_verified:
+            AuthRepo._finalize_signup_draft(db, draft)
+            account_created = True
+            db.refresh(draft)
+            return {
+                "status": 200,
+                "message": "Account created successfully. Please sign in.",
+                "account_created": account_created,
+                "draft": AuthRepo._signup_draft_payload(draft),
+            }
+
         db.commit()
-        return {"status": 200, "message": "Email verified successfully"}
+        db.refresh(draft)
+        return {
+            "status": 200,
+            "message": "Email verified. Please verify phone to finish signup.",
+            "account_created": account_created,
+            "draft": AuthRepo._signup_draft_payload(draft),
+        }
 
     @staticmethod
     def send_signup_phone_otp(db: Session, draft_id: str, phone_number: str):
         draft = AuthRepo._get_active_signup_draft(db, draft_id)
+
+        if draft.phone_verified:
+            return {
+                "status": 200,
+                "message": "Phone already verified",
+                "account_created": bool(draft.is_completed),
+                "draft": AuthRepo._signup_draft_payload(draft),
+            }
+
         normalized = normalizePhoneNumber(phone_number)
         if not normalized:
             raise HTTPException(status_code=400, detail="Invalid phone number")
@@ -542,7 +637,12 @@ class AuthRepo:
         logger.debug(f"[DEV ONLY] Signup phone OTP for draft {draft.id}: {phone_code}")
         message = f"Your Welend verification code is: {phone_code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
         threading.Thread(target=send_sms, args=(normalized, message), daemon=True).start()
-        return {"status": 200, "message": "OTP sent to phone"}
+        return {
+            "status": 200,
+            "message": "OTP sent to phone",
+            "account_created": bool(draft.is_completed),
+            "draft": AuthRepo._signup_draft_payload(draft),
+        }
 
     @staticmethod
     def _finalize_signup_draft(db: Session, draft: SignupDraft, ip_address: str | None = None):
@@ -594,6 +694,15 @@ class AuthRepo:
     @staticmethod
     def verify_signup_phone_otp(db: Session, draft_id: str, phone_number: str, code: str, ip_address: str | None = None):
         draft = AuthRepo._get_active_signup_draft(db, draft_id)
+
+        if draft.phone_verified:
+            return {
+                "status": 200,
+                "message": "Phone already verified",
+                "account_created": bool(draft.is_completed),
+                "draft": AuthRepo._signup_draft_payload(draft),
+            }
+
         normalized = normalizePhoneNumber(phone_number)
         if not normalized:
             raise HTTPException(status_code=400, detail="Invalid phone number")
@@ -628,10 +737,22 @@ class AuthRepo:
 
         if not draft.email_verified:
             db.commit()
-            return {"status": 200, "message": "Phone verified. Please verify email to finish signup."}
+            db.refresh(draft)
+            return {
+                "status": 200,
+                "message": "Phone verified. Please verify email to finish signup.",
+                "account_created": False,
+                "draft": AuthRepo._signup_draft_payload(draft),
+            }
 
         AuthRepo._finalize_signup_draft(db, draft, ip_address=ip_address)
-        return {"status": 200, "message": "Account created successfully. Please sign in."}
+        db.refresh(draft)
+        return {
+            "status": 200,
+            "message": "Account created successfully. Please sign in.",
+            "account_created": True,
+            "draft": AuthRepo._signup_draft_payload(draft),
+        }
 
     # ── register ────────────────────────────────
 
