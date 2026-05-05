@@ -12,6 +12,7 @@ from helpers import generateReferenceNumber
 from repository.dependencies import get_db, current_active_user
 from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, RepaymentCreate, GuarantorCreate
 from repository.security import require_roles
+from utils.upg_client import UPGClient, _detect_carrier
 
 router = APIRouter(prefix="/loans", tags=["Loans"])
 
@@ -214,6 +215,20 @@ async def respond_to_offer(
     if data.status == "accepted":
         offer.status = "accepted"
         app.status = "funded"
+
+        # Disburse loan funds to borrower's mobile money via UPG
+        borrower = db.query(User).filter(User.id == app.borrower_id).first()
+        borrower_phone = borrower.phone_number if borrower else None
+        if not borrower_phone:
+            raise HTTPException(status_code=400, detail="Borrower has no phone number on record for disbursement")
+        carrier = _detect_carrier(borrower_phone)
+        try:
+            disburse_resp = UPGClient().disburse(amount=offer.amount, phone=borrower_phone, carrier=carrier)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Disbursement failed: {e}")
+        if not UPGClient.is_success(disburse_resp):
+            raise HTTPException(status_code=400, detail=disburse_resp.get("message", "Mobile money disbursement failed"))
+
         # Create active loan
         loan = Loan(
             application_id=app.id,
@@ -301,6 +316,20 @@ async def make_repayment(
         payment_method=data.payment_method,
     )
     db.add(repayment)
+
+    # If paying via mobile money, collect from borrower's phone via UPG
+    if data.payment_method == "mobile_money":
+        phone = data.phone_number or user.phone_number
+        if not phone:
+            raise HTTPException(status_code=400, detail="Phone number required for mobile money repayment")
+        carrier = (data.carrier or _detect_carrier(phone)).upper()
+        try:
+            resp = UPGClient().collect(amount=data.amount, phone=phone, carrier=carrier)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Payment gateway error: {e}")
+        if not UPGClient.is_success(resp):
+            raise HTTPException(status_code=400, detail=resp.get("message", "Mobile money collection failed"))
+        repayment.reference = UPGClient.transaction_id(resp)
 
     loan.total_paid += data.amount
     loan.paid_instalments += 1

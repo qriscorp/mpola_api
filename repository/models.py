@@ -236,11 +236,13 @@ class WalletSetupModel(BaseModel):
 class WalletDepositModel(BaseModel):
     amount: float = Field(..., ge=1000)
     phone_number: Optional[str] = None
+    carrier: Optional[str] = None  # MTN or AIRTEL; auto-detected if omitted
 
 
 class WalletWithdrawModel(BaseModel):
     amount: float = Field(..., ge=1000)
     phone_number: str
+    carrier: Optional[str] = None  # MTN or AIRTEL; auto-detected if omitted
 
 
 class WalletTransferModel(BaseModel):
@@ -251,7 +253,9 @@ class WalletTransferModel(BaseModel):
 class RepaymentCreate(BaseModel):
     loan_id: str
     amount: float
-    payment_method: str = "wallet"
+    payment_method: str = "wallet"  # wallet or mobile_money
+    phone_number: Optional[str] = None  # required when payment_method=mobile_money
+    carrier: Optional[str] = None       # MTN or AIRTEL; auto-detected if omitted
 
 
 # ─── Notifications ────────────────────────────
