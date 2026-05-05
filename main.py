@@ -31,9 +31,12 @@ DEFAULT_ALLOWED_ORIGINS = [
     "http://localhost:3001",       # Next.js alt
     "http://localhost:8081",       # Expo dev
     "http://localhost:19006",      # Expo web
-    "https://welend.qriscorp.com", # Production web
-    "https://admin.welend.qriscorp.com",  # Production admin
+    "https://mpola.co", # Production web
+    "https://www.mpola.co", # Production web
+    "https://admin.mpola.co",  # Production admin
     "https://api.welend.qriscorp.com",    # API docs/tools
+    "https://api.mpola.co",    # API docs/tools
+    "https://api.unified.qriscorp.com",    # API docs/tools
     "https://lendflow.app",       # Production web
     "https://admin.lendflow.app", # Production admin
 ]
