@@ -1,5 +1,5 @@
 services:
-  lendflow-api:
+  mpola-api:
     build: .
     ports:
       - "127.0.0.1:8010:8000"

@@ -1,12 +1,12 @@
 """HTTP client for the Unified Payment Gateway (UPG).
 
-All payment operations in lendflow_api route through UPG instead of
+All payment operations in mpola_api route through UPG instead of
 calling Interswitch directly. UPG is hosted at UPG_BASE_URL.
 
 Required env vars:
     UPG_BASE_URL    - e.g. https://api.unified.qriscorp.com
     UPG_API_KEY     - project API key issued by UPG admin
-    UPG_PROJECT_ID  - e.g. "lendflow"
+    UPG_PROJECT_ID  - e.g. "mpola"
 """
 import os
 import uuid
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 UPG_BASE_URL = os.getenv("UPG_BASE_URL", "https://api.unified.qriscorp.com")
 UPG_API_KEY = os.getenv("UPG_API_KEY")
-UPG_PROJECT_ID = os.getenv("UPG_PROJECT_ID", "lendflow")
+UPG_PROJECT_ID = os.getenv("UPG_PROJECT_ID", "mpola")
 
 
 def _detect_carrier(phone: str) -> str:

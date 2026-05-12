@@ -9,11 +9,11 @@ from pathlib import Path
 logs_dir = Path(__file__).resolve().parents[1] / "logs"
 logs_dir.mkdir(exist_ok=True)
 
-logger = logging.getLogger("lendflow")
+logger = logging.getLogger("mpola")
 logger.setLevel(logging.DEBUG)
 
 # File handler
-fh = logging.FileHandler(logs_dir / "lendflow.log")
+fh = logging.FileHandler(logs_dir / "mpola.log")
 fh.setLevel(logging.DEBUG)
 
 # Console handler

@@ -1,5 +1,5 @@
 """
-Pydantic request/response models for LendFlow API.
+Pydantic request/response models for Mpola API.
 """
 
 import re
