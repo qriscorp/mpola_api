@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
 *.pyo
-# .env
 venv/
 .venv/
 logs/*.log
@@ -12,3 +11,12 @@ static/*
 *.db
 .idea/
 .vscode/
+uploads/
+core.*
+alembic.ini
+alembic/
+database.db
+dev.db
+test.db
+# .env.local
+# .env.*
