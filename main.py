@@ -31,14 +31,14 @@ DEFAULT_ALLOWED_ORIGINS = [
     "http://localhost:3001",       # Next.js alt
     "http://localhost:8081",       # Expo dev
     "http://localhost:19006",      # Expo web
-    "https://api.welend.qriscorp.com",    # legacy API endpoint
-    "https://api.mpola.co",    # Production API
+    "https://api.welend.qriscorp.com",    # Current production API (legacy domain, not yet cut over to api.mpola.co)
+    "https://api.mpola.co",    # Production API (target domain, pending DNS cutover)
     "https://mpola.co", # Production web
     "https://www.mpola.co", # Production web
     "https://admin.mpola.co",  # Production admin
     "https://api.unified.qriscorp.com",    # API docs/tools
-    "https://lendflow.app",       # legacy web
-    "https://admin.lendflow.app", # legacy admin
+    "https://lendflow.app",       # legacy web (retire once traffic confirmed off it)
+    "https://admin.lendflow.app", # legacy admin (retire once traffic confirmed off it)
 ]
 
 
