@@ -464,6 +464,78 @@ async def my_active_loans(
     return {"total": total, "loans": [_loan_response(l) for l in loans]}
 
 
+@router.get("/earnings")
+async def my_earnings(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Aggregate lender earnings, computed from real loan/repayment data.
+
+    Interest earned is approximated per-repayment as
+    repayment_amount * (total_repayable - amount) / total_repayable —
+    i.e. every repayment carries the same interest/principal split as the
+    loan overall. This matches the flat/add-on interest model used when
+    offers are priced (see make_offer/create_application), since no
+    amortization schedule is tracked to split payments more precisely.
+    """
+    loans = db.query(Loan).filter(Loan.lender_id == user.id).all()
+
+    def interest_ratio(loan: Loan) -> float:
+        return (loan.total_repayable - loan.amount) / loan.total_repayable if loan.total_repayable else 0.0
+
+    total_deployed = sum(l.amount for l in loans)
+    active_loans = sum(1 for l in loans if l.status in ("active", "overdue"))
+    total_repaid = sum(l.total_paid for l in loans)
+    total_earned = sum(l.total_paid * interest_ratio(l) for l in loans)
+    avg_yield = sum(l.interest_rate for l in loans) / len(loans) if loans else 0.0
+
+    loan_by_id = {l.id: l for l in loans}
+    monthly_totals = {}
+    this_month_earned = 0.0
+    now = datetime.now(timezone.utc)
+
+    if loans:
+        repayments = db.query(Repayment).filter(
+            Repayment.loan_id.in_(list(loan_by_id.keys())),
+        ).all()
+        for r in repayments:
+            loan = loan_by_id.get(r.loan_id)
+            if not loan:
+                continue
+            earned_portion = r.amount * interest_ratio(loan)
+            month_key = r.created_at.strftime("%Y-%m")
+            monthly_totals[month_key] = monthly_totals.get(month_key, 0.0) + earned_portion
+            if r.created_at.year == now.year and r.created_at.month == now.month:
+                this_month_earned += earned_portion
+
+    months = []
+    y, m = now.year, now.month
+    for _ in range(6):
+        months.append((y, m))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    months.reverse()
+
+    monthly_earnings = [
+        {
+            "month": f"{y:04d}-{m:02d}",
+            "amount": round(monthly_totals.get(f"{y:04d}-{m:02d}", 0.0), 2),
+        }
+        for (y, m) in months
+    ]
+
+    return {
+        "total_deployed": round(total_deployed, 2),
+        "active_loans": active_loans,
+        "total_repaid": round(total_repaid, 2),
+        "total_earned": round(total_earned, 2),
+        "this_month_earned": round(this_month_earned, 2),
+        "avg_yield": round(avg_yield, 2),
+        "monthly_earnings": monthly_earnings,
+    }
+
+
 @router.get("/active/{loan_id}")
 async def get_loan(
     loan_id: str,
@@ -603,9 +675,14 @@ def _app_response(app: LoanApplication, include_offers: bool = False) -> dict:
 
 
 def _offer_response(offer: LoanOffer) -> dict:
+    app = offer.application
     return {
         "id": offer.id,
         "application_id": offer.application_id,
+        "application_reference": app.reference_number if app else None,
+        "borrower_name": app.borrower.full_name if app and app.borrower else None,
+        "loan_type": app.loan_type if app else None,
+        "application_status": app.status if app else None,
         "lender_id": offer.lender_id,
         "lender_name": offer.lender.full_name if offer.lender else None,
         "amount": offer.amount,
@@ -623,6 +700,8 @@ def _loan_response(loan: Loan, include_repayments: bool = False) -> dict:
         "id": loan.id,
         "borrower_id": loan.borrower_id,
         "lender_id": loan.lender_id,
+        "borrower_name": loan.borrower.full_name if loan.borrower else None,
+        "lender_name": loan.lender_user.full_name if loan.lender_user else None,
         "amount": loan.amount,
         "interest_rate": loan.interest_rate,
         "duration": loan.duration,
