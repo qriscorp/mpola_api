@@ -1,14 +1,14 @@
 """
 Loans router — applications, offers, active loans, repayments.
-Returns dummy data for now (connected to real auth).
 """
 
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from database.tables import User, LoanApplication, LoanOffer, Loan, Repayment, Guarantor, LoanDocument
+from database.tables import User, LoanApplication, LoanOffer, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction
 from helpers import generateReferenceNumber
+from repository.auth_repo import _audit
 from repository.dependencies import get_db, current_active_user
 from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, RepaymentCreate, GuarantorCreate
 from repository.security import require_roles
@@ -317,8 +317,8 @@ async def make_repayment(
     )
     db.add(repayment)
 
-    # If paying via mobile money, collect from borrower's phone via UPG
     if data.payment_method == "mobile_money":
+        # Collect straight from the borrower's phone via UPG — doesn't touch the wallet.
         phone = data.phone_number or user.phone_number
         if not phone:
             raise HTTPException(status_code=400, detail="Phone number required for mobile money repayment")
@@ -329,17 +329,57 @@ async def make_repayment(
             raise HTTPException(status_code=502, detail=f"Payment gateway error: {e}")
         if not UPGClient.is_success(resp):
             raise HTTPException(status_code=400, detail=resp.get("message", "Mobile money collection failed"))
-        repayment.reference = UPGClient.transaction_id(resp)
+        repayment.transaction_id = UPGClient.transaction_id(resp)
+    else:
+        # Wallet repayment — debit the borrower's own wallet balance.
+        wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+        if not wallet or not wallet.is_wallet_setup:
+            raise HTTPException(status_code=400, detail="Please set up your wallet first")
+        if wallet.balance < data.amount:
+            raise HTTPException(status_code=400, detail="Insufficient wallet balance")
+
+        wallet.balance -= data.amount
+        wallet_tx = WalletTransaction(
+            wallet_id=wallet.id,
+            amount=data.amount,
+            type="repayment",
+            status="completed",
+            description=f"Loan repayment — instalment #{loan.paid_instalments + 1}",
+            counterparty=loan.id,
+        )
+        db.add(wallet_tx)
+        db.flush()  # populate wallet_tx.id before using it as the repayment's reference
+        repayment.transaction_id = wallet_tx.id
 
     loan.total_paid += data.amount
     loan.paid_instalments += 1
     if loan.total_paid >= loan.total_repayable:
         loan.status = "completed"
+        loan.next_payment_date = None
+        loan.next_payment_amount = None
     else:
         loan.next_payment_date = datetime.now(timezone.utc) + timedelta(days=30)
+        loan.next_payment_amount = loan.monthly_payment
 
+    _audit(db, "loan_repayment", username=user.username, user_id=user.id,
+           resource_type="loan", resource_id=loan.id,
+           details={"amount": data.amount, "payment_method": data.payment_method,
+                     "instalment_number": repayment.instalment_number})
     db.commit()
-    return {"status": 200, "message": "Repayment recorded"}
+
+    return {
+        "status": 200,
+        "message": "Repayment recorded",
+        "repayment": {
+            "id": repayment.id,
+            "amount": repayment.amount,
+            "instalment_number": repayment.instalment_number,
+            "payment_method": repayment.payment_method,
+            "transaction_id": repayment.transaction_id,
+            "created_at": str(repayment.created_at),
+        },
+        "loan": _loan_response(loan),
+    }
 
 
 # ═══════════════════════════════════════════════
@@ -412,6 +452,7 @@ def _loan_response(loan: Loan, include_repayments: bool = False) -> dict:
                 "instalment_number": r.instalment_number,
                 "status": r.status,
                 "payment_method": r.payment_method,
+                "transaction_id": r.transaction_id,
                 "created_at": str(r.created_at),
             }
             for r in loan.repayments
