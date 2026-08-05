@@ -209,6 +209,9 @@ class Guarantor(Base, TimestampMixin):
     phone = Column(String(20), nullable=False)
     relationship_type = Column(String(50), nullable=True)  # friend, family, colleague
     status = Column(String(20), default="pending")  # pending, accepted, declined
+    # Secret, single-use link sent by SMS so the guarantor (who has no account) can respond.
+    confirmation_token = Column(String(64), unique=True, nullable=True)
+    responded_at = Column(DateTime, nullable=True)
 
     application = relationship("LoanApplication", back_populates="guarantors")
 

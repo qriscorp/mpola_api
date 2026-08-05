@@ -2,17 +2,26 @@
 Loans router — applications, offers, active loans, repayments.
 """
 
+import os
+import threading
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
+from config import BASE_URL, FRONTEND_URL
 from database.tables import User, LoanApplication, LoanOffer, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction
-from helpers import generateReferenceNumber
-from repository.auth_repo import _audit
+from helpers import generateReferenceNumber, generateUniqueId, normalizePhoneNumber
+from repository.auth_repo import _audit, send_sms
 from repository.dependencies import get_db, current_active_user
-from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, RepaymentCreate, GuarantorCreate
+from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, RepaymentCreate, GuarantorCreate, GuarantorRespond
 from repository.security import require_roles
 from utils.upg_client import UPGClient, _detect_carrier
+
+# Guarantors must reach this many "accepted" responses before a loan can be disbursed.
+REQUIRED_ACCEPTED_GUARANTORS = 2
+
+MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
+ALLOWED_DOCUMENT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
 
 router = APIRouter(prefix="/loans", tags=["Loans"])
 
@@ -95,21 +104,176 @@ async def add_guarantor(
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
 ):
+    """Add a guarantor and text them a link to accept or decline.
+    A loan can't be disbursed until REQUIRED_ACCEPTED_GUARANTORS have accepted.
+    """
     app = db.query(LoanApplication).filter(
         LoanApplication.id == app_id, LoanApplication.borrower_id == user.id
     ).first()
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
 
+    token = generateUniqueId(22)
     g = Guarantor(
         application_id=app_id,
         name=data.name,
         phone=data.phone,
         relationship_type=data.relationship_type,
+        confirmation_token=token,
     )
     db.add(g)
+    _audit(db, "guarantor_added", username=user.username, user_id=user.id,
+           resource_type="loan_application", resource_id=app_id,
+           details={"guarantor_name": data.name, "guarantor_phone": data.phone})
     db.commit()
+
+    normalized = normalizePhoneNumber(data.phone)
+    if normalized:
+        link = f"{FRONTEND_URL}/guarantor/{token}"
+        borrower_name = user.full_name or user.username
+        message = (
+            f"{borrower_name} asked you to be a guarantor on Mpola for a loan of "
+            f"UGX {app.amount:,.0f}. Confirm or decline: {link}"
+        )
+        threading.Thread(target=send_sms, args=(normalized, message), daemon=True).start()
+
     return {"status": 200, "message": "Guarantor added"}
+
+
+# ═══════════════════════════════════════════════
+#  GUARANTOR CONFIRMATION (public — guarantors have no account)
+# ═══════════════════════════════════════════════
+
+@router.get("/guarantors/{token}")
+async def get_guarantor_invite(token: str, db: Session = Depends(get_db)):
+    """Public lookup so a guarantor can see what they're being asked to confirm."""
+    g = db.query(Guarantor).filter(Guarantor.confirmation_token == token).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Invite not found")
+
+    app = db.query(LoanApplication).filter(LoanApplication.id == g.application_id).first()
+    borrower = app.borrower if app else None
+
+    return {
+        "guarantor": {
+            "id": g.id,
+            "name": g.name,
+            "status": g.status,
+        },
+        "application": {
+            "id": app.id if app else None,
+            "amount": app.amount if app else None,
+            "duration": app.duration if app else None,
+            "loan_type": app.loan_type if app else None,
+            "borrower_name": borrower.full_name if borrower else None,
+        },
+    }
+
+
+@router.post("/guarantors/{token}/respond")
+async def respond_to_guarantor_invite(
+    token: str,
+    data: GuarantorRespond,
+    db: Session = Depends(get_db),
+):
+    """Public — the guarantor accepts or declines via the SMS link. Single-use."""
+    if data.status not in ("accepted", "declined"):
+        raise HTTPException(status_code=400, detail="Status must be 'accepted' or 'declined'")
+
+    g = db.query(Guarantor).filter(Guarantor.confirmation_token == token).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    if g.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Already {g.status}")
+
+    g.status = data.status
+    g.responded_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {"status": 200, "message": f"Guarantor {data.status}"}
+
+
+# ═══════════════════════════════════════════════
+#  APPLICATION DOCUMENTS
+# ═══════════════════════════════════════════════
+
+@router.post("/applications/{app_id}/documents")
+async def upload_document(
+    app_id: str,
+    document_type: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    app = db.query(LoanApplication).filter(
+        LoanApplication.id == app_id, LoanApplication.borrower_id == user.id
+    ).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_DOCUMENT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext or 'unknown'}")
+
+    contents = await file.read()
+    if len(contents) > MAX_DOCUMENT_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="File exceeds 10MB limit")
+
+    os.makedirs("uploads", exist_ok=True)
+    stored_name = f"{generateUniqueId(20)}{ext}"
+    with open(os.path.join("uploads", stored_name), "wb") as f:
+        f.write(contents)
+
+    doc = LoanDocument(
+        application_id=app_id,
+        document_type=document_type,
+        file_url=f"{BASE_URL}/uploads/{stored_name}",
+        file_name=file.filename,
+    )
+    db.add(doc)
+    _audit(db, "document_uploaded", username=user.username, user_id=user.id,
+           resource_type="loan_application", resource_id=app_id,
+           details={"document_type": document_type})
+    db.commit()
+
+    return {
+        "status": 200,
+        "message": "Document uploaded",
+        "document": {
+            "id": doc.id,
+            "document_type": doc.document_type,
+            "file_url": doc.file_url,
+            "file_name": doc.file_name,
+            "verified": doc.verified,
+        },
+    }
+
+
+@router.get("/applications/{app_id}/documents")
+async def list_documents(
+    app_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    app = db.query(LoanApplication).filter(LoanApplication.id == app_id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if user.role not in ("admin", "super_admin", "lender") and app.borrower_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    docs = db.query(LoanDocument).filter(LoanDocument.application_id == app_id).all()
+    return {
+        "documents": [
+            {
+                "id": d.id,
+                "document_type": d.document_type,
+                "file_url": d.file_url,
+                "file_name": d.file_name,
+                "verified": d.verified,
+            }
+            for d in docs
+        ]
+    }
 
 
 # ═══════════════════════════════════════════════
@@ -204,6 +368,9 @@ async def respond_to_offer(
     user: User = Depends(current_active_user),
 ):
     """Borrower accepts or declines an offer."""
+    if data.status not in ("accepted", "declined"):
+        raise HTTPException(status_code=400, detail="Status must be 'accepted' or 'declined'")
+
     offer = db.query(LoanOffer).filter(LoanOffer.id == offer_id).first()
     if not offer:
         raise HTTPException(status_code=404, detail="Offer not found")
@@ -212,7 +379,26 @@ async def respond_to_offer(
     if not app or app.borrower_id != user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
 
+    # Guard against double-submit/replay — without this, accepting twice would
+    # disburse via UPG twice and create two Loan records for one offer.
+    if offer.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Offer already {offer.status}")
+    if app.status != "pending":
+        raise HTTPException(status_code=400, detail="This application has already been funded or is no longer open")
+
     if data.status == "accepted":
+        accepted_guarantors = db.query(Guarantor).filter(
+            Guarantor.application_id == app.id, Guarantor.status == "accepted",
+        ).count()
+        if accepted_guarantors < REQUIRED_ACCEPTED_GUARANTORS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"This loan needs {REQUIRED_ACCEPTED_GUARANTORS} guarantors to accept "
+                    f"before it can be disbursed ({accepted_guarantors} so far)."
+                ),
+            )
+
         offer.status = "accepted"
         app.status = "funded"
 
@@ -399,6 +585,12 @@ def _app_response(app: LoanApplication, include_offers: bool = False) -> dict:
         "monthly_payment": app.monthly_payment,
         "total_repayable": app.total_repayable,
         "created_at": str(app.created_at),
+        "borrower": {
+            "id": app.borrower.id,
+            "full_name": app.borrower.full_name,
+            "kyc_status": app.borrower.kyc_status,
+            "credit_score": app.borrower.credit_score,
+        } if app.borrower else None,
     }
     if include_offers:
         result["offers"] = [_offer_response(o) for o in app.offers]
@@ -415,6 +607,7 @@ def _offer_response(offer: LoanOffer) -> dict:
         "id": offer.id,
         "application_id": offer.application_id,
         "lender_id": offer.lender_id,
+        "lender_name": offer.lender.full_name if offer.lender else None,
         "amount": offer.amount,
         "interest_rate": offer.interest_rate,
         "duration": offer.duration,

@@ -208,6 +208,10 @@ class GuarantorCreate(BaseModel):
     relationship_type: Optional[str] = None
 
 
+class GuarantorRespond(BaseModel):
+    status: str  # accepted or declined
+
+
 class DocumentUpload(BaseModel):
     document_type: str
     file_url: str

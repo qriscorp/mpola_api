@@ -315,6 +315,20 @@ async def initiate_bank_withdraw(
     if wallet.balance < data.amount:
         raise HTTPException(status_code=400, detail="Insufficient funds")
 
+    # Balance isn't reserved until settlement, so block a second withdrawal from
+    # starting while one is still in flight — otherwise both could pass the balance
+    # check above and each trigger a real payout before either is confirmed.
+    has_pending_withdrawal = db.query(WalletTransaction).filter(
+        WalletTransaction.wallet_id == wallet.id,
+        WalletTransaction.type == "withdrawal",
+        WalletTransaction.status == "pending",
+    ).first()
+    if has_pending_withdrawal:
+        raise HTTPException(
+            status_code=400,
+            detail="You already have a withdrawal in progress — wait for it to complete first.",
+        )
+
     try:
         resp = UPGClient().payout(
             amount=data.amount,

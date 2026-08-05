@@ -13,6 +13,8 @@ else:
 
 DATABASE_URL = os.getenv('DATABASE_URL')
 BASE_URL = os.getenv('BASE_URL')
+# Website base URL — used to build links sent out-of-band (e.g. SMS guarantor invites).
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://mpola.co')
 JWT_SECRET = os.getenv('JWT_SECRET')
 EGOSMS_USERNAME = os.getenv('EGOSMS_USERNAME')
 EGOSMS_APIKEY = os.getenv('EGOSMS_APIKEY')
