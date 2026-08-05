@@ -250,6 +250,19 @@ class WalletTransferModel(BaseModel):
     amount: float = Field(..., ge=1000)
 
 
+class WalletCardDepositInitiateModel(BaseModel):
+    amount: float = Field(..., ge=1000)
+    redirect_url: str
+
+
+class WalletBankWithdrawInitiateModel(BaseModel):
+    amount: float = Field(..., ge=1000)
+    account_bank: str
+    account_number: str
+    beneficiary_name: str = Field(..., min_length=1)
+    narration: Optional[str] = None
+
+
 class RepaymentCreate(BaseModel):
     loan_id: str
     amount: float

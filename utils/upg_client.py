@@ -115,6 +115,82 @@ class UPGClient:
         response = requests.post(url, json=payload, headers=self._headers(idempotency_key), timeout=30)
         return self._handle_response(response)
 
+    def checkout(
+        self,
+        amount: float,
+        customer_email: str,
+        redirect_url: str,
+        customer_name: Optional[str] = None,
+        customer_phone: Optional[str] = None,
+        callback_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a Flutterwave hosted card-checkout link."""
+        if not idempotency_key:
+            idempotency_key = self._new_idempotency_key()
+        url = f"{self.base_url}/v1/checkout"
+        payload: Dict[str, Any] = {
+            "amount": str(int(amount)),
+            "currency": "UGX",
+            "customer_email": customer_email,
+            "customer_name": customer_name,
+            "customer_phone": customer_phone,
+            "redirect_url": redirect_url,
+            "callback_url": callback_url,
+        }
+        logger.info(f"UPG checkout: amount={amount}, email={customer_email}")
+        response = requests.post(url, json=payload, headers=self._headers(idempotency_key), timeout=30)
+        return self._handle_response(response)
+
+    def payout(
+        self,
+        amount: float,
+        account_bank: str,
+        account_number: str,
+        beneficiary_name: str,
+        narration: Optional[str] = None,
+        callback_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Initiate a Flutterwave bank-transfer payout."""
+        if not idempotency_key:
+            idempotency_key = self._new_idempotency_key()
+        url = f"{self.base_url}/v1/payout"
+        payload: Dict[str, Any] = {
+            "amount": str(int(amount)),
+            "currency": "UGX",
+            "account_bank": account_bank,
+            "account_number": account_number,
+            "beneficiary_name": beneficiary_name,
+            "narration": narration,
+            "callback_url": callback_url,
+        }
+        logger.info(f"UPG payout: amount={amount}, bank={account_bank}, account={account_number}")
+        response = requests.post(url, json=payload, headers=self._headers(idempotency_key), timeout=30)
+        return self._handle_response(response)
+
+    def get_payout_status(self, reference: str) -> Dict[str, Any]:
+        """Poll a payout's current state. Status is lowercase (success/pending/failed)."""
+        url = f"{self.base_url}/v1/payout/{reference}"
+        response = requests.get(url, headers=self._headers(), timeout=30)
+        return self._handle_response(response)
+
+    def get_transaction(self, transaction_id: str) -> Dict[str, Any]:
+        """Poll a transaction's current state (used for checkout/card status).
+
+        Unlike /collect, /disburse, /checkout and /payout responses, this
+        endpoint's status is UPPERCASE (SUCCESS/PENDING/PROCESSING/FAILED/REVERSED).
+        """
+        url = f"{self.base_url}/v1/transactions/{transaction_id}"
+        response = requests.get(url, headers=self._headers(), timeout=30)
+        return self._handle_response(response)
+
+    def list_banks(self, country_code: str = "UG") -> Dict[str, Any]:
+        """List valid payout destinations (banks/mobile-money operators) for a country."""
+        url = f"{self.base_url}/v1/banks/{country_code}"
+        response = requests.get(url, headers=self._headers(), timeout=30)
+        return self._handle_response(response)
+
     # ------------------------------------------------------------------
     # Response helpers
     # ------------------------------------------------------------------
