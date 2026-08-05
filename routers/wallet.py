@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from database.tables import User, Wallet, WalletTransaction
-from repository.auth_repo import get_password_hash, verify_password, _audit
+from repository.auth_repo import get_password_hash, verify_password, _audit, _notify
 from repository.dependencies import get_db, current_active_user
 from repository.models import (
     WalletSetupModel,
@@ -105,6 +105,12 @@ async def deposit(
     db.add(tx)
     _audit(db, "wallet_deposit", username=user.username, user_id=user.id,
            resource_type="wallet", details={"amount": data.amount, "phone": phone, "carrier": carrier})
+    _notify(
+        db, user.id,
+        title="Deposit successful",
+        message=f"UGX {data.amount:,.0f} was added to your wallet.",
+        type="payment",
+    )
     db.commit()
 
     return {"status": 200, "message": "Deposit successful", "balance": wallet.balance}
@@ -146,6 +152,12 @@ async def withdraw(
     db.add(tx)
     _audit(db, "wallet_withdrawal", username=user.username, user_id=user.id,
            resource_type="wallet", details={"amount": data.amount, "to": data.phone_number, "carrier": carrier})
+    _notify(
+        db, user.id,
+        title="Withdrawal successful",
+        message=f"UGX {data.amount:,.0f} was sent to {data.phone_number}.",
+        type="payment",
+    )
     db.commit()
 
     return {"status": 200, "message": "Withdrawal successful", "balance": wallet.balance}
@@ -274,6 +286,12 @@ async def get_card_deposit_status(
         tx.status = "completed"
         _audit(db, "wallet_card_deposit_completed", username=user.username, user_id=user.id,
                resource_type="wallet", details={"amount": tx.amount, "reference": reference})
+        _notify(
+            db, user.id,
+            title="Deposit successful",
+            message=f"UGX {tx.amount:,.0f} was added to your wallet via card.",
+            type="payment",
+        )
         db.commit()
     elif upg_status in ("FAILED", "REVERSED"):
         tx.status = "failed"
@@ -400,6 +418,12 @@ async def get_bank_withdraw_status(
             tx.status = "completed"
             _audit(db, "wallet_bank_withdraw_completed", username=user.username, user_id=user.id,
                    resource_type="wallet", details={"amount": tx.amount, "reference": reference})
+            _notify(
+                db, user.id,
+                title="Withdrawal successful",
+                message=f"UGX {tx.amount:,.0f} was sent to your bank account.",
+                type="payment",
+            )
         db.commit()
     elif upg_status == "failed":
         tx.status = "failed"

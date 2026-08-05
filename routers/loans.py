@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from config import BASE_URL, FRONTEND_URL
 from database.tables import User, LoanApplication, LoanOffer, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction
 from helpers import generateReferenceNumber, generateUniqueId, normalizePhoneNumber
-from repository.auth_repo import _audit, send_sms
+from repository.auth_repo import _audit, _notify, send_sms
 from repository.dependencies import get_db, current_active_user
 from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, RepaymentCreate, GuarantorCreate, GuarantorRespond
 from repository.security import require_roles
@@ -188,6 +188,15 @@ async def respond_to_guarantor_invite(
 
     g.status = data.status
     g.responded_at = datetime.now(timezone.utc)
+
+    app = db.query(LoanApplication).filter(LoanApplication.id == g.application_id).first()
+    if app:
+        _notify(
+            db, app.borrower_id,
+            title="Guarantor responded",
+            message=f"{g.name} {data.status} your request to be a guarantor.",
+            type="guarantor_response",
+        )
     db.commit()
 
     return {"status": 200, "message": f"Guarantor {data.status}"}
@@ -337,6 +346,16 @@ async def make_offer(
         monthly_payment=round(monthly_payment, 2),
     )
     db.add(offer)
+    _notify(
+        db, app.borrower_id,
+        title="New offer received",
+        message=(
+            f"{user.full_name or user.username} offered UGX {data.amount:,.0f} "
+            f"at {data.interest_rate}% p.a. for {data.duration} months on your loan request."
+        ),
+        type="loan_offer",
+        data={"application_id": app.id},
+    )
     db.commit()
     db.refresh(offer)
 
@@ -431,14 +450,39 @@ async def respond_to_offer(
             disbursed_at=datetime.now(timezone.utc),
         )
         db.add(loan)
-        # Decline other pending offers
-        db.query(LoanOffer).filter(
+
+        _notify(
+            db, offer.lender_id,
+            title="Offer accepted",
+            message=f"{user.full_name or user.username} accepted your offer of UGX {offer.amount:,.0f}. Funds have been disbursed.",
+            type="offer_accepted",
+            data={"application_id": app.id},
+        )
+
+        # Decline other pending offers, and let those lenders know
+        other_offers = db.query(LoanOffer).filter(
             LoanOffer.application_id == app.id,
             LoanOffer.id != offer_id,
             LoanOffer.status == "pending",
-        ).update({"status": "declined"})
+        ).all()
+        for other in other_offers:
+            other.status = "declined"
+            _notify(
+                db, other.lender_id,
+                title="Offer declined",
+                message="The borrower accepted a different offer on this loan request.",
+                type="offer_declined",
+                data={"application_id": app.id},
+            )
     else:
         offer.status = "declined"
+        _notify(
+            db, offer.lender_id,
+            title="Offer declined",
+            message=f"{user.full_name or user.username} declined your offer of UGX {offer.amount:,.0f}.",
+            type="offer_declined",
+            data={"application_id": app.id},
+        )
 
     db.commit()
     return {"status": 200, "message": f"Offer {data.status}"}
@@ -483,11 +527,16 @@ async def my_earnings(
     def interest_ratio(loan: Loan) -> float:
         return (loan.total_repayable - loan.amount) / loan.total_repayable if loan.total_repayable else 0.0
 
+    active_loan_list = [l for l in loans if l.status in ("active", "overdue")]
+
     total_deployed = sum(l.amount for l in loans)
-    active_loans = sum(1 for l in loans if l.status in ("active", "overdue"))
+    active_loans = len(active_loan_list)
     total_repaid = sum(l.total_paid for l in loans)
     total_earned = sum(l.total_paid * interest_ratio(l) for l in loans)
-    avg_yield = sum(l.interest_rate for l in loans) / len(loans) if loans else 0.0
+    avg_yield = (
+        sum(l.interest_rate for l in active_loan_list) / len(active_loan_list)
+        if active_loan_list else 0.0
+    )
 
     loan_by_id = {l.id: l for l in loans}
     monthly_totals = {}
@@ -615,9 +664,23 @@ async def make_repayment(
         loan.status = "completed"
         loan.next_payment_date = None
         loan.next_payment_amount = None
+        _notify(
+            db, loan.lender_id,
+            title="Loan fully repaid",
+            message=f"{user.full_name or user.username} has fully repaid their UGX {loan.amount:,.0f} loan.",
+            type="repayment",
+            data={"loan_id": loan.id},
+        )
     else:
         loan.next_payment_date = datetime.now(timezone.utc) + timedelta(days=30)
         loan.next_payment_amount = loan.monthly_payment
+        _notify(
+            db, loan.lender_id,
+            title="Payment received",
+            message=f"{user.full_name or user.username} paid UGX {data.amount:,.0f} (instalment #{repayment.instalment_number}).",
+            type="repayment",
+            data={"loan_id": loan.id},
+        )
 
     _audit(db, "loan_repayment", username=user.username, user_id=user.id,
            resource_type="loan", resource_id=loan.id,
@@ -663,6 +726,8 @@ def _app_response(app: LoanApplication, include_offers: bool = False) -> dict:
             "kyc_status": app.borrower.kyc_status,
             "credit_score": app.borrower.credit_score,
         } if app.borrower else None,
+        "offers_count": len(app.offers),
+        "pending_offers_count": sum(1 for o in app.offers if o.status == "pending"),
     }
     if include_offers:
         result["offers"] = [_offer_response(o) for o in app.offers]

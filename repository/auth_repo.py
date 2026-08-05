@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from comms_sdk import CommsSDK
 
 from config import JWT_SECRET, EGOSMS_USERNAME, EGOSMS_APIKEY, SMTP_USERNAME, SMTP_PASSWORD, SMTP_SERVER, SMTP_PORT
-from database.tables import User, OTP, LoginAttempt, AuditLog, SignupDraft
+from database.tables import User, OTP, LoginAttempt, AuditLog, SignupDraft, Notification
 from helpers import generateUniqueId, normalizePhoneNumber
 from logging_module import logger
 from repository.models import AuthUser
@@ -146,6 +146,24 @@ def _audit(db: Session, action: str, username: str | None = None, user_id: str |
         # poison the active transaction if one of them fails.
     except Exception as e:
         logger.error(f"Audit log write failed: {e}")
+
+
+def _notify(db: Session, user_id: str, title: str, message: str,
+            type: str | None = None, data: dict | None = None):
+    """Create an in-app notification for a user."""
+    try:
+        n = Notification(
+            user_id=user_id,
+            title=title,
+            message=message,
+            type=type,
+            data=json.dumps(data) if data else None,
+        )
+        db.add(n)
+        # Don't flush here: flushing can trigger unrelated pending writes and
+        # poison the active transaction if one of them fails.
+    except Exception as e:
+        logger.error(f"Notification write failed: {e}")
 
 
 # ═══════════════════════════════════════════════
