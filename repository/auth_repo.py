@@ -1221,8 +1221,9 @@ class AuthRepo:
                 daemon=True,
             ).start()
         else:
+            normalized = normalizePhoneNumber(user.phone_number) or user.phone_number
             message = f"Your Mpola password reset code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
-            threading.Thread(target=send_sms, args=(user.phone_number, message), daemon=True).start()
+            threading.Thread(target=send_sms, args=(normalized, message), daemon=True).start()
 
         return _generic_ok
 
