@@ -231,6 +231,19 @@ class LoanOfferUpdate(BaseModel):
     status: str  # accepted, declined
 
 
+class LenderOfferTemplateCreate(BaseModel):
+    max_amount: float = Field(..., ge=100000)
+    min_amount: float = Field(..., ge=0)
+    interest_rate: float = Field(..., ge=0.1, le=25)
+    max_duration: int = Field(..., ge=1, le=36)
+    accepted_loan_types: list[str] = Field(default_factory=list)
+    required_documents: list[str] = Field(default_factory=list)
+    description: Optional[str] = None
+    valid_until: Optional[datetime] = None
+    max_concurrent_loans: Optional[int] = None
+    is_draft: bool = False
+
+
 # ─── Wallet ───────────────────────────────────
 
 class WalletSetupModel(BaseModel):

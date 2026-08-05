@@ -2,6 +2,7 @@
 Loans router — applications, offers, active loans, repayments.
 """
 
+import json
 import os
 import threading
 from datetime import datetime, timedelta, timezone
@@ -9,11 +10,11 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from sqlalchemy.orm import Session
 
 from config import BASE_URL, FRONTEND_URL
-from database.tables import User, LoanApplication, LoanOffer, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction
+from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction
 from helpers import generateReferenceNumber, generateUniqueId, normalizePhoneNumber
 from repository.auth_repo import _audit, _notify, send_sms
 from repository.dependencies import get_db, current_active_user
-from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, RepaymentCreate, GuarantorCreate, GuarantorRespond
+from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, RepaymentCreate, GuarantorCreate, GuarantorRespond
 from repository.security import require_roles
 from utils.upg_client import UPGClient, _detect_carrier
 
@@ -379,6 +380,27 @@ async def my_offers(
     return {"total": total, "offers": [_offer_response(o) for o in offers]}
 
 
+@router.get("/offers/received")
+async def offers_received(
+    status: str = Query(None),
+    skip: int = 0,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """List offers received across all of the current borrower's applications."""
+    query = (
+        db.query(LoanOffer)
+        .join(LoanApplication, LoanOffer.application_id == LoanApplication.id)
+        .filter(LoanApplication.borrower_id == user.id)
+    )
+    if status:
+        query = query.filter(LoanOffer.status == status)
+    total = query.count()
+    offers = query.order_by(LoanOffer.created_at.desc()).offset(skip).limit(limit).all()
+    return {"total": total, "offers": [_offer_response(o) for o in offers]}
+
+
 @router.patch("/offers/{offer_id}")
 async def respond_to_offer(
     offer_id: str,
@@ -486,6 +508,75 @@ async def respond_to_offer(
 
     db.commit()
     return {"status": 200, "message": f"Offer {data.status}"}
+
+
+def _offer_template_response(t: LenderOfferTemplate) -> dict:
+    return {
+        "id": t.id,
+        "lender_id": t.lender_id,
+        "max_amount": t.max_amount,
+        "min_amount": t.min_amount,
+        "interest_rate": t.interest_rate,
+        "max_duration": t.max_duration,
+        "accepted_loan_types": json.loads(t.accepted_loan_types) if t.accepted_loan_types else [],
+        "required_documents": json.loads(t.required_documents) if t.required_documents else [],
+        "description": t.description,
+        "valid_until": str(t.valid_until) if t.valid_until else None,
+        "max_concurrent_loans": t.max_concurrent_loans,
+        "status": t.status,
+        "created_at": str(t.created_at),
+    }
+
+
+@router.post("/offer-templates")
+async def create_offer_template(
+    data: LenderOfferTemplateCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """A lender submits their standing lending criteria. There's no automated
+    matching engine yet — submissions sit as 'pending_review' until an admin
+    dashboard exists to review and publish them.
+    """
+    template = LenderOfferTemplate(
+        lender_id=user.id,
+        max_amount=data.max_amount,
+        min_amount=data.min_amount,
+        interest_rate=data.interest_rate,
+        max_duration=data.max_duration,
+        accepted_loan_types=json.dumps(data.accepted_loan_types),
+        required_documents=json.dumps(data.required_documents),
+        description=data.description,
+        valid_until=data.valid_until,
+        max_concurrent_loans=data.max_concurrent_loans,
+        status="draft" if data.is_draft else "pending_review",
+    )
+    db.add(template)
+    _audit(db, "lender_offer_template_created", username=user.username, user_id=user.id,
+           resource_type="lender_offer_template", details={"status": template.status})
+    db.commit()
+    db.refresh(template)
+
+    return {
+        "status": 200,
+        "message": "Saved as draft" if data.is_draft else "Submitted for review",
+        "template": _offer_template_response(template),
+    }
+
+
+@router.get("/offer-templates/mine")
+async def my_offer_templates(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """List the current lender's submitted offer templates."""
+    templates = (
+        db.query(LenderOfferTemplate)
+        .filter(LenderOfferTemplate.lender_id == user.id)
+        .order_by(LenderOfferTemplate.created_at.desc())
+        .all()
+    )
+    return {"templates": [_offer_template_response(t) for t in templates]}
 
 
 # ═══════════════════════════════════════════════

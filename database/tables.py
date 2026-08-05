@@ -237,6 +237,30 @@ class LoanOffer(Base, TimestampMixin):
     lender = relationship("User", back_populates="offers_made", foreign_keys=[lender_id])
 
 
+class LenderOfferTemplate(Base, TimestampMixin):
+    """A lender's standing lending criteria (max/min amount, rate, accepted
+    loan types, etc). Not yet matched against applications automatically —
+    submissions sit as 'pending_review' until an admin dashboard exists to
+    review and publish them.
+    """
+    __tablename__ = "lender_offer_templates"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    lender_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    max_amount = Column(Float, nullable=False)
+    min_amount = Column(Float, nullable=False)
+    interest_rate = Column(Float, nullable=False)
+    max_duration = Column(Integer, nullable=False)  # months
+    accepted_loan_types = Column(Text, nullable=True)  # JSON list
+    required_documents = Column(Text, nullable=True)  # JSON list
+    description = Column(Text, nullable=True)
+    valid_until = Column(DateTime, nullable=True)
+    max_concurrent_loans = Column(Integer, nullable=True)
+    status = Column(String(20), default="pending_review")  # pending_review, draft, approved, rejected
+
+    lender = relationship("User")
+
+
 # ═══════════════════════════════════════
 #  ACTIVE LOAN (FUNDED)
 # ═══════════════════════════════════════
