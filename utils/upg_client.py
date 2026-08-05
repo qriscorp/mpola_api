@@ -26,7 +26,7 @@ def _detect_carrier(phone: str) -> str:
     p = phone.strip()
     if p.startswith(("0077", "0078", "0076", "0079", "077", "078", "076", "079")):
         return "MTN"
-    if p.startswith(("0075", "0074", "0070", "075", "074", "070")):
+    if p.startswith(("0075", "0074", "0073", "0070", "075", "074", "073", "070")):
         return "AIRTEL"
     return "MTN"  # fallback
 

@@ -161,6 +161,24 @@ class WalletTransaction(Base, TimestampMixin):
     wallet = relationship("Wallet", back_populates="transactions")
 
 
+class PlatformFeeTransaction(Base, TimestampMixin):
+    """Platform revenue ledger — one row per fee charged on a withdrawal.
+    Kept separate from WalletTransaction (which belongs to a user's own
+    wallet) since this represents Mpola's own cut, not a user balance change.
+    """
+    __tablename__ = "platform_fee_transactions"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    user_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    wallet_transaction_id = Column(String(50), nullable=True)
+    category = Column(String(30), nullable=False)  # mobile_money_withdrawal, bank_withdrawal
+    platform_fee = Column(Float, default=0.0)
+    provider_fee = Column(Float, default=0.0)
+    total_fee = Column(Float, nullable=False)
+
+    user = relationship("User")
+
+
 # ═══════════════════════════════════════
 #  LOAN APPLICATION
 # ═══════════════════════════════════════

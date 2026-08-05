@@ -5,7 +5,7 @@ Wallet router — balance, transactions, deposit, withdraw.
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from database.tables import User, Wallet, WalletTransaction
+from database.tables import User, Wallet, WalletTransaction, PlatformFeeTransaction
 from repository.auth_repo import get_password_hash, verify_password, _audit, _notify
 from repository.dependencies import get_db, current_active_user
 from repository.models import (
@@ -17,6 +17,7 @@ from repository.models import (
 )
 from helpers import generateUniqueId
 from utils.upg_client import UPGClient, _detect_carrier
+from utils.fee import calc_mobile_money_withdrawal_charges, calc_bank_withdrawal_charges
 
 router = APIRouter(prefix="/wallet", tags=["Wallet"])
 
@@ -122,14 +123,23 @@ async def withdraw(
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
 ):
-    """Withdraw funds from wallet to mobile money."""
+    """Withdraw funds from wallet to mobile money. A platform fee (0.5%) plus
+    the Interswitch MTN/Airtel surcharge is charged on top, debited from the
+    wallet — the recipient still receives the full amount requested.
+    """
     wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
-    if wallet.balance < data.amount:
-        raise HTTPException(status_code=400, detail="Insufficient funds")
 
     carrier = (data.carrier or _detect_carrier(data.phone_number)).upper()
+    charges = calc_mobile_money_withdrawal_charges(data.amount, carrier)
+    total_debit = data.amount + charges["total_fee"]
+
+    if wallet.balance < total_debit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient funds — you need UGX {total_debit:,.0f} (UGX {charges['total_fee']:,.0f} in fees included)",
+        )
 
     try:
         resp = UPGClient().disburse(amount=data.amount, phone=data.phone_number, carrier=carrier)
@@ -139,7 +149,7 @@ async def withdraw(
     if not UPGClient.is_success(resp):
         raise HTTPException(status_code=400, detail=resp.get("message", "Mobile money disbursement failed"))
 
-    wallet.balance -= data.amount
+    wallet.balance -= total_debit
     tx = WalletTransaction(
         wallet_id=wallet.id,
         amount=data.amount,
@@ -150,17 +160,32 @@ async def withdraw(
         counterparty=data.phone_number,
     )
     db.add(tx)
+    db.flush()
+    db.add(PlatformFeeTransaction(
+        user_id=user.id,
+        wallet_transaction_id=tx.id,
+        category="mobile_money_withdrawal",
+        platform_fee=charges["platform_fee"],
+        provider_fee=charges["provider_fee"],
+        total_fee=charges["total_fee"],
+    ))
     _audit(db, "wallet_withdrawal", username=user.username, user_id=user.id,
-           resource_type="wallet", details={"amount": data.amount, "to": data.phone_number, "carrier": carrier})
+           resource_type="wallet", details={"amount": data.amount, "to": data.phone_number, "carrier": carrier, "fee": charges["total_fee"]})
     _notify(
         db, user.id,
         title="Withdrawal successful",
-        message=f"UGX {data.amount:,.0f} was sent to {data.phone_number}.",
+        message=f"UGX {data.amount:,.0f} was sent to {data.phone_number} (UGX {charges['total_fee']:,.0f} fee charged).",
         type="payment",
     )
     db.commit()
 
-    return {"status": 200, "message": "Withdrawal successful", "balance": wallet.balance}
+    return {
+        "status": 200,
+        "message": "Withdrawal successful",
+        "balance": wallet.balance,
+        "fee": charges["total_fee"],
+        "total_debited": total_debit,
+    }
 
 
 @router.get("/transactions")
@@ -330,8 +355,14 @@ async def initiate_bank_withdraw(
     wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
-    if wallet.balance < data.amount:
-        raise HTTPException(status_code=400, detail="Insufficient funds")
+
+    charges = calc_bank_withdrawal_charges(data.amount)
+    total_debit = data.amount + charges["total_fee"]
+    if wallet.balance < total_debit:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Insufficient funds — you need UGX {total_debit:,.0f} (UGX {charges['total_fee']:,.0f} in fees included)",
+        )
 
     # Balance isn't reserved until settlement, so block a second withdrawal from
     # starting while one is still in flight — otherwise both could pass the balance
@@ -373,10 +404,10 @@ async def initiate_bank_withdraw(
     )
     db.add(tx)
     _audit(db, "wallet_bank_withdraw_initiated", username=user.username, user_id=user.id,
-           resource_type="wallet", details={"amount": data.amount, "reference": reference})
+           resource_type="wallet", details={"amount": data.amount, "reference": reference, "fee": charges["total_fee"]})
     db.commit()
 
-    return {"reference": reference, "status": "pending"}
+    return {"reference": reference, "status": "pending", "fee": charges["total_fee"], "total_debited": total_debit}
 
 
 @router.get("/withdraw/bank/status/{reference}")
@@ -409,19 +440,29 @@ async def get_bank_withdraw_status(
     upg_status = (resp.get("status") or "").lower()
 
     if upg_status == "success":
-        if wallet.balance < tx.amount:
+        charges = calc_bank_withdrawal_charges(tx.amount)
+        total_debit = tx.amount + charges["total_fee"]
+        if wallet.balance < total_debit:
             # Funds moved elsewhere since initiate — flag rather than push the balance negative.
             tx.status = "failed"
             tx.description = (tx.description or "") + " (insufficient balance at settlement)"
         else:
-            wallet.balance -= tx.amount
+            wallet.balance -= total_debit
             tx.status = "completed"
+            db.add(PlatformFeeTransaction(
+                user_id=user.id,
+                wallet_transaction_id=tx.id,
+                category="bank_withdrawal",
+                platform_fee=charges["platform_fee"],
+                provider_fee=charges["provider_fee"],
+                total_fee=charges["total_fee"],
+            ))
             _audit(db, "wallet_bank_withdraw_completed", username=user.username, user_id=user.id,
-                   resource_type="wallet", details={"amount": tx.amount, "reference": reference})
+                   resource_type="wallet", details={"amount": tx.amount, "reference": reference, "fee": charges["total_fee"]})
             _notify(
                 db, user.id,
                 title="Withdrawal successful",
-                message=f"UGX {tx.amount:,.0f} was sent to your bank account.",
+                message=f"UGX {tx.amount:,.0f} was sent to your bank account (UGX {charges['total_fee']:,.0f} fee charged).",
                 type="payment",
             )
         db.commit()
@@ -430,4 +471,11 @@ async def get_bank_withdraw_status(
         db.commit()
     # pending / processing: leave as-is, caller keeps polling.
 
-    return {"status": tx.status, "balance": wallet.balance}
+    fee_tx = db.query(PlatformFeeTransaction).filter(
+        PlatformFeeTransaction.wallet_transaction_id == tx.id
+    ).first()
+    return {
+        "status": tx.status,
+        "balance": wallet.balance,
+        "fee": fee_tx.total_fee if fee_tx else None,
+    }

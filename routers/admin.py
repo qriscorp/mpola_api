@@ -4,12 +4,12 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from database.tables import (
     User, DeactivatedAccount, Wallet, WalletTransaction,
     LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment,
-    Notification, PlatformSetting, AuditLog, LoginAttempt,
+    Notification, PlatformSetting, AuditLog, LoginAttempt, PlatformFeeTransaction,
 )
 from repository.auth_repo import get_password_hash, _audit
 from repository.dependencies import get_db
@@ -49,6 +49,7 @@ def get_dashboard_stats(
     total_loan_volume = db.query(func.sum(Loan.amount)).scalar() or 0
     total_repaid = db.query(func.sum(Loan.total_paid)).scalar() or 0
     total_repayable = db.query(func.sum(Loan.total_repayable)).scalar() or 0
+    avg_interest_rate = db.query(func.avg(Loan.interest_rate)).scalar() or 0.0
 
     total_wallet_balance = db.query(func.sum(Wallet.balance)).scalar() or 0
 
@@ -65,9 +66,25 @@ def get_dashboard_stats(
         LenderOfferTemplate.status == "pending_review"
     ).scalar()
 
+    # Real platform revenue — the 0.5% fee (plus Interswitch/Flutterwave
+    # provider surcharges) charged on withdrawals. See utils/fee.py.
+    total_platform_revenue = db.query(func.sum(PlatformFeeTransaction.total_fee)).scalar() or 0.0
+    total_platform_fee_only = db.query(func.sum(PlatformFeeTransaction.platform_fee)).scalar() or 0.0
+
     repayment_rate = round((total_repaid / total_repayable) * 100, 1) if total_repayable else 0.0
     default_rate = round((total_defaulted_loans / total_loans_count) * 100, 1) if total_loans_count else 0.0
     kyc_completion_rate = round((verified_users / total_users) * 100, 1) if total_users else 0.0
+
+    application_status_rows = (
+        db.query(LoanApplication.status, func.count(LoanApplication.id))
+        .group_by(LoanApplication.status)
+        .all()
+    )
+    status_counts = {s: c for s, c in application_status_rows}
+    application_status_breakdown = [
+        {"status": s.capitalize(), "count": status_counts.get(s, 0)}
+        for s in ("pending", "funded", "completed", "rejected", "defaulted")
+    ]
 
     # Loan type mix — sourced from applications that actually got funded/completed.
     type_rows = (
@@ -103,11 +120,17 @@ def get_dashboard_stats(
         key = dt.strftime("%Y-%m")
         collected_by_month[key] = collected_by_month.get(key, 0.0) + amt
 
+    revenue_by_month: dict = {}
+    for dt, amt in db.query(PlatformFeeTransaction.created_at, PlatformFeeTransaction.total_fee).all():
+        key = dt.strftime("%Y-%m")
+        revenue_by_month[key] = revenue_by_month.get(key, 0.0) + amt
+
     monthly_trend = [
         {
             "month": f"{y:04d}-{m:02d}",
             "disbursed": round(disbursed_by_month.get(f"{y:04d}-{m:02d}", 0.0), 2),
             "collected": round(collected_by_month.get(f"{y:04d}-{m:02d}", 0.0), 2),
+            "revenue": round(revenue_by_month.get(f"{y:04d}-{m:02d}", 0.0), 2),
         }
         for (y, m) in months
     ]
@@ -149,16 +172,20 @@ def get_dashboard_stats(
             "defaulted": total_defaulted_loans,
             "total_volume": total_loan_volume,
             "total_repaid": total_repaid,
+            "avg_interest_rate": round(avg_interest_rate, 2),
         },
         "platform": {
             "total_wallet_balance": total_wallet_balance,
             "total_interest_generated": round(total_interest_generated, 2),
+            "total_platform_revenue": round(total_platform_revenue, 2),
+            "total_platform_fee_only": round(total_platform_fee_only, 2),
             "repayment_rate": repayment_rate,
             "default_rate": default_rate,
             "kyc_completion_rate": kyc_completion_rate,
             "pending_offer_templates": pending_offer_templates,
         },
         "loan_type_mix": loan_type_mix,
+        "application_status_breakdown": application_status_breakdown,
         "monthly_trend": monthly_trend,
         "user_growth": user_growth,
     }
@@ -462,6 +489,7 @@ def list_deactivated(
 @router.get("/applications")
 def list_applications(
     status: str = Query(None),
+    search: str = Query(None),
     skip: int = 0,
     limit: int = 50,
     db: Session = Depends(get_db),
@@ -470,6 +498,11 @@ def list_applications(
     query = db.query(LoanApplication)
     if status:
         query = query.filter(LoanApplication.status == status)
+    if search:
+        filt = f"%{search}%"
+        query = query.join(User, LoanApplication.borrower_id == User.id).filter(
+            LoanApplication.reference_number.ilike(filt) | User.full_name.ilike(filt)
+        )
     total = query.count()
     apps = query.order_by(LoanApplication.created_at.desc()).offset(skip).limit(limit).all()
 
@@ -526,6 +559,7 @@ def admin_update_application(
 @router.get("/loans")
 def list_all_loans(
     status: str = Query(None),
+    search: str = Query(None),
     skip: int = 0,
     limit: int = 50,
     db: Session = Depends(get_db),
@@ -534,6 +568,20 @@ def list_all_loans(
     query = db.query(Loan)
     if status:
         query = query.filter(Loan.status == status)
+    if search:
+        filt = f"%{search}%"
+        Borrower = aliased(User)
+        Lender = aliased(User)
+        query = (
+            query.join(Borrower, Loan.borrower_id == Borrower.id)
+            .join(Lender, Loan.lender_id == Lender.id)
+            .outerjoin(LoanApplication, Loan.application_id == LoanApplication.id)
+            .filter(
+                Borrower.full_name.ilike(filt)
+                | Lender.full_name.ilike(filt)
+                | LoanApplication.reference_number.ilike(filt)
+            )
+        )
     total = query.count()
     loans = query.order_by(Loan.created_at.desc()).offset(skip).limit(limit).all()
 
@@ -600,6 +648,86 @@ def list_all_payments(
                 "created_at": str(tx.created_at),
             }
             for tx in txs
+        ],
+    }
+
+
+# ═══════════════════════════════════════════════
+#  PLATFORM REVENUE (fees charged on withdrawals)
+# ═══════════════════════════════════════════════
+
+@router.get("/revenue")
+def get_revenue(
+    category: str = Query(None, description="mobile_money_withdrawal or bank_withdrawal"),
+    skip: int = 0,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Platform revenue ledger — the 0.5% fee (plus Interswitch MTN/Airtel or
+    Flutterwave provider surcharge) charged on every withdrawal. See utils/fee.py
+    for the schedule.
+    """
+    query = db.query(PlatformFeeTransaction)
+    if category:
+        query = query.filter(PlatformFeeTransaction.category == category)
+    total = query.count()
+    rows = query.order_by(PlatformFeeTransaction.created_at.desc()).offset(skip).limit(limit).all()
+
+    total_revenue = db.query(func.sum(PlatformFeeTransaction.total_fee)).scalar() or 0.0
+    total_platform_fee = db.query(func.sum(PlatformFeeTransaction.platform_fee)).scalar() or 0.0
+    total_provider_fee = db.query(func.sum(PlatformFeeTransaction.provider_fee)).scalar() or 0.0
+
+    by_category_rows = (
+        db.query(PlatformFeeTransaction.category, func.sum(PlatformFeeTransaction.total_fee), func.count(PlatformFeeTransaction.id))
+        .group_by(PlatformFeeTransaction.category)
+        .all()
+    )
+    by_category = [
+        {"category": cat, "total_fee": round(amt or 0.0, 2), "count": cnt}
+        for cat, amt, cnt in by_category_rows
+    ]
+
+    now = datetime.now(timezone.utc)
+    months = []
+    y, m = now.year, now.month
+    for _ in range(6):
+        months.append((y, m))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    months.reverse()
+
+    revenue_by_month: dict = {}
+    for dt, amt in db.query(PlatformFeeTransaction.created_at, PlatformFeeTransaction.total_fee).all():
+        key = dt.strftime("%Y-%m")
+        revenue_by_month[key] = revenue_by_month.get(key, 0.0) + amt
+
+    monthly_revenue = [
+        {"month": f"{y:04d}-{m:02d}", "revenue": round(revenue_by_month.get(f"{y:04d}-{m:02d}", 0.0), 2)}
+        for (y, m) in months
+    ]
+
+    return {
+        "total": total,
+        "totals": {
+            "revenue": round(total_revenue, 2),
+            "platform_fee": round(total_platform_fee, 2),
+            "provider_fee": round(total_provider_fee, 2),
+        },
+        "by_category": by_category,
+        "monthly_revenue": monthly_revenue,
+        "transactions": [
+            {
+                "id": r.id,
+                "username": r.user.full_name if r.user else None,
+                "category": r.category,
+                "platform_fee": r.platform_fee,
+                "provider_fee": r.provider_fee,
+                "total_fee": r.total_fee,
+                "created_at": str(r.created_at),
+            }
+            for r in rows
         ],
     }
 
@@ -714,6 +842,7 @@ def update_setting(
 def get_audit_logs(
     action: str = Query(None),
     username: str = Query(None),
+    search: str = Query(None),
     skip: int = 0,
     limit: int = 100,
     db: Session = Depends(get_db),
@@ -725,6 +854,13 @@ def get_audit_logs(
         query = query.filter(AuditLog.action == action)
     if username:
         query = query.filter(AuditLog.username == username)
+    if search:
+        filt = f"%{search}%"
+        query = query.filter(
+            AuditLog.username.ilike(filt)
+            | AuditLog.action.ilike(filt)
+            | AuditLog.resource_type.ilike(filt)
+        )
 
     total = query.count()
     logs = query.order_by(AuditLog.created_at.desc()).offset(skip).limit(limit).all()
