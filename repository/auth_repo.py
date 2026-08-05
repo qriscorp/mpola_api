@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from comms_sdk import CommsSDK
 
 from config import JWT_SECRET, EGOSMS_USERNAME, EGOSMS_APIKEY, SMTP_USERNAME, SMTP_PASSWORD, SMTP_SERVER, SMTP_PORT
-from database.tables import User, OTP, LoginAttempt, AuditLog, SignupDraft, Notification
+from database.tables import User, OTP, LoginAttempt, AuditLog, SignupDraft, Notification, PlatformSetting
 from helpers import generateUniqueId, normalizePhoneNumber
 from logging_module import logger
 from repository.models import AuthUser
@@ -924,6 +924,17 @@ class AuthRepo:
 
         # Enforce portal-specific sign-in for borrower/lender accounts.
         AuthRepo._enforce_portal_role(user, getattr(login_data, "portal", None))
+
+        # Maintenance mode blocks everyone except admins from signing in.
+        if "admin" not in (user.role or "").lower():
+            maintenance = db.query(PlatformSetting).filter(PlatformSetting.key == "maintenance_mode").first()
+            if maintenance and maintenance.value == "true":
+                AuthRepo._record_login_attempt(db, identifier, False, ip_address)
+                db.commit()
+                raise HTTPException(
+                    status_code=503,
+                    detail="Mpola is temporarily down for maintenance. Please try again shortly.",
+                )
 
         # Successful login
         AuthRepo._record_login_attempt(db, identifier, True, ip_address)

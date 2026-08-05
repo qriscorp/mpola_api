@@ -27,6 +27,29 @@ ALLOWED_DOCUMENT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
 router = APIRouter(prefix="/loans", tags=["Loans"])
 
 
+def _platform_setting(db: Session, key: str, default: float) -> float:
+    """Admin-configurable platform setting, falling back to a default when unset."""
+    from database.tables import PlatformSetting
+    setting = db.query(PlatformSetting).filter(PlatformSetting.key == key).first()
+    if not setting:
+        return default
+    try:
+        return float(setting.value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _loan_amount_bounds(db: Session) -> tuple[float, float]:
+    return (
+        _platform_setting(db, "min_loan_amount", 100000),
+        _platform_setting(db, "max_loan_amount", 50000000),
+    )
+
+
+def _max_interest_rate(db: Session) -> float:
+    return _platform_setting(db, "max_interest_rate", 25)
+
+
 # ═══════════════════════════════════════════════
 #  LOAN APPLICATIONS (Borrower)
 # ═══════════════════════════════════════════════
@@ -38,6 +61,13 @@ async def create_application(
     user: User = Depends(current_active_user),
 ):
     """Create a new loan application. Borrowers only."""
+    min_amount, max_amount = _loan_amount_bounds(db)
+    if data.amount < min_amount or data.amount > max_amount:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Amount must be between {min_amount:,.0f} and {max_amount:,.0f}",
+        )
+
     # Calculate estimated monthly payment (simple interest)
     rate = 15.0  # default platform rate
     total_interest = data.amount * (rate / 100) * (data.duration / 12)
@@ -332,6 +362,10 @@ async def make_offer(
         raise HTTPException(status_code=400, detail="Application no longer accepting offers")
     if app.borrower_id == user.id:
         raise HTTPException(status_code=400, detail="Cannot make an offer on your own application")
+
+    max_rate = _max_interest_rate(db)
+    if data.interest_rate > max_rate:
+        raise HTTPException(status_code=400, detail=f"Interest rate cannot exceed {max_rate}% p.a.")
 
     total_interest = data.amount * (data.interest_rate / 100) * (data.duration / 12)
     total_repayable = data.amount + total_interest
