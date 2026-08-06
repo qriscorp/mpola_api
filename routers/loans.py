@@ -6,7 +6,7 @@ import json
 import os
 import threading
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, Response
 from sqlalchemy.orm import Session
 
 from config import BASE_URL, FRONTEND_URL
@@ -897,6 +897,42 @@ async def make_repayment(
         },
         "loan": _loan_response(loan),
     }
+
+
+@router.get("/repayments/{repayment_id}/receipt")
+async def get_repayment_receipt(
+    repayment_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Real PDF receipt for a single repayment — borrower or lender on the loan only."""
+    repayment = db.query(Repayment).filter(Repayment.id == repayment_id).first()
+    if not repayment:
+        raise HTTPException(status_code=404, detail="Repayment not found")
+
+    loan = db.query(Loan).filter(Loan.id == repayment.loan_id).first()
+    if not loan or user.id not in (loan.borrower_id, loan.lender_id):
+        raise HTTPException(status_code=404, detail="Repayment not found")
+
+    from utils.receipts import build_repayment_receipt_pdf
+
+    pdf_bytes = build_repayment_receipt_pdf(
+        receipt_id=repayment.id,
+        borrower_name=loan.borrower.full_name or loan.borrower.username,
+        lender_name=loan.lender_user.full_name or loan.lender_user.username,
+        loan_reference=loan.application.reference_number if loan.application else loan.id[:10],
+        amount=repayment.amount,
+        instalment_number=repayment.instalment_number,
+        payment_method=repayment.payment_method or "unknown",
+        status=repayment.status,
+        paid_at=str(repayment.created_at),
+    )
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="mpola-receipt-{repayment.id}.pdf"'},
+    )
 
 
 # ═══════════════════════════════════════════════

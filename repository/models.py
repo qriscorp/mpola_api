@@ -40,6 +40,7 @@ class UserCreate(BaseModel):
     nin: Optional[str] = Field(None, max_length=50)
     account_type: Optional[str] = "individual"
     role: Optional[str] = "borrower"  # borrower or lender
+    referred_by_code: Optional[str] = Field(None, max_length=20)
 
     @field_validator('email')
     @classmethod
@@ -79,6 +80,7 @@ class RegisterStart(BaseModel):
     nin: Optional[str] = Field(None, max_length=50)
     account_type: Optional[str] = "individual"
     role: Optional[str] = "borrower"  # borrower or lender
+    referred_by_code: Optional[str] = Field(None, max_length=20)
 
     @field_validator('email')
     @classmethod
@@ -126,8 +128,11 @@ class UserUpdate(BaseModel):
     gender: Optional[str] = None
     date_of_birth: Optional[datetime] = None
     account_type: Optional[str] = None
-    fcm_token: Optional[str] = None
     two_factor_enabled: Optional[bool] = None
+
+
+class PushTokenUpdate(BaseModel):
+    push_token: Optional[str] = None  # Expo push token; null clears it (e.g. on sign-out)
 
 
 class ResetPasswordModel(BaseModel):
@@ -293,6 +298,35 @@ class RepaymentCreate(BaseModel):
 class NotificationSettingsUpdate(BaseModel):
     push_enabled: Optional[bool] = None
     email_enabled: Optional[bool] = None
+
+
+# ─── Disputes ─────────────────────────────────
+
+class DisputeCreate(BaseModel):
+    category: str = Field(..., max_length=50)  # payment, loan_terms, fraud, disbursement, other
+    description: str = Field(..., min_length=10, max_length=4000)
+    loan_id: Optional[str] = None
+
+
+class DisputeResolve(BaseModel):
+    status: str  # investigating, resolved, rejected
+    resolution_note: Optional[str] = None
+
+
+# ─── Support tickets ───────────────────────────
+
+class SupportTicketCreate(BaseModel):
+    subject: str = Field(..., max_length=255)
+    category: str = Field("general", max_length=50)
+    message: str = Field(..., min_length=5, max_length=4000)
+
+
+class SupportMessageCreate(BaseModel):
+    message: str = Field(..., min_length=1, max_length=4000)
+
+
+class SupportTicketStatusUpdate(BaseModel):
+    status: str  # open, in_progress, resolved, closed
 
 
 # ─── Admin ────────────────────────────────────

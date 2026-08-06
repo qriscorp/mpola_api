@@ -4,3 +4,8 @@ from routers.loans import router as loans_router
 from routers.wallet import router as wallet_router
 from routers.notifications import router as notifications_router
 from routers.admin import router as admin_router
+from routers.ws import router as ws_router
+from routers.referrals import router as referrals_router
+from routers.support import router as support_router
+from routers.disputes import router as disputes_router
+from routers.sessions import router as sessions_router

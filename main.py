@@ -7,9 +7,12 @@ from middleware.security import SecurityHeadersMiddleware, RateLimitMiddleware
 from routers import (
     auth_router, users_router, loans_router,
     wallet_router, notifications_router, admin_router,
+    ws_router, referrals_router, support_router,
+    disputes_router, sessions_router,
 )
 from database import ENGINE
 from database.tables import Base
+from scheduler import start_scheduler, stop_scheduler
 
 app = FastAPI(
     title="Mpola API",
@@ -85,6 +88,11 @@ app.include_router(loans_router)
 app.include_router(wallet_router)
 app.include_router(notifications_router)
 app.include_router(admin_router)
+app.include_router(ws_router)
+app.include_router(referrals_router)
+app.include_router(support_router)
+app.include_router(disputes_router)
+app.include_router(sessions_router)
 
 # ─── Static files ───────────────────────────────────────────
 os.makedirs("static", exist_ok=True)
@@ -110,6 +118,12 @@ async def health_check():
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=ENGINE)
+    start_scheduler()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    stop_scheduler()
 
 
 

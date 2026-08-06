@@ -34,6 +34,13 @@ def generateReferenceNumber(prefix="LF"):
     return f"{prefix}-{now.year}-{now.month:02d}-{uid}"
 
 
+def generateReferralCode(length=7):
+    """Short, shareable, human-typeable referral code (uppercase, no ambiguous chars)."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no I/O/0/1
+    raw = uuid.uuid4().bytes
+    return "".join(alphabet[b % len(alphabet)] for b in raw[:length])
+
+
 def normalizePhoneNumber(phone: str) -> str | None:
     """
     Normalize Ugandan phone to 256XXXXXXXXX (12 digits, no +).

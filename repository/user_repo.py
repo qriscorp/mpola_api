@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from database.tables import User, DeactivatedAccount, Wallet
 from logging_module import logger
-from repository.auth_repo import get_password_hash
+from repository.auth_repo import get_password_hash, _generate_unique_referral_code
 
 
 class UserRepo:
@@ -126,6 +126,7 @@ class UserRepo:
             password_hash=get_password_hash(temp_password),
             role="borrower",
             is_active=True,
+            referral_code=_generate_unique_referral_code(db),
         )
         db.add(user)
         db.delete(record)

@@ -44,17 +44,20 @@ class User(Base, TimestampMixin):
     is_kyc_verified = Column(Boolean, default=False)
     kyc_status = Column(String(20), default="pending")  # pending, verified, rejected
     credit_score = Column(Integer, default=0)
-    fcm_token = Column(Text, nullable=True)
+    push_token = Column(Text, nullable=True)  # Expo push token
     # JWT refresh tokens can exceed 255 chars once claims/signature are included.
     refresh_token = Column(Text, nullable=True)
     refresh_token_expires_at = Column(DateTime, nullable=True)
     two_factor_enabled = Column(Boolean, default=False)
+    referral_code = Column(String(20), unique=True, nullable=True, index=True)
+    referred_by_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
     # Relationships
     wallets = relationship("Wallet", back_populates="user", cascade="all, delete-orphan")
     loan_applications = relationship("LoanApplication", back_populates="borrower", foreign_keys="LoanApplication.borrower_id")
     offers_made = relationship("LoanOffer", back_populates="lender", foreign_keys="LoanOffer.lender_id")
     notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan")
+    referred_by = relationship("User", remote_side=[id])
 
 
 class DeactivatedAccount(Base, TimestampMixin):
@@ -85,6 +88,7 @@ class SignupDraft(Base, TimestampMixin):
     phone_verified = Column(Boolean, default=False)
     is_completed = Column(Boolean, default=False)
     created_user_id = Column(String(50), nullable=True)
+    referred_by_code = Column(String(20), nullable=True)
     expires_at = Column(DateTime, nullable=False)
 
 
@@ -356,3 +360,75 @@ class PlatformSetting(Base, TimestampMixin):
     key = Column(String(100), unique=True, nullable=False)
     value = Column(Text, nullable=False)
     description = Column(Text, nullable=True)
+
+
+# ═══════════════════════════════════════
+#  LOGIN SESSIONS (device visibility)
+# ═══════════════════════════════════════
+
+class LoginSession(Base, TimestampMixin):
+    """One row per successful login — powers the 'Active Sessions' view.
+    Mpola only keeps a single active refresh token per user (see User.refresh_token),
+    so there is no per-session revocation; this is visibility plus a
+    sign-out-everywhere action, not true independent multi-device sessions.
+    """
+    __tablename__ = "login_sessions"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    user_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    device_label = Column(String(200), nullable=True)
+    ip_address = Column(String(50), nullable=True)
+    user_agent = Column(Text, nullable=True)
+
+    user = relationship("User")
+
+
+# ═══════════════════════════════════════
+#  DISPUTES
+# ═══════════════════════════════════════
+
+class Dispute(Base, TimestampMixin):
+    __tablename__ = "disputes"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    user_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    loan_id = Column(String(50), ForeignKey("loans.id", ondelete="SET NULL"), nullable=True)
+    category = Column(String(50), nullable=False)  # payment, loan_terms, fraud, disbursement, other
+    description = Column(Text, nullable=False)
+    status = Column(String(20), default="open")  # open, investigating, resolved, rejected
+    resolution_note = Column(Text, nullable=True)
+    resolved_by = Column(String(100), nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+    loan = relationship("Loan")
+
+
+# ═══════════════════════════════════════
+#  SUPPORT TICKETS
+# ═══════════════════════════════════════
+
+class SupportTicket(Base, TimestampMixin):
+    __tablename__ = "support_tickets"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    user_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    subject = Column(String(255), nullable=False)
+    category = Column(String(50), default="general")  # general, wallet, loan, kyc, bug, other
+    status = Column(String(20), default="open")  # open, in_progress, resolved, closed
+
+    user = relationship("User")
+    messages = relationship("SupportMessage", back_populates="ticket", cascade="all, delete-orphan", order_by="SupportMessage.created_at")
+
+
+class SupportMessage(Base, TimestampMixin):
+    __tablename__ = "support_messages"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    ticket_id = Column(String(50), ForeignKey("support_tickets.id", ondelete="CASCADE"), nullable=False)
+    sender_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    is_admin = Column(Boolean, default=False)
+    message = Column(Text, nullable=False)
+
+    ticket = relationship("SupportTicket", back_populates="messages")
+    sender = relationship("User")

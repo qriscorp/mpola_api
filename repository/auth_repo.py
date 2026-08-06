@@ -17,8 +17,8 @@ from sqlalchemy.orm import Session
 from comms_sdk import CommsSDK
 
 from config import JWT_SECRET, EGOSMS_USERNAME, EGOSMS_APIKEY, SMTP_USERNAME, SMTP_PASSWORD, SMTP_SERVER, SMTP_PORT
-from database.tables import User, OTP, LoginAttempt, AuditLog, SignupDraft, Notification, PlatformSetting
-from helpers import generateUniqueId, normalizePhoneNumber
+from database.tables import User, OTP, LoginAttempt, AuditLog, SignupDraft, Notification, PlatformSetting, LoginSession
+from helpers import generateUniqueId, normalizePhoneNumber, generateReferralCode
 from logging_module import logger
 from repository.models import AuthUser
 
@@ -42,6 +42,23 @@ SIGNUP_DRAFT_EXPIRE_HOURS = 24
 
 def get_password_hash(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+
+def _generate_unique_referral_code(db: Session) -> str:
+    for _ in range(10):
+        code = generateReferralCode()
+        if not db.query(User).filter(User.referral_code == code).first():
+            return code
+    # Astronomically unlikely, but never return a duplicate.
+    return generateReferralCode(9)
+
+
+def _log_login_session(db: Session, user_id: str, ip_address: str | None, user_agent: str | None):
+    """Best-effort — a failed session log should never block login."""
+    try:
+        db.add(LoginSession(user_id=user_id, ip_address=ip_address, user_agent=user_agent))
+    except Exception as e:
+        logger.error(f"Login session log failed: {e}")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
@@ -150,7 +167,10 @@ def _audit(db: Session, action: str, username: str | None = None, user_id: str |
 
 def _notify(db: Session, user_id: str, title: str, message: str,
             type: str | None = None, data: dict | None = None):
-    """Create an in-app notification for a user."""
+    """Create an in-app notification for a user, and best-effort push it
+    out live (WebSocket, if they're connected) and to their device (Expo
+    push, if they've registered a token).
+    """
     try:
         n = Notification(
             user_id=user_id,
@@ -164,6 +184,27 @@ def _notify(db: Session, user_id: str, title: str, message: str,
         # poison the active transaction if one of them fails.
     except Exception as e:
         logger.error(f"Notification write failed: {e}")
+        return
+
+    try:
+        from realtime import manager
+        manager.broadcast(user_id, {
+            "event": "notification",
+            "title": title,
+            "message": message,
+            "type": type,
+            "data": data,
+        })
+    except Exception as e:
+        logger.error(f"WebSocket notify failed: {e}")
+
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user and user.push_token:
+            from utils.push import send_expo_push
+            send_expo_push(user.push_token, title, message, data)
+    except Exception as e:
+        logger.error(f"Push notify failed: {e}")
 
 
 # ═══════════════════════════════════════════════
@@ -481,6 +522,7 @@ class AuthRepo:
                 role=requested_role,
                 email_verified=False,
                 phone_verified=False,
+                referred_by_code=(data.referred_by_code or None),
                 expires_at=datetime.utcnow() + timedelta(hours=SIGNUP_DRAFT_EXPIRE_HOURS),
             )
             db.add(draft)
@@ -494,6 +536,7 @@ class AuthRepo:
             draft.role = requested_role
             draft.email_verified = False
             draft.phone_verified = False
+            draft.referred_by_code = data.referred_by_code or draft.referred_by_code
             draft.expires_at = datetime.utcnow() + timedelta(hours=SIGNUP_DRAFT_EXPIRE_HOURS)
             db.query(OTP).filter(OTP.username == draft.id).delete(synchronize_session=False)
 
@@ -678,6 +721,12 @@ class AuthRepo:
         while db.query(User).filter(func.lower(User.username) == username.lower()).first():
             username = f"{base_username}{secrets.randbelow(9) + 1}"
 
+        referred_by_id = None
+        if draft.referred_by_code:
+            referrer = db.query(User).filter(User.referral_code == draft.referred_by_code).first()
+            if referrer:
+                referred_by_id = referrer.id
+
         user = User(
             username=username,
             email=draft.email,
@@ -689,12 +738,22 @@ class AuthRepo:
             role=draft.role or "borrower",
             is_verified=True,
             is_phone_verified=True,
+            referral_code=_generate_unique_referral_code(db),
+            referred_by_id=referred_by_id,
         )
         db.add(user)
         db.flush()
 
         draft.is_completed = True
         draft.created_user_id = user.id
+
+        if referred_by_id:
+            _notify(
+                db, referred_by_id,
+                title="Your referral joined Mpola",
+                message=f"{user.full_name or user.username} just signed up using your referral link.",
+                type="referral",
+            )
 
         _audit(
             db,
@@ -826,6 +885,12 @@ class AuthRepo:
 
         hashed = get_password_hash(user_data.password)
 
+        referred_by_id = None
+        if getattr(user_data, "referred_by_code", None):
+            referrer = db.query(User).filter(User.referral_code == user_data.referred_by_code).first()
+            if referrer:
+                referred_by_id = referrer.id
+
         user = User(
             username=username,
             email=user_data.email.lower().strip(),
@@ -835,6 +900,8 @@ class AuthRepo:
             nin=user_data.nin,
             account_type=user_data.account_type or "individual",
             role=requested_role,
+            referral_code=_generate_unique_referral_code(db),
+            referred_by_id=referred_by_id,
         )
 
         db.add(user)
@@ -876,7 +943,7 @@ class AuthRepo:
     # ── login ───────────────────────────────────
 
     @staticmethod
-    def login(db: Session, login_data, ip_address: str | None = None):
+    def login(db: Session, login_data, ip_address: str | None = None, user_agent: str | None = None):
         identifier = login_data.username.strip()
 
         # Check lockout
@@ -947,6 +1014,7 @@ class AuthRepo:
 
         _audit(db, "login_success", username=user.username, user_id=user.id,
                resource_type="user", ip_address=ip_address)
+        _log_login_session(db, user.id, ip_address, user_agent)
         db.commit()
 
         return {

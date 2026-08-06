@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from database.tables import User
 from repository.dependencies import get_db, current_active_user
-from repository.models import UserUpdate
+from repository.models import UserUpdate, PushTokenUpdate
 from repository.user_repo import UserRepo
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -25,6 +25,18 @@ async def update_profile(
     user: User = Depends(current_active_user),
 ):
     return UserRepo.update_user(db, user.username, data)
+
+
+@router.put("/me/push-token")
+async def update_push_token(
+    data: PushTokenUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Register (or clear, on sign-out) this device's Expo push token."""
+    user.push_token = data.push_token
+    db.commit()
+    return {"status": 200, "message": "Push token updated"}
 
 
 @router.get("/{username}")

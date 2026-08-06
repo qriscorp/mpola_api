@@ -72,7 +72,11 @@ async def verify_signup_phone_otp(data: SignupDraftVerifyPhoneRequest, request: 
 
 @router.post("/login")
 async def login(data: Login, request: Request, db: Session = Depends(get_db)):
-    return AuthRepo.login(db, data, ip_address=_get_ip(request))
+    return AuthRepo.login(
+        db, data,
+        ip_address=_get_ip(request),
+        user_agent=request.headers.get("user-agent"),
+    )
 
 
 @router.post("/refresh")

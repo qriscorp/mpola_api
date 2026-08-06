@@ -10,10 +10,14 @@ from database.tables import (
     User, DeactivatedAccount, Wallet, WalletTransaction,
     LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment,
     Notification, PlatformSetting, AuditLog, LoginAttempt, PlatformFeeTransaction,
+    Dispute, SupportTicket, SupportMessage,
 )
-from repository.auth_repo import get_password_hash, _audit
+from repository.auth_repo import get_password_hash, _audit, _notify
 from repository.dependencies import get_db
-from repository.models import AuthUser, AdminRoleUpdate, PlatformSettingUpdate
+from repository.models import (
+    AuthUser, AdminRoleUpdate, PlatformSettingUpdate,
+    DisputeResolve, SupportMessageCreate, SupportTicketStatusUpdate,
+)
 from repository.security import require_admin
 from repository.user_repo import UserRepo
 
@@ -988,3 +992,184 @@ def clear_lockout(
            resource_type="user", details={"identifier": identifier, "records_removed": deleted})
     db.commit()
     return {"message": f"Lockout cleared. {deleted} failed attempt(s) removed.", "identifier": identifier}
+
+
+# ═══════════════════════════════════════════════
+#  DISPUTES
+# ═══════════════════════════════════════════════
+
+@router.get("/disputes")
+def list_disputes(
+    status: str = Query(None),
+    skip: int = 0,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    query = db.query(Dispute)
+    if status:
+        query = query.filter(Dispute.status == status)
+    total = query.count()
+    disputes = query.order_by(Dispute.created_at.desc()).offset(skip).limit(limit).all()
+
+    return {
+        "total": total,
+        "disputes": [
+            {
+                "id": d.id,
+                "user_id": d.user_id,
+                "username": d.user.full_name or d.user.username if d.user else None,
+                "loan_id": d.loan_id,
+                "category": d.category,
+                "description": d.description,
+                "status": d.status,
+                "resolution_note": d.resolution_note,
+                "resolved_by": d.resolved_by,
+                "resolved_at": str(d.resolved_at) if d.resolved_at else None,
+                "created_at": str(d.created_at),
+            }
+            for d in disputes
+        ],
+    }
+
+
+@router.patch("/disputes/{dispute_id}")
+def resolve_dispute(
+    dispute_id: str,
+    data: DisputeResolve,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    dispute = db.query(Dispute).filter(Dispute.id == dispute_id).first()
+    if not dispute:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    if data.status not in ("investigating", "resolved", "rejected"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    dispute.status = data.status
+    dispute.resolution_note = data.resolution_note
+    if data.status in ("resolved", "rejected"):
+        dispute.resolved_by = admin.username
+        dispute.resolved_at = datetime.now(timezone.utc)
+
+    _audit(db, "dispute_resolved", username=admin.username,
+           resource_type="dispute", resource_id=dispute.id, details={"status": data.status})
+    _notify(
+        db, dispute.user_id,
+        title="Update on your dispute",
+        message=f"Your dispute has been marked as {data.status}." + (f" {data.resolution_note}" if data.resolution_note else ""),
+        type="dispute_update",
+        data={"dispute_id": dispute.id},
+    )
+    db.commit()
+    return {"status": 200, "message": "Dispute updated"}
+
+
+# ═══════════════════════════════════════════════
+#  SUPPORT TICKETS
+# ═══════════════════════════════════════════════
+
+@router.get("/support-tickets")
+def list_support_tickets(
+    status: str = Query(None),
+    skip: int = 0,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    query = db.query(SupportTicket)
+    if status:
+        query = query.filter(SupportTicket.status == status)
+    total = query.count()
+    tickets = query.order_by(SupportTicket.created_at.desc()).offset(skip).limit(limit).all()
+
+    return {
+        "total": total,
+        "tickets": [
+            {
+                "id": t.id,
+                "username": t.user.full_name or t.user.username if t.user else None,
+                "subject": t.subject,
+                "category": t.category,
+                "status": t.status,
+                "message_count": len(t.messages) if t.messages else 0,
+                "created_at": str(t.created_at),
+            }
+            for t in tickets
+        ],
+    }
+
+
+@router.get("/support-tickets/{ticket_id}")
+def get_support_ticket(
+    ticket_id: str,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    ticket = db.query(SupportTicket).filter(SupportTicket.id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    return {
+        "ticket": {
+            "id": ticket.id,
+            "username": ticket.user.full_name or ticket.user.username if ticket.user else None,
+            "subject": ticket.subject,
+            "category": ticket.category,
+            "status": ticket.status,
+            "created_at": str(ticket.created_at),
+            "messages": [
+                {
+                    "id": m.id,
+                    "message": m.message,
+                    "is_admin": m.is_admin,
+                    "sender_name": m.sender.full_name if m.sender else None,
+                    "created_at": str(m.created_at),
+                }
+                for m in ticket.messages
+            ],
+        },
+    }
+
+
+@router.post("/support-tickets/{ticket_id}/reply")
+def reply_to_support_ticket(
+    ticket_id: str,
+    data: SupportMessageCreate,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    ticket = db.query(SupportTicket).filter(SupportTicket.id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    admin_user = db.query(User).filter(User.username == admin.username).first()
+    db.add(SupportMessage(ticket_id=ticket.id, sender_id=admin_user.id if admin_user else None, is_admin=True, message=data.message))
+    ticket.status = "in_progress"
+
+    _notify(
+        db, ticket.user_id,
+        title=f"New reply on: {ticket.subject}",
+        message=data.message[:200],
+        type="support_reply",
+        data={"ticket_id": ticket.id},
+    )
+    db.commit()
+    return {"status": 200, "message": "Reply sent"}
+
+
+@router.patch("/support-tickets/{ticket_id}/status")
+def update_support_ticket_status(
+    ticket_id: str,
+    data: SupportTicketStatusUpdate,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    ticket = db.query(SupportTicket).filter(SupportTicket.id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    if data.status not in ("open", "in_progress", "resolved", "closed"):
+        raise HTTPException(status_code=400, detail="Invalid status")
+    ticket.status = data.status
+    db.commit()
+    return {"status": 200, "message": "Ticket status updated"}
