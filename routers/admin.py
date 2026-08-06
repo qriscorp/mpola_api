@@ -192,6 +192,87 @@ def get_dashboard_stats(
 
 
 # ═══════════════════════════════════════════════
+#  GROWTH & ACTIVITY (simple, at-a-glance for admin)
+# ═══════════════════════════════════════════════
+
+@router.get("/activity")
+def get_activity(
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """New users, transactions, and offers — today, this week vs last week,
+    this month vs last month — plus a 14-day daily trend. One place for the
+    admin to see how fast the platform is growing, no digging required.
+    """
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+    week_start = today_start - timedelta(days=7)
+    prev_week_start = today_start - timedelta(days=14)
+    month_start = today_start - timedelta(days=30)
+    prev_month_start = today_start - timedelta(days=60)
+
+    def _count(model, date_col, start, end=None):
+        q = db.query(func.count(model.id)).filter(date_col >= start)
+        if end:
+            q = q.filter(date_col < end)
+        return q.scalar() or 0
+
+    def _pct_change(current, previous):
+        if previous == 0:
+            return 100.0 if current > 0 else 0.0
+        return round(((current - previous) / previous) * 100, 1)
+
+    def _period_summary(model, date_col):
+        this_week = _count(model, date_col, week_start)
+        last_week = _count(model, date_col, prev_week_start, week_start)
+        this_month = _count(model, date_col, month_start)
+        last_month = _count(model, date_col, prev_month_start, month_start)
+        return {
+            "today": _count(model, date_col, today_start),
+            "yesterday": _count(model, date_col, yesterday_start, today_start),
+            "this_week": this_week,
+            "last_week": last_week,
+            "week_change_pct": _pct_change(this_week, last_week),
+            "this_month": this_month,
+            "last_month": last_month,
+            "month_change_pct": _pct_change(this_month, last_month),
+        }
+
+    # 14-day daily trend, for a simple at-a-glance sparkline.
+    day_keys = [(today_start - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(13, -1, -1)]
+    trend_start = today_start - timedelta(days=13)
+
+    def _daily_counts(model, date_col):
+        by_day: dict = {}
+        for (dt,) in db.query(date_col).filter(date_col >= trend_start).all():
+            key = dt.strftime("%Y-%m-%d")
+            by_day[key] = by_day.get(key, 0) + 1
+        return by_day
+
+    users_by_day = _daily_counts(User, User.created_at)
+    tx_by_day = _daily_counts(WalletTransaction, WalletTransaction.created_at)
+    offers_by_day = _daily_counts(LoanOffer, LoanOffer.created_at)
+
+    daily_activity = [
+        {
+            "date": k,
+            "new_users": users_by_day.get(k, 0),
+            "transactions": tx_by_day.get(k, 0),
+            "offers": offers_by_day.get(k, 0),
+        }
+        for k in day_keys
+    ]
+
+    return {
+        "users": _period_summary(User, User.created_at),
+        "transactions": _period_summary(WalletTransaction, WalletTransaction.created_at),
+        "offers": _period_summary(LoanOffer, LoanOffer.created_at),
+        "daily_activity": daily_activity,
+    }
+
+
+# ═══════════════════════════════════════════════
 #  USER MANAGEMENT
 # ═══════════════════════════════════════════════
 

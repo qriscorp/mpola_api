@@ -10,13 +10,14 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from sqlalchemy.orm import Session
 
 from config import BASE_URL, FRONTEND_URL
-from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction
+from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction, PlatformFeeTransaction
 from helpers import generateReferenceNumber, generateUniqueId, normalizePhoneNumber
 from repository.auth_repo import _audit, _notify, send_sms
 from repository.dependencies import get_db, current_active_user
 from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, RepaymentCreate, GuarantorCreate, GuarantorRespond
 from repository.security import require_roles
 from utils.upg_client import UPGClient, _detect_carrier
+from utils.fee import calc_platform_fee
 
 # Guarantors must reach this many "accepted" responses before a loan can be disbursed.
 REQUIRED_ACCEPTED_GUARANTORS = 2
@@ -474,21 +475,59 @@ async def respond_to_offer(
                 ),
             )
 
+        # Disbursement is wallet-to-wallet: the lender must have the funds sitting
+        # in their own Mpola wallet already, plus the 0.5% platform fee — the
+        # borrower's wallet is credited the exact amount requested.
+        lender_wallet = db.query(Wallet).filter(Wallet.user_id == offer.lender_id).first()
+        if not lender_wallet or not lender_wallet.is_wallet_setup:
+            raise HTTPException(status_code=400, detail="Lender has not set up their wallet yet — cannot disburse this loan")
+
+        borrower_wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+        if not borrower_wallet or not borrower_wallet.is_wallet_setup:
+            raise HTTPException(status_code=400, detail="Please set up your wallet before accepting a loan offer")
+
+        platform_fee = calc_platform_fee(offer.amount)
+        total_debit = offer.amount + platform_fee
+        if lender_wallet.balance < total_debit:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Lender has insufficient wallet balance to fund this loan — needs UGX {total_debit:,.0f} (UGX {platform_fee:,.0f} platform fee included)",
+            )
+
         offer.status = "accepted"
         app.status = "funded"
 
-        # Disburse loan funds to borrower's mobile money via UPG
-        borrower = db.query(User).filter(User.id == app.borrower_id).first()
-        borrower_phone = borrower.phone_number if borrower else None
-        if not borrower_phone:
-            raise HTTPException(status_code=400, detail="Borrower has no phone number on record for disbursement")
-        carrier = _detect_carrier(borrower_phone)
-        try:
-            disburse_resp = UPGClient().disburse(amount=offer.amount, phone=borrower_phone, carrier=carrier)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Disbursement failed: {e}")
-        if not UPGClient.is_success(disburse_resp):
-            raise HTTPException(status_code=400, detail=disburse_resp.get("message", "Mobile money disbursement failed"))
+        lender_wallet.balance -= total_debit
+        borrower_wallet.balance += offer.amount
+
+        lender_tx = WalletTransaction(
+            wallet_id=lender_wallet.id,
+            amount=offer.amount,
+            type="disbursement",
+            status="completed",
+            description=f"Loan disbursed to {user.full_name or user.username}",
+            counterparty=user.username,
+        )
+        db.add(lender_tx)
+        db.flush()
+        db.add(PlatformFeeTransaction(
+            user_id=offer.lender_id,
+            wallet_transaction_id=lender_tx.id,
+            category="loan_disbursement",
+            platform_fee=platform_fee,
+            provider_fee=0,
+            total_fee=platform_fee,
+        ))
+
+        borrower_tx = WalletTransaction(
+            wallet_id=borrower_wallet.id,
+            amount=offer.amount,
+            type="disbursement",
+            status="completed",
+            description=f"Loan received from {offer.lender.full_name or offer.lender.username}",
+            counterparty=offer.lender.username,
+        )
+        db.add(borrower_tx)
 
         # Create active loan
         loan = Loan(
@@ -763,14 +802,27 @@ async def make_repayment(
             raise HTTPException(status_code=400, detail=resp.get("message", "Mobile money collection failed"))
         repayment.transaction_id = UPGClient.transaction_id(resp)
     else:
-        # Wallet repayment — debit the borrower's own wallet balance.
+        # Wallet repayment — wallet-to-wallet: the borrower pays the amount plus
+        # a 0.5% platform fee; the lender's wallet is credited the exact amount.
         wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
         if not wallet or not wallet.is_wallet_setup:
             raise HTTPException(status_code=400, detail="Please set up your wallet first")
-        if wallet.balance < data.amount:
-            raise HTTPException(status_code=400, detail="Insufficient wallet balance")
 
-        wallet.balance -= data.amount
+        lender_wallet = db.query(Wallet).filter(Wallet.user_id == loan.lender_id).first()
+        if not lender_wallet or not lender_wallet.is_wallet_setup:
+            raise HTTPException(status_code=400, detail="Lender's wallet is not set up — repayment cannot be completed")
+
+        platform_fee = calc_platform_fee(data.amount)
+        total_debit = data.amount + platform_fee
+        if wallet.balance < total_debit:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient wallet balance — you need UGX {total_debit:,.0f} (UGX {platform_fee:,.0f} platform fee included)",
+            )
+
+        wallet.balance -= total_debit
+        lender_wallet.balance += data.amount
+
         wallet_tx = WalletTransaction(
             wallet_id=wallet.id,
             amount=data.amount,
@@ -782,6 +834,25 @@ async def make_repayment(
         db.add(wallet_tx)
         db.flush()  # populate wallet_tx.id before using it as the repayment's reference
         repayment.transaction_id = wallet_tx.id
+
+        db.add(PlatformFeeTransaction(
+            user_id=user.id,
+            wallet_transaction_id=wallet_tx.id,
+            category="loan_repayment",
+            platform_fee=platform_fee,
+            provider_fee=0,
+            total_fee=platform_fee,
+        ))
+
+        lender_tx = WalletTransaction(
+            wallet_id=lender_wallet.id,
+            amount=data.amount,
+            type="repayment",
+            status="completed",
+            description=f"Repayment received from {user.full_name or user.username} — instalment #{loan.paid_instalments + 1}",
+            counterparty=loan.id,
+        )
+        db.add(lender_tx)
 
     loan.total_paid += data.amount
     loan.paid_instalments += 1
