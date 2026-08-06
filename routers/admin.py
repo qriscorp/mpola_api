@@ -57,10 +57,10 @@ def get_dashboard_stats(
 
     total_wallet_balance = db.query(func.sum(Wallet.balance)).scalar() or 0
 
-    # Interest generated platform-wide (goes to lenders — Mpola doesn't yet
-    # take a platform fee, so this is the closest real "revenue" proxy).
-    # Same approximation used in the lender earnings endpoint: every repayment
-    # carries the same interest/principal split as the loan overall.
+    # Interest generated platform-wide — goes to lenders, not Mpola. Shown
+    # alongside platform revenue for context, but it's the lenders' earnings,
+    # not ours. Same approximation used in the lender earnings endpoint:
+    # every repayment carries the same interest/principal split as the loan.
     total_interest_generated = 0.0
     for amount, total_repayable_, total_paid in db.query(Loan.amount, Loan.total_repayable, Loan.total_paid).all():
         if total_repayable_:
@@ -70,10 +70,11 @@ def get_dashboard_stats(
         LenderOfferTemplate.status == "pending_review"
     ).scalar()
 
-    # Real platform revenue — the 0.5% fee (plus Interswitch/Flutterwave
-    # provider surcharges) charged on withdrawals. See utils/fee.py.
-    total_platform_revenue = db.query(func.sum(PlatformFeeTransaction.total_fee)).scalar() or 0.0
-    total_platform_fee_only = db.query(func.sum(PlatformFeeTransaction.platform_fee)).scalar() or 0.0
+    # Real platform revenue — the 0.5% fee only (see utils/fee.py). Excludes
+    # Interswitch/Flutterwave provider surcharges: those are collected from
+    # withdrawing users but passed straight through to the provider, so
+    # they're not Mpola's money and must never be counted as revenue.
+    total_platform_revenue = db.query(func.sum(PlatformFeeTransaction.platform_fee)).scalar() or 0.0
 
     repayment_rate = round((total_repaid / total_repayable) * 100, 1) if total_repayable else 0.0
     default_rate = round((total_defaulted_loans / total_loans_count) * 100, 1) if total_loans_count else 0.0
@@ -125,7 +126,7 @@ def get_dashboard_stats(
         collected_by_month[key] = collected_by_month.get(key, 0.0) + amt
 
     revenue_by_month: dict = {}
-    for dt, amt in db.query(PlatformFeeTransaction.created_at, PlatformFeeTransaction.total_fee).all():
+    for dt, amt in db.query(PlatformFeeTransaction.created_at, PlatformFeeTransaction.platform_fee).all():
         key = dt.strftime("%Y-%m")
         revenue_by_month[key] = revenue_by_month.get(key, 0.0) + amt
 
@@ -182,7 +183,6 @@ def get_dashboard_stats(
             "total_wallet_balance": total_wallet_balance,
             "total_interest_generated": round(total_interest_generated, 2),
             "total_platform_revenue": round(total_platform_revenue, 2),
-            "total_platform_fee_only": round(total_platform_fee_only, 2),
             "repayment_rate": repayment_rate,
             "default_rate": default_rate,
             "kyc_completion_rate": kyc_completion_rate,
