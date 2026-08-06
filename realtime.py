@@ -20,6 +20,7 @@ from logging_module import logger
 class ConnectionManager:
     def __init__(self) -> None:
         self._connections: dict[str, list[WebSocket]] = {}
+        self.loop: asyncio.AbstractEventLoop | None = None
 
     async def connect(self, user_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -49,17 +50,17 @@ class ConnectionManager:
             self.disconnect(user_id, ws)
 
     def broadcast(self, user_id: str, message: dict[str, Any]) -> None:
-        """Fire-and-forget send usable from synchronous code (schedules on
-        the running event loop). Silently no-ops if there's no active loop
-        (e.g. called from a background scheduler thread) — push notifications
-        cover that case instead.
+        """Fire-and-forget send usable from ANY calling context — an async
+        route handler running on the event loop, a sync `def` route handler
+        (FastAPI runs those in a worker thread, where there's no running
+        loop), or the background scheduler thread. Uses the loop captured at
+        app startup (see main.py) rather than assuming one is already
+        running on the current thread.
         """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
+        if self.loop is None:
             return
         try:
-            loop.create_task(self.send_to_user(user_id, message))
+            asyncio.run_coroutine_threadsafe(self.send_to_user(user_id, message), self.loop)
         except Exception as e:
             logger.error(f"WebSocket broadcast scheduling failed: {e}")
 

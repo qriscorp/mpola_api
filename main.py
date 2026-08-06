@@ -13,6 +13,8 @@ from routers import (
 from database import ENGINE
 from database.tables import Base
 from scheduler import start_scheduler, stop_scheduler
+from realtime import manager as realtime_manager
+import asyncio
 
 app = FastAPI(
     title="Mpola API",
@@ -116,9 +118,14 @@ async def health_check():
 # ─── Create tables on startup (dev — use alembic in prod) ──
 
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
     Base.metadata.create_all(bind=ENGINE)
     start_scheduler()
+    # Captured here (a genuine async handler, run directly on the event loop)
+    # so realtime.manager.broadcast() can schedule sends from ANY calling
+    # context later — sync `def` route handlers run in a worker thread and
+    # have no running loop of their own to find via asyncio.get_running_loop().
+    realtime_manager.loop = asyncio.get_running_loop()
 
 
 @app.on_event("shutdown")
