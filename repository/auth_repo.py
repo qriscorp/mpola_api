@@ -219,6 +219,35 @@ def _notify(db: Session, user_id: str, title: str, message: str,
         logger.error(f"Push notify failed: {e}")
 
 
+def _setting_enabled(db: Session, key: str, default: bool = True) -> bool:
+    """Reads an admin-configurable on/off PlatformSetting (see the admin
+    Settings page's Notification Settings section)."""
+    row = db.query(PlatformSetting).filter(PlatformSetting.key == key).first()
+    if not row:
+        return default
+    return row.value == "true"
+
+
+def _notify_admins(db: Session, title: str, message: str, type: str | None = None,
+                    data: dict | None = None, setting_key: str | None = None,
+                    channel: str = "app"):
+    """Notify every admin/super_admin account, gated by an admin-configurable
+    toggle. `channel="sms"` sends via SMS instead of an in-app notification —
+    only admins with a phone number on file receive it in that case.
+    """
+    if setting_key and not _setting_enabled(db, setting_key):
+        return
+    admins = db.query(User).filter(
+        (User.is_admin == True) | (User.role.in_(["admin", "super_admin"]))
+    ).all()
+    for admin in admins:
+        if channel == "sms":
+            if admin.phone_number:
+                threading.Thread(target=send_sms, args=(admin.phone_number, message), daemon=True).start()
+        else:
+            _notify(db, admin.id, title=title, message=message, type=type, data=data)
+
+
 # ═══════════════════════════════════════════════
 #  EMAIL VIA SMTP
 # ═══════════════════════════════════════════════
@@ -1020,7 +1049,24 @@ class AuthRepo:
                     detail="Mpola is temporarily down for maintenance. Please try again shortly.",
                 )
 
-        # Successful login
+        # Password verified — if 2FA is on, stop here and challenge for a code
+        # instead of issuing tokens. No phone on file means there's no channel
+        # to deliver a code to, so fall through to a normal login rather than
+        # locking the user out of their own account.
+        if user.two_factor_enabled and user.phone_number:
+            AuthRepo._send_login_2fa_code(db, user)
+            return {
+                "status": 200,
+                "requires_2fa": True,
+                "username": user.username,
+                "message": "Enter the verification code sent to your phone to finish signing in.",
+            }
+
+        return AuthRepo._complete_login(db, user, identifier, ip_address, user_agent)
+
+    @staticmethod
+    def _complete_login(db: Session, user: User, identifier: str, ip_address: str | None, user_agent: str | None):
+        """Issues tokens for a fully-verified login (password-only, or password + 2FA code)."""
         AuthRepo._record_login_attempt(db, identifier, True, ip_address)
 
         token = create_access_token(_auth_claims(user))
@@ -1041,6 +1087,64 @@ class AuthRepo:
             "refresh_token": refresh,
             "user": _user_response(user),
         }
+
+    @staticmethod
+    def _send_login_2fa_code(db: Session, user: User):
+        code = _generate_otp_code()
+        hashed = _hash_otp(code)
+
+        existing = db.query(OTP).filter(
+            OTP.username == user.username, OTP.purpose == "login_2fa"
+        ).first()
+        if existing:
+            existing.code_hash = hashed
+            existing.phone_number = user.phone_number
+            existing.expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES)
+            existing.attempts = 0
+        else:
+            db.add(OTP(
+                username=user.username,
+                phone_number=user.phone_number,
+                code_hash=hashed,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES),
+                purpose="login_2fa",
+            ))
+        db.commit()
+
+        logger.debug(f"[DEV ONLY] 2FA login code for {user.username}: {code}")
+        message = f"Your Mpola sign-in verification code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
+        threading.Thread(target=send_sms, args=(user.phone_number, message), daemon=True).start()
+
+    @staticmethod
+    def verify_login_2fa(db: Session, username: str, code: str, ip_address: str | None = None, user_agent: str | None = None):
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            raise HTTPException(status_code=400, detail="Invalid code")
+
+        otp = db.query(OTP).filter(
+            OTP.username == user.username, OTP.purpose == "login_2fa"
+        ).first()
+        if not otp:
+            raise HTTPException(status_code=400, detail="No code found. Please sign in again.")
+        if otp.expires_at < datetime.utcnow():
+            db.delete(otp)
+            db.commit()
+            raise HTTPException(status_code=400, detail="Code expired. Please sign in again.")
+        if otp.attempts >= OTP_MAX_ATTEMPTS:
+            db.delete(otp)
+            db.commit()
+            raise HTTPException(status_code=429, detail="Too many attempts. Please sign in again.")
+
+        otp.attempts += 1
+        db.flush()
+
+        if not _verify_otp_hash(code, otp.code_hash):
+            db.commit()
+            remaining = OTP_MAX_ATTEMPTS - otp.attempts
+            raise HTTPException(status_code=400, detail=f"Invalid code. {remaining} attempt(s) remaining.")
+
+        db.delete(otp)
+        return AuthRepo._complete_login(db, user, username, ip_address, user_agent)
 
     # ── refresh ─────────────────────────────────
 

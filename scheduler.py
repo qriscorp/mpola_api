@@ -11,16 +11,20 @@ endpoints) — all have sane defaults so the job works with zero configuration:
   - default_after_days         (default 60)  — days overdue before a loan flips to "defaulted"
   - late_fee_rate              (default 0.02) — one-time late fee, as a fraction of monthly_payment,
                                                  added to total_repayable when a loan first goes overdue
+
+Also runs a weekly admin digest email (gated by the notif_weekly_digest
+toggle on the admin Settings page) — see run_weekly_digest_job.
 """
 
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import func
 
 from database import SessionLocal
-from database.tables import Loan, PlatformSetting
+from database.tables import User, Loan, LoanApplication, PlatformFeeTransaction, PlatformSetting, AuditLog
 from logging_module import logger
-from repository.auth_repo import _audit, _notify
+from repository.auth_repo import _audit, _notify, _send_email, _setting_enabled
 
 
 def _setting(db, key: str, default: float) -> float:
@@ -105,6 +109,10 @@ def _flag_overdue(db, now, grace_days: float, late_fee_rate: float) -> None:
             type="loan_overdue",
             data={"loan_id": loan.id},
         )
+        # The lender who actually owns this loan is notified above — that's
+        # the right person to act on it. Admins don't get a per-loan ping
+        # (on a busy platform that's dozens of alerts a day); they see the
+        # weekly digest total instead (see run_weekly_digest_job).
 
 
 def _flag_defaulted(db, now, grace_days: float, default_days: float) -> None:
@@ -135,6 +143,63 @@ def _flag_defaulted(db, now, grace_days: float, default_days: float) -> None:
             type="loan_defaulted",
             data={"loan_id": loan.id},
         )
+        # Same reasoning as overdue above — the lender is notified directly;
+        # admins get the weekly digest total instead of a per-loan ping.
+
+
+def run_weekly_digest_job() -> None:
+    """Emails every admin a one-week performance summary. Gated by the
+    "Weekly performance digest" toggle on the admin Settings page."""
+    db = SessionLocal()
+    try:
+        if not _setting_enabled(db, "notif_weekly_digest"):
+            return
+
+        since = datetime.now(timezone.utc) - timedelta(days=7)
+
+        new_users = db.query(func.count(User.id)).filter(User.created_at >= since).scalar() or 0
+        new_applications = db.query(func.count(LoanApplication.id)).filter(
+            LoanApplication.created_at >= since
+        ).scalar() or 0
+        disbursed_volume = db.query(func.sum(Loan.amount)).filter(Loan.disbursed_at >= since).scalar() or 0.0
+        revenue = db.query(func.sum(PlatformFeeTransaction.platform_fee)).filter(
+            PlatformFeeTransaction.created_at >= since
+        ).scalar() or 0.0
+        # Individual overdue/default events aren't pinged to admins in
+        # real time (the lender on each loan already gets notified directly
+        # — see _flag_overdue/_flag_defaulted) — this weekly total is how
+        # admins stay aware without a per-loan flood.
+        new_overdue = db.query(func.count(AuditLog.id)).filter(
+            AuditLog.action == "loan_marked_overdue", AuditLog.created_at >= since
+        ).scalar() or 0
+        new_defaulted = db.query(func.count(AuditLog.id)).filter(
+            AuditLog.action == "loan_marked_defaulted", AuditLog.created_at >= since
+        ).scalar() or 0
+
+        admins = db.query(User).filter(
+            (User.is_admin == True) | (User.role.in_(["admin", "super_admin"]))
+        ).all()
+
+        subject = "Mpola — Weekly Performance Digest"
+        html_body = f"""
+        <h2>Mpola weekly digest</h2>
+        <p>Last 7 days:</p>
+        <ul>
+          <li>New users: {new_users}</li>
+          <li>New loan applications: {new_applications}</li>
+          <li>Loans disbursed: UGX {disbursed_volume:,.0f}</li>
+          <li>Platform revenue: UGX {revenue:,.0f}</li>
+          <li>Loans newly overdue: {new_overdue}</li>
+          <li>Loans newly defaulted: {new_defaulted}</li>
+        </ul>
+        """
+        for admin in admins:
+            if admin.email:
+                _send_email(admin.email, subject, html_body)
+    except Exception as e:
+        logger.error(f"Weekly digest job failed: {e}")
+    finally:
+        db.close()
 
 
 _scheduler: BackgroundScheduler | None = None
@@ -146,8 +211,14 @@ def start_scheduler() -> None:
         return
     _scheduler = BackgroundScheduler(timezone="UTC")
     _scheduler.add_job(run_collections_job, "interval", hours=24, id="collections_job", next_run_time=datetime.now(timezone.utc))
+    # First run is a week out (not immediate like the collections job) so a
+    # server restart never spams admins with an extra digest email.
+    _scheduler.add_job(
+        run_weekly_digest_job, "interval", weeks=1, id="weekly_digest_job",
+        next_run_time=datetime.now(timezone.utc) + timedelta(weeks=1),
+    )
     _scheduler.start()
-    logger.info("Collections scheduler started (runs every 24h)")
+    logger.info("Collections scheduler started (runs every 24h, digest weekly)")
 
 
 def stop_scheduler() -> None:

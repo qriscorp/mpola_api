@@ -13,7 +13,7 @@ from repository.models import (
     SendPhoneOTPModel, VerifyPhoneOTPModel,
     SendPasswordResetCodeModel, VerifyPasswordResetCodeModel,
     ResetPasswordModel, ChangePasswordModel,
-    SendLoginPhoneOTPModel, VerifyLoginPhoneOTPModel,
+    SendLoginPhoneOTPModel, VerifyLoginPhoneOTPModel, VerifyLogin2FAModel,
     RegisterStart, SignupDraftRequest, SignupDraftPhoneRequest,
     SignupDraftVerifyRequest, SignupDraftVerifyPhoneRequest,
 )
@@ -74,6 +74,17 @@ async def verify_signup_phone_otp(data: SignupDraftVerifyPhoneRequest, request: 
 async def login(data: Login, request: Request, db: Session = Depends(get_db)):
     return AuthRepo.login(
         db, data,
+        ip_address=_get_ip(request),
+        user_agent=request.headers.get("user-agent"),
+    )
+
+
+@router.post("/verify_login_2fa")
+async def verify_login_2fa(data: VerifyLogin2FAModel, request: Request, db: Session = Depends(get_db)):
+    return AuthRepo.verify_login_2fa(
+        db,
+        data.username,
+        data.code,
         ip_address=_get_ip(request),
         user_agent=request.headers.get("user-agent"),
     )

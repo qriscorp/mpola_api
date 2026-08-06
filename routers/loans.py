@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from config import BASE_URL, FRONTEND_URL
 from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction, PlatformFeeTransaction
 from helpers import generateReferenceNumber, generateUniqueId, normalizePhoneNumber
-from repository.auth_repo import _audit, _notify, send_sms
+from repository.auth_repo import _audit, _notify, _notify_admins, send_sms
 from repository.dependencies import get_db, current_active_user
 from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, RepaymentCreate, GuarantorCreate, GuarantorRespond
 from repository.security import require_roles
@@ -89,6 +89,16 @@ async def create_application(
     db.add(app)
     db.commit()
     db.refresh(app)
+
+    _notify_admins(
+        db,
+        title="New loan application",
+        message=f"{user.full_name or user.username} applied for a {data.loan_type} loan of UGX {data.amount:,.0f}.",
+        type="new_application",
+        data={"application_id": app.id},
+        setting_key="notif_new_applications",
+    )
+    db.commit()
 
     return {
         "status": 200,

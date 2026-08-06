@@ -160,6 +160,11 @@ class SendLoginPhoneOTPModel(BaseModel):
     phone_number: str
 
 
+class VerifyLogin2FAModel(BaseModel):
+    username: str
+    code: str = Field(..., min_length=4, max_length=8)
+
+
 class VerifyLoginPhoneOTPModel(BaseModel):
     phone_number: str
     code: str
