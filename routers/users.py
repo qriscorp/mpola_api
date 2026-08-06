@@ -44,7 +44,7 @@ async def get_user(username: str, db: Session = Depends(get_db), user: User = De
     """Get public profile of another user (limited fields)."""
     target = UserRepo.get_user_by_username(db, username)
     # Return only public fields for non-admin users
-    if user.role not in ("admin", "super_admin") and user.username != username:
+    if not user.has_admin_access and user.username != username:
         return {
             "username": target["username"],
             "full_name": target["full_name"],

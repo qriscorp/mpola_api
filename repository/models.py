@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field, field_validator
 class AuthUser(BaseModel):
     username: str
     user_category: str
+    is_admin: bool = False
+    is_super_admin: bool = False
 
 
 class Login(BaseModel):
@@ -337,6 +339,13 @@ class AdminUserStatusUpdate(BaseModel):
 
 class AdminRoleUpdate(BaseModel):
     role: str  # borrower, lender, admin
+
+
+class AdminAccessUpdate(BaseModel):
+    """Grants/revokes admin access WITHOUT touching the account's borrower/lender
+    portal role — lets an existing lender or borrower also become an admin."""
+    is_admin: bool
+    is_super_admin: bool = False
 
 
 class PlatformSettingUpdate(BaseModel):

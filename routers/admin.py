@@ -15,10 +15,10 @@ from database.tables import (
 from repository.auth_repo import get_password_hash, _audit, _notify
 from repository.dependencies import get_db
 from repository.models import (
-    AuthUser, AdminRoleUpdate, PlatformSettingUpdate,
+    AuthUser, AdminRoleUpdate, AdminAccessUpdate, PlatformSettingUpdate,
     DisputeResolve, SupportMessageCreate, SupportTicketStatusUpdate,
 )
-from repository.security import require_admin
+from repository.security import require_admin, require_super_admin
 from repository.user_repo import UserRepo
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
@@ -343,6 +343,8 @@ def get_users(
                 "full_name": u.full_name,
                 "phone_number": u.phone_number,
                 "role": u.role,
+                "is_admin": u.has_admin_access,
+                "is_super_admin": u.has_super_admin_access,
                 "is_active": u.is_active,
                 "is_verified": u.is_verified,
                 "is_kyc_verified": u.is_kyc_verified,
@@ -453,7 +455,7 @@ def suspend_user(
         raise HTTPException(status_code=404, detail="User not found")
 
     # Prevent suspending other admins
-    if user.role in ("admin", "super_admin") and admin.user_category != "super_admin":
+    if user.has_admin_access and not admin.is_super_admin:
         raise HTTPException(status_code=403, detail="Cannot suspend admin accounts")
 
     user.is_active = not user.is_active
@@ -483,9 +485,12 @@ def change_user_role(
     db: Session = Depends(get_db),
     admin: AuthUser = Depends(require_admin),
 ):
-    """Change a user's role (make admin, change to lender/borrower)."""
+    """Change a user's portal role (borrower/lender), or set a legacy pure-admin
+    role with no portal identity. To grant admin access to an existing
+    lender/borrower WITHOUT changing their portal role, use
+    PATCH /admin/users/{username}/admin-access instead."""
     # Only super_admin can create other admins
-    if data.role in ("admin", "super_admin") and admin.user_category != "super_admin":
+    if data.role in ("admin", "super_admin") and not admin.is_super_admin:
         raise HTTPException(status_code=403, detail="Only super admins can grant admin roles")
 
     user = db.query(User).filter(User.username == username).first()
@@ -508,6 +513,46 @@ def change_user_role(
     }
 
 
+@router.patch("/users/{username}/admin-access")
+def set_admin_access(
+    username: str,
+    data: AdminAccessUpdate,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_super_admin),
+):
+    """Grant or revoke admin access on an existing lender/borrower account
+    WITHOUT changing their portal role — e.g. a lender who should also be
+    able to use the admin dashboard. Only super admins can do this."""
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if data.is_super_admin and not data.is_admin:
+        raise HTTPException(status_code=400, detail="is_super_admin requires is_admin")
+
+    user.is_admin = data.is_admin
+    user.is_super_admin = data.is_admin and data.is_super_admin
+
+    # Revoking admin access on a session should force re-auth so a stale
+    # token (still carrying the old admin claim) can't keep working.
+    if not data.is_admin:
+        user.refresh_token = None
+        user.refresh_token_expires_at = None
+
+    _audit(db, "admin_access_change", username=admin.username,
+           resource_type="user", resource_id=user.id,
+           details={"target_user": username, "is_admin": user.is_admin, "is_super_admin": user.is_super_admin})
+    db.commit()
+
+    return {
+        "success": True,
+        "username": username,
+        "role": user.role,
+        "is_admin": user.is_admin,
+        "is_super_admin": user.is_super_admin,
+    }
+
+
 @router.post("/users/{username}/deactivate")
 def deactivate_user(
     username: str,
@@ -519,7 +564,7 @@ def deactivate_user(
     user = db.query(User).filter(User.username == username).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if user.role in ("admin", "super_admin"):
+    if user.has_admin_access:
         raise HTTPException(status_code=403, detail="Cannot deactivate admin accounts")
 
     record = DeactivatedAccount(

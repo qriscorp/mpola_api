@@ -11,10 +11,10 @@ def require_roles(allowed: list[str]):
     """FastAPI dependency that restricts access to users with the specified roles."""
 
     def _check(current_user: AuthUser = Depends(get_current_user)):
-        category = (current_user.user_category or "").lower()
-        # Admins always permitted
-        if "admin" in category:
+        # Admins always permitted, regardless of their underlying portal role
+        if current_user.is_admin:
             return current_user
+        category = (current_user.user_category or "").lower()
         if category not in [r.lower() for r in allowed]:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -26,11 +26,20 @@ def require_roles(allowed: list[str]):
 
 
 def require_admin(current_user: AuthUser = Depends(get_current_user)):
-    """Dependency that ensures the user is an admin or super_admin."""
-    category = (current_user.user_category or "").lower()
-    if "admin" not in category:
+    """Dependency that ensures the user has admin (or super_admin) access."""
+    if not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required",
+        )
+    return current_user
+
+
+def require_super_admin(current_user: AuthUser = Depends(get_current_user)):
+    """Dependency that ensures the user has super_admin access."""
+    if not current_user.is_super_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super admin access required",
         )
     return current_user

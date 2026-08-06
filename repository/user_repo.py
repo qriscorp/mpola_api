@@ -28,6 +28,8 @@ class UserRepo:
             "full_name": user.full_name,
             "phone_number": user.phone_number,
             "role": user.role,
+            "is_admin": user.has_admin_access,
+            "is_super_admin": user.has_super_admin_access,
             "is_verified": user.is_verified,
             "is_phone_verified": user.is_phone_verified,
             "is_kyc_verified": user.is_kyc_verified,

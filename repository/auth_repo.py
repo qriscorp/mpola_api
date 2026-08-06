@@ -94,6 +94,18 @@ def validate_email_format(email: str):
 # ═══════════════════════════════════════════════
 
 
+def _auth_claims(user: User) -> dict:
+    """Base JWT claims for a user — admin access is carried as flags so a
+    dual-role account (e.g. lender + admin) authorizes correctly everywhere
+    without changing its `role` (borrower/lender) claim."""
+    return {
+        "sub": user.username,
+        "role": user.role,
+        "is_admin": user.has_admin_access,
+        "is_super_admin": user.has_super_admin_access,
+    }
+
+
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
@@ -321,7 +333,12 @@ class AuthRepo:
                 raise HTTPException(status_code=401, detail="Invalid token")
             if token_type != "access":
                 raise HTTPException(status_code=401, detail="Invalid token type")
-            return AuthUser(username=username, user_category=role)
+            return AuthUser(
+                username=username,
+                user_category=role,
+                is_admin=bool(payload.get("is_admin", False)),
+                is_super_admin=bool(payload.get("is_super_admin", False)),
+            )
         except jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Token expired")
         except jwt.InvalidIssuerError:
@@ -367,7 +384,7 @@ class AuthRepo:
             raise HTTPException(status_code=400, detail="Invalid login portal")
 
         role = (user.role or "borrower").lower()
-        if role in {"admin", "super_admin"}:
+        if role in {"admin", "super_admin"} or user.has_admin_access:
             return
 
         if requested_portal == "borrower" and role == "lender":
@@ -908,8 +925,8 @@ class AuthRepo:
         db.flush()
 
         # Generate tokens
-        token = create_access_token({"sub": user.username, "role": user.role})
-        refresh = create_refresh_token({"sub": user.username, "role": user.role})
+        token = create_access_token(_auth_claims(user))
+        refresh = create_refresh_token(_auth_claims(user))
 
         user.refresh_token = refresh
         user.refresh_token_expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
@@ -993,7 +1010,7 @@ class AuthRepo:
         AuthRepo._enforce_portal_role(user, getattr(login_data, "portal", None))
 
         # Maintenance mode blocks everyone except admins from signing in.
-        if "admin" not in (user.role or "").lower():
+        if not user.has_admin_access:
             maintenance = db.query(PlatformSetting).filter(PlatformSetting.key == "maintenance_mode").first()
             if maintenance and maintenance.value == "true":
                 AuthRepo._record_login_attempt(db, identifier, False, ip_address)
@@ -1006,8 +1023,8 @@ class AuthRepo:
         # Successful login
         AuthRepo._record_login_attempt(db, identifier, True, ip_address)
 
-        token = create_access_token({"sub": user.username, "role": user.role})
-        refresh = create_refresh_token({"sub": user.username, "role": user.role})
+        token = create_access_token(_auth_claims(user))
+        refresh = create_refresh_token(_auth_claims(user))
 
         user.refresh_token = refresh
         user.refresh_token_expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
@@ -1049,8 +1066,8 @@ class AuthRepo:
         if not user.is_active:
             raise HTTPException(status_code=403, detail="Account suspended")
 
-        new_access = create_access_token({"sub": user.username, "role": user.role})
-        new_refresh = create_refresh_token({"sub": user.username, "role": user.role})
+        new_access = create_access_token(_auth_claims(user))
+        new_refresh = create_refresh_token(_auth_claims(user))
 
         # Rotate refresh token (one-time use)
         user.refresh_token = new_refresh
@@ -1354,7 +1371,7 @@ class AuthRepo:
 
         # Generate short-lived token for password reset (15 min)
         token = create_access_token(
-            {"sub": user.username, "role": user.role, "purpose": "password_reset"},
+            {**_auth_claims(user), "purpose": "password_reset"},
             expires_delta=timedelta(minutes=15),
         )
         db.delete(otp)
@@ -1471,7 +1488,7 @@ class AuthRepo:
         db.delete(otp)
 
         # Issue tokens
-        access_token = create_access_token({"sub": user.username, "role": user.role})
+        access_token = create_access_token(_auth_claims(user))
         refresh = secrets.token_urlsafe(64)
         user.refresh_token = refresh
         user.refresh_token_expires_at = datetime.utcnow() + timedelta(days=7)
@@ -1489,6 +1506,8 @@ class AuthRepo:
                 "full_name": user.full_name,
                 "phone_number": user.phone_number,
                 "role": user.role,
+                "is_admin": user.has_admin_access,
+                "is_super_admin": user.has_super_admin_access,
                 "is_active": user.is_active,
                 "is_verified": user.is_verified,
                 "is_phone_verified": user.is_phone_verified,
@@ -1545,6 +1564,8 @@ def _user_response(user: User) -> dict:
         "full_name": user.full_name,
         "phone_number": user.phone_number,
         "role": user.role,
+        "is_admin": user.has_admin_access,
+        "is_super_admin": user.has_super_admin_access,
         "is_verified": user.is_verified,
         "is_phone_verified": user.is_phone_verified,
         "is_kyc_verified": user.is_kyc_verified,

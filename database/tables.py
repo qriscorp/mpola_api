@@ -38,6 +38,13 @@ class User(Base, TimestampMixin):
     bio = Column(Text, nullable=True)
     account_type = Column(String(20), default="individual")  # individual, business, company
     role = Column(String(30), default="borrower")  # borrower, lender, admin, super_admin
+    # Admin access is orthogonal to `role`: an account keeps its borrower/lender
+    # portal identity (role can never be both at once) and can ADDITIONALLY be
+    # flagged as admin/super_admin here — e.g. a lender who also moderates the
+    # platform. Legacy accounts with role="admin"/"super_admin" (no portal
+    # identity) still work as before via has_admin_access/has_super_admin_access.
+    is_admin = Column(Boolean, default=False)
+    is_super_admin = Column(Boolean, default=False)
     is_active = Column(Boolean, default=True)
     is_verified = Column(Boolean, default=False)
     is_phone_verified = Column(Boolean, default=False)
@@ -58,6 +65,25 @@ class User(Base, TimestampMixin):
     offers_made = relationship("LoanOffer", back_populates="lender", foreign_keys="LoanOffer.lender_id")
     notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan")
     referred_by = relationship("User", remote_side=[id])
+
+    @property
+    def has_admin_access(self) -> bool:
+        return bool(self.is_admin) or (self.role or "").lower() in ("admin", "super_admin")
+
+    @property
+    def has_super_admin_access(self) -> bool:
+        return bool(self.is_super_admin) or (self.role or "").lower() == "super_admin"
+
+    @property
+    def portal_role(self) -> str:
+        """Borrower/lender identity used for dashboard routing — never 'admin'."""
+        r = (self.role or "borrower").lower()
+        return r if r in ("borrower", "lender") else "borrower"
+
+    @property
+    def has_portal_identity(self) -> bool:
+        """True if this account has a real lender/borrower portal (not a pure legacy admin)."""
+        return (self.role or "").lower() in ("borrower", "lender")
 
 
 class DeactivatedAccount(Base, TimestampMixin):

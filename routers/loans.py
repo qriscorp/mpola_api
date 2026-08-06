@@ -124,7 +124,7 @@ async def get_application(
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
     # Borrower can see own, lenders can see any, admin can see all
-    if user.role in ("admin", "super_admin", "lender") or app.borrower_id == user.id:
+    if user.has_admin_access or user.role == "lender" or app.borrower_id == user.id:
         return _app_response(app, include_offers=True)
     raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -299,7 +299,7 @@ async def list_documents(
     app = db.query(LoanApplication).filter(LoanApplication.id == app_id).first()
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
-    if user.role not in ("admin", "super_admin", "lender") and app.borrower_id != user.id:
+    if not (user.has_admin_access or user.role == "lender") and app.borrower_id != user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     docs = db.query(LoanDocument).filter(LoanDocument.application_id == app_id).all()
@@ -758,7 +758,7 @@ async def get_loan(
     loan = db.query(Loan).filter(Loan.id == loan_id).first()
     if not loan:
         raise HTTPException(status_code=404, detail="Loan not found")
-    if loan.borrower_id != user.id and loan.lender_id != user.id and user.role not in ("admin", "super_admin"):
+    if loan.borrower_id != user.id and loan.lender_id != user.id and not user.has_admin_access:
         raise HTTPException(status_code=403, detail="Not authorized")
     return _loan_response(loan, include_repayments=True)
 
