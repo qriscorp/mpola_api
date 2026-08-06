@@ -794,9 +794,11 @@ def get_revenue(
     db: Session = Depends(get_db),
     admin: AuthUser = Depends(require_admin),
 ):
-    """Platform revenue ledger — the 0.5% fee (plus Interswitch MTN/Airtel or
-    Flutterwave provider surcharge) charged on every withdrawal. See utils/fee.py
-    for the schedule.
+    """Platform revenue ledger — the 0.5% fee Mpola actually keeps, charged on
+    withdrawals, loan disbursements, and loan repayments (see utils/fee.py).
+    Interswitch/Flutterwave provider surcharges are collected from users on
+    withdrawals but passed straight through to the provider — that's not
+    Mpola revenue, so it's deliberately excluded from every figure here.
     """
     query = db.query(PlatformFeeTransaction)
     if category:
@@ -804,17 +806,15 @@ def get_revenue(
     total = query.count()
     rows = query.order_by(PlatformFeeTransaction.created_at.desc()).offset(skip).limit(limit).all()
 
-    total_revenue = db.query(func.sum(PlatformFeeTransaction.total_fee)).scalar() or 0.0
-    total_platform_fee = db.query(func.sum(PlatformFeeTransaction.platform_fee)).scalar() or 0.0
-    total_provider_fee = db.query(func.sum(PlatformFeeTransaction.provider_fee)).scalar() or 0.0
+    total_revenue = db.query(func.sum(PlatformFeeTransaction.platform_fee)).scalar() or 0.0
 
     by_category_rows = (
-        db.query(PlatformFeeTransaction.category, func.sum(PlatformFeeTransaction.total_fee), func.count(PlatformFeeTransaction.id))
+        db.query(PlatformFeeTransaction.category, func.sum(PlatformFeeTransaction.platform_fee), func.count(PlatformFeeTransaction.id))
         .group_by(PlatformFeeTransaction.category)
         .all()
     )
     by_category = [
-        {"category": cat, "total_fee": round(amt or 0.0, 2), "count": cnt}
+        {"category": cat, "revenue": round(amt or 0.0, 2), "count": cnt}
         for cat, amt, cnt in by_category_rows
     ]
 
@@ -829,7 +829,7 @@ def get_revenue(
     months.reverse()
 
     revenue_by_month: dict = {}
-    for dt, amt in db.query(PlatformFeeTransaction.created_at, PlatformFeeTransaction.total_fee).all():
+    for dt, amt in db.query(PlatformFeeTransaction.created_at, PlatformFeeTransaction.platform_fee).all():
         key = dt.strftime("%Y-%m")
         revenue_by_month[key] = revenue_by_month.get(key, 0.0) + amt
 
@@ -842,8 +842,6 @@ def get_revenue(
         "total": total,
         "totals": {
             "revenue": round(total_revenue, 2),
-            "platform_fee": round(total_platform_fee, 2),
-            "provider_fee": round(total_provider_fee, 2),
         },
         "by_category": by_category,
         "monthly_revenue": monthly_revenue,
@@ -853,8 +851,6 @@ def get_revenue(
                 "username": r.user.full_name if r.user else None,
                 "category": r.category,
                 "platform_fee": r.platform_fee,
-                "provider_fee": r.provider_fee,
-                "total_fee": r.total_fee,
                 "created_at": str(r.created_at),
             }
             for r in rows

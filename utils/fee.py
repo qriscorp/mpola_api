@@ -3,17 +3,27 @@ Platform + payment-provider fee schedule — mirrors kumpi's model exactly,
 since Mpola shares the same UPG (Unified Payment Gateway) and the same
 underlying Interswitch (MTN/Airtel) and Flutterwave rails.
 
-Fee applies only to money LEAVING the platform via an external rail
-(mobile money withdrawal, bank/Flutterwave payout). No fee on deposits —
-same as kumpi.
+The 0.5% platform fee (Mpola's actual revenue — see calc_platform_fee) is
+charged on FOUR kinds of transaction: mobile money withdrawal, bank
+withdrawal, loan disbursement (lender pays it on top, borrower receives the
+full amount), and loan repayment (borrower pays it on top, wallet-to-wallet).
+No fee on deposits.
+
+The provider surcharge below (Interswitch for mobile money, Flutterwave for
+bank payouts) only applies to withdrawals, since those are the only two
+categories that actually leave the platform via an external rail — loan
+disbursement/repayment are wallet-to-wallet and never touch a provider.
+That surcharge is collected from the withdrawing user and passed straight
+through to the provider; it is NOT Mpola revenue.
 """
 
 import math
 
 # ── Platform fee ─────────────────────────────────────────────────────────
-# 0.5% charged on every withdrawal (mobile money or bank), on top of the
-# amount, absorbed by the withdrawing user — they still receive the full
-# amount they requested; the extra is debited from their wallet.
+# 0.5% — Mpola's own cut, charged on every withdrawal, loan disbursement,
+# and loan repayment, on top of the amount, absorbed by whoever is sending
+# the money. This is the only line item that counts as platform revenue —
+# see routers/admin.py's /admin/revenue endpoint.
 TX_FEE_RATE = 0.005  # 0.5%
 
 
