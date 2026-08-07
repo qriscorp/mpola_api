@@ -248,6 +248,22 @@ class LoanDocument(Base, TimestampMixin):
     application = relationship("LoanApplication", back_populates="documents")
 
 
+class KYCDocument(Base, TimestampMixin):
+    """Account-level identity verification documents — separate from
+    LoanDocument, which is paperwork attached to one specific loan
+    application. These are what admin KYC review actually looks at."""
+    __tablename__ = "kyc_documents"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    user_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    document_type = Column(String(50), nullable=False)  # national_id, passport, profile_photo, proof_of_address
+    file_url = Column(String(500), nullable=False)
+    file_name = Column(String(255), nullable=True)
+    verified = Column(Boolean, default=False)
+
+    user = relationship("User")
+
+
 class Guarantor(Base, TimestampMixin):
     __tablename__ = "guarantors"
 

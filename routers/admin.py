@@ -10,7 +10,7 @@ from database.tables import (
     User, DeactivatedAccount, Wallet, WalletTransaction,
     LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment,
     Notification, PlatformSetting, AuditLog, LoginAttempt, PlatformFeeTransaction,
-    Dispute, SupportTicket, SupportMessage, LoanDocument,
+    Dispute, SupportTicket, SupportMessage, LoanDocument, KYCDocument,
 )
 from repository.auth_repo import get_password_hash, _audit, _notify
 from repository.dependencies import get_db
@@ -390,6 +390,13 @@ def get_user_detail(
             .all()
         )
 
+    kyc_documents = (
+        db.query(KYCDocument)
+        .filter(KYCDocument.user_id == user_id)
+        .order_by(KYCDocument.created_at.desc())
+        .all()
+    )
+
     wallet = db.query(Wallet).filter(Wallet.user_id == user_id).first()
     transactions = []
     if wallet:
@@ -446,6 +453,17 @@ def get_user_detail(
                 "created_at": str(d.created_at),
             }
             for d in documents
+        ],
+        "kyc_documents": [
+            {
+                "id": d.id,
+                "document_type": d.document_type,
+                "file_url": d.file_url,
+                "file_name": d.file_name,
+                "verified": d.verified,
+                "created_at": str(d.created_at),
+            }
+            for d in kyc_documents
         ],
         "wallet": {
             "balance": wallet.balance if wallet else 0,
@@ -524,6 +542,26 @@ def verify_document(
     document.verified = data.verified
     _audit(db, "document_verified" if data.verified else "document_unverified",
            username=admin.username, resource_type="loan_document", resource_id=document.id)
+    db.commit()
+
+    return {"success": True, "document_id": document.id, "verified": document.verified}
+
+
+@router.patch("/kyc-documents/{document_id}/verify")
+def verify_kyc_document(
+    document_id: str,
+    data: DocumentVerifyUpdate,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Marks one of a user's account-level KYC documents as verified/unverified."""
+    document = db.query(KYCDocument).filter(KYCDocument.id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    document.verified = data.verified
+    _audit(db, "kyc_document_verified" if data.verified else "kyc_document_unverified",
+           username=admin.username, resource_type="kyc_document", resource_id=document.id)
     db.commit()
 
     return {"success": True, "document_id": document.id, "verified": document.verified}
