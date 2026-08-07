@@ -10,13 +10,14 @@ from database.tables import (
     User, DeactivatedAccount, Wallet, WalletTransaction,
     LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment,
     Notification, PlatformSetting, AuditLog, LoginAttempt, PlatformFeeTransaction,
-    Dispute, SupportTicket, SupportMessage,
+    Dispute, SupportTicket, SupportMessage, LoanDocument,
 )
 from repository.auth_repo import get_password_hash, _audit, _notify
 from repository.dependencies import get_db
 from repository.models import (
     AuthUser, AdminRoleUpdate, AdminAccessUpdate, PlatformSettingUpdate,
     DisputeResolve, SupportMessageCreate, SupportTicketStatusUpdate,
+    KYCReviewUpdate, DocumentVerifyUpdate,
 )
 from repository.security import require_admin, require_super_admin
 from repository.user_repo import UserRepo
@@ -380,6 +381,15 @@ def get_user_detail(
         .all()
     )
 
+    documents = []
+    if applications:
+        documents = (
+            db.query(LoanDocument)
+            .filter(LoanDocument.application_id.in_([a.id for a in applications]))
+            .order_by(LoanDocument.created_at.desc())
+            .all()
+        )
+
     wallet = db.query(Wallet).filter(Wallet.user_id == user_id).first()
     transactions = []
     if wallet:
@@ -425,6 +435,18 @@ def get_user_detail(
             }
             for a in applications
         ],
+        "documents": [
+            {
+                "id": d.id,
+                "application_id": d.application_id,
+                "document_type": d.document_type,
+                "file_url": d.file_url,
+                "file_name": d.file_name,
+                "verified": d.verified,
+                "created_at": str(d.created_at),
+            }
+            for d in documents
+        ],
         "wallet": {
             "balance": wallet.balance if wallet else 0,
             "is_wallet_setup": wallet.is_wallet_setup if wallet else False,
@@ -441,6 +463,70 @@ def get_user_detail(
             for tx in transactions
         ],
     }
+
+
+@router.patch("/users/{username}/kyc")
+def review_kyc(
+    username: str,
+    data: KYCReviewUpdate,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Admin approves or rejects a user's KYC — the only place in the codebase
+    that ever changes is_kyc_verified/kyc_status away from their defaults."""
+    if data.status not in ("verified", "rejected"):
+        raise HTTPException(status_code=400, detail="status must be 'verified' or 'rejected'")
+
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.kyc_status = data.status
+    user.is_kyc_verified = data.status == "verified"
+
+    _audit(db, f"kyc_{data.status}", username=admin.username,
+           resource_type="user", resource_id=user.id,
+           details={"target_user": username, "note": data.note})
+
+    _notify(
+        db, user.id,
+        title="KYC verified" if data.status == "verified" else "KYC rejected",
+        message=(
+            "Your identity verification is complete — you now have full access to Mpola."
+            if data.status == "verified"
+            else f"Your identity verification was rejected.{f' Reason: {data.note}' if data.note else ' Please contact support for details.'}"
+        ),
+        type="kyc_update",
+    )
+    db.commit()
+
+    return {
+        "success": True,
+        "username": username,
+        "kyc_status": user.kyc_status,
+        "is_kyc_verified": user.is_kyc_verified,
+    }
+
+
+@router.patch("/documents/{document_id}/verify")
+def verify_document(
+    document_id: str,
+    data: DocumentVerifyUpdate,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Marks a single uploaded document as verified/unverified — part of the
+    evidence an admin reviews before approving or rejecting KYC overall."""
+    document = db.query(LoanDocument).filter(LoanDocument.id == document_id).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    document.verified = data.verified
+    _audit(db, "document_verified" if data.verified else "document_unverified",
+           username=admin.username, resource_type="loan_document", resource_id=document.id)
+    db.commit()
+
+    return {"success": True, "document_id": document.id, "verified": document.verified}
 
 
 @router.patch("/users/{username}/suspend")
@@ -922,8 +1008,14 @@ def review_offer_template(
 
     _audit(db, f"offer_template_{action}", username=admin.username,
            resource_type="lender_offer_template", resource_id=template.id)
+
+    matched = 0
+    if action == "approve":
+        from routers.loans import auto_match_offers_for_template
+        matched = auto_match_offers_for_template(db, template)
+
     db.commit()
-    return {"success": True, "status": template.status}
+    return {"success": True, "status": template.status, "offers_created": matched}
 
 
 # ═══════════════════════════════════════════════

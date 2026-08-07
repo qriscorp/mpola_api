@@ -7,6 +7,7 @@ import os
 import threading
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, Response
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from config import BASE_URL, FRONTEND_URL
@@ -98,6 +99,7 @@ async def create_application(
         data={"application_id": app.id},
         setting_key="notif_new_applications",
     )
+    auto_match_offers_for_application(db, app)
     db.commit()
 
     return {
@@ -617,9 +619,10 @@ async def create_offer_template(
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
 ):
-    """A lender submits their standing lending criteria. There's no automated
-    matching engine yet — submissions sit as 'pending_review' until an admin
-    dashboard exists to review and publish them.
+    """A lender submits their standing lending criteria. Submissions sit as
+    'pending_review' until an admin approves them — once approved, they're
+    matched against every pending application (and every new one going
+    forward) and auto-generate real offers. See auto_match_offers_for_*.
     """
     template = LenderOfferTemplate(
         lender_id=user.id,
@@ -660,6 +663,117 @@ async def my_offer_templates(
         .all()
     )
     return {"templates": [_offer_template_response(t) for t in templates]}
+
+
+# ═══════════════════════════════════════════════
+#  STANDING OFFER AUTO-MATCHING
+# ═══════════════════════════════════════════════
+#  An approved LenderOfferTemplate is a lender's standing lending criteria.
+#  These two entry points are how it actually turns into real offers:
+#    - a new application checks every approved template (see create_application)
+#    - a newly-approved template checks every pending application (see
+#      routers/admin.py's review_offer_template)
+#  Either way, matching creates a real LoanOffer exactly as if the lender had
+#  made it by hand — the borrower still has to accept it themselves.
+
+def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanApplication) -> bool:
+    if template.status != "approved":
+        return False
+    if template.lender_id == app.borrower_id:
+        return False
+    if template.valid_until and template.valid_until < datetime.now(timezone.utc):
+        return False
+    if not (template.min_amount <= app.amount <= template.max_amount):
+        return False
+    if app.duration > template.max_duration:
+        return False
+
+    accepted_types = json.loads(template.accepted_loan_types) if template.accepted_loan_types else []
+    if accepted_types and app.loan_type not in accepted_types:
+        return False
+
+    if template.max_concurrent_loans is not None:
+        active_count = db.query(func.count(Loan.id)).filter(
+            Loan.lender_id == template.lender_id,
+            Loan.status.in_(["active", "overdue"]),
+        ).scalar()
+        if active_count >= template.max_concurrent_loans:
+            return False
+
+    already_offered = db.query(LoanOffer).filter(
+        LoanOffer.application_id == app.id,
+        LoanOffer.lender_id == template.lender_id,
+    ).first()
+    if already_offered:
+        return False
+
+    return True
+
+
+def _create_offer_from_template(db: Session, app: LoanApplication, template: LenderOfferTemplate) -> LoanOffer:
+    total_interest = app.amount * (template.interest_rate / 100) * (app.duration / 12)
+    total_repayable = app.amount + total_interest
+    monthly_payment = total_repayable / app.duration
+
+    offer = LoanOffer(
+        application_id=app.id,
+        lender_id=template.lender_id,
+        amount=app.amount,
+        interest_rate=template.interest_rate,
+        duration=app.duration,
+        total_repayable=round(total_repayable, 2),
+        monthly_payment=round(monthly_payment, 2),
+    )
+    db.add(offer)
+    db.flush()
+
+    lender = db.query(User).filter(User.id == template.lender_id).first()
+    _notify(
+        db, app.borrower_id,
+        title="New offer received",
+        message=(
+            f"{lender.full_name if lender else 'A lender'} auto-offered UGX {app.amount:,.0f} "
+            f"at {template.interest_rate}% p.a. for {app.duration} months, matching your loan request."
+        ),
+        type="loan_offer",
+        data={"application_id": app.id},
+    )
+    _notify(
+        db, template.lender_id,
+        title="Standing offer matched",
+        message=(
+            f"Your standing offer criteria matched a new UGX {app.amount:,.0f} "
+            f"{app.loan_type} request — an offer was sent automatically."
+        ),
+        type="lender_offer_template",
+        data={"application_id": app.id},
+    )
+    _audit(db, "offer_auto_matched", username=lender.username if lender else None,
+           resource_type="loan_offer", resource_id=offer.id,
+           details={"application_id": app.id, "template_id": template.id})
+    return offer
+
+
+def auto_match_offers_for_application(db: Session, app: LoanApplication) -> int:
+    """New application → check it against every approved standing offer."""
+    templates = db.query(LenderOfferTemplate).filter(LenderOfferTemplate.status == "approved").all()
+    created = 0
+    for template in templates:
+        if _template_matches(db, template, app):
+            _create_offer_from_template(db, app, template)
+            created += 1
+    return created
+
+
+def auto_match_offers_for_template(db: Session, template: LenderOfferTemplate) -> int:
+    """Newly-approved standing offer → check it against every pending application."""
+    apps = db.query(LoanApplication).filter(LoanApplication.status == "pending").all()
+    created = 0
+    for app in apps:
+        if _template_matches(db, template, app):
+            _create_offer_from_template(db, app, template)
+            created += 1
+    return created
 
 
 # ═══════════════════════════════════════════════

@@ -346,6 +346,15 @@ class AdminRoleUpdate(BaseModel):
     role: str  # borrower, lender, admin
 
 
+class KYCReviewUpdate(BaseModel):
+    status: str  # verified, rejected
+    note: Optional[str] = None
+
+
+class DocumentVerifyUpdate(BaseModel):
+    verified: bool
+
+
 class AdminAccessUpdate(BaseModel):
     """Grants/revokes admin access WITHOUT touching the account's borrower/lender
     portal role — lets an existing lender or borrower also become an admin."""

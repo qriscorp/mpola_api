@@ -287,9 +287,10 @@ class LoanOffer(Base, TimestampMixin):
 
 class LenderOfferTemplate(Base, TimestampMixin):
     """A lender's standing lending criteria (max/min amount, rate, accepted
-    loan types, etc). Not yet matched against applications automatically —
-    submissions sit as 'pending_review' until an admin dashboard exists to
-    review and publish them.
+    loan types, etc). Submissions sit as 'pending_review' until an admin
+    approves them — once approved, routers/loans.py's auto-matching engine
+    checks it against pending applications (and every new one going forward)
+    and creates real LoanOffer rows automatically.
     """
     __tablename__ = "lender_offer_templates"
 
