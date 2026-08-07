@@ -413,7 +413,13 @@ class AuthRepo:
             raise HTTPException(status_code=400, detail="Invalid login portal")
 
         role = (user.role or "borrower").lower()
-        if role in {"admin", "super_admin"} or user.has_admin_access:
+        # Only a legacy pure-admin account (role IS admin/super_admin, no real
+        # borrower/lender identity of its own) is exempt. A dual-role account
+        # (e.g. borrower + admin) still has one true portal — it must sign in
+        # through the matching form, then use the in-app switcher to reach
+        # /admin. Being admin-flagged does NOT let it use the other portal's
+        # login form.
+        if role in {"admin", "super_admin"}:
             return
 
         if requested_portal == "borrower" and role == "lender":
