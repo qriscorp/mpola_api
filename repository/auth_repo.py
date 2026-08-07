@@ -35,6 +35,7 @@ ALLOWED_LOGIN_PORTALS = {"borrower", "lender"}
 SIGNUP_DRAFT_EXPIRE_HOURS = 24
 
 
+
 # ═══════════════════════════════════════════════
 #  PASSWORD HELPERS
 # ═══════════════════════════════════════════════
@@ -253,11 +254,13 @@ def _notify_admins(db: Session, title: str, message: str, type: str | None = Non
 # ═══════════════════════════════════════════════
 
 
-def _send_email(to_email: str, subject: str, html_body: str):
-    """Send HTML email via SMTP (SSL, port 465)."""
+def _send_email(to_email: str, subject: str, html_body: str, timeout: int = 8) -> dict:
+    """Send HTML email via SMTP (SSL, port 465). Returns {"status": 200} on success
+    or {"status": 500, "message": ...} on failure, so callers can decide whether to
+    fall back to another channel (e.g. SMS)."""
     if not SMTP_USERNAME or not SMTP_PASSWORD:
         logger.warning("SMTP credentials not configured — email not sent")
-        return
+        return {"status": 500, "message": "SMTP not configured"}
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -265,12 +268,14 @@ def _send_email(to_email: str, subject: str, html_body: str):
         msg["To"] = to_email
         msg.attach(MIMEText(html_body, "html"))
         context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context, timeout=timeout) as server:
             server.login(SMTP_USERNAME, SMTP_PASSWORD)
             server.sendmail(SMTP_USERNAME, to_email, msg.as_string())
         logger.info(f"Email sent successfully")
+        return {"status": 200}
     except Exception as e:
         logger.error(f"Email send error: {type(e).__name__}: {e}")
+        return {"status": 500, "message": f"{type(e).__name__}: {e}"}
 
 
 def _build_otp_email_html(username: str, code: str, purpose: str = "verification") -> str:
@@ -323,20 +328,21 @@ except Exception as _e:
     _sms_sdk = None
 
 
-def send_sms(phone_number: str, message: str):
-    """Send SMS via EgoSMS CommsSDK."""
+def send_sms(phone_number: str, message: str) -> bool:
+    """Send SMS via EgoSMS CommsSDK. Returns True on success, False on failure."""
     try:
         if _sms_sdk is None:
             logger.error("SMS SDK not initialized")
-            return None
+            return False
         # CommsSDK requires E.164 format (+256XXXXXXXXX)
         if not phone_number.startswith('+'):
             phone_number = '+' + phone_number
         _sms_sdk.send_sms(phone_number, message)
         logger.info(f"SMS sent via CommsSDK to {phone_number[:8]}...")
+        return True
     except Exception as e:
         logger.error(f"EgoSMS send error: {type(e).__name__}: {e}")
-        return None
+        return False
 
 
 # ═══════════════════════════════════════════════
@@ -592,8 +598,46 @@ class AuthRepo:
             draft.expires_at = datetime.utcnow() + timedelta(hours=SIGNUP_DRAFT_EXPIRE_HOURS)
             db.query(OTP).filter(OTP.username == draft.id).delete(synchronize_session=False)
 
-        email_code = _generate_otp_code()
-        AuthRepo._upsert_signup_otp(db, draft.id, "signup_email", email_code)
+        # Try email first; only fall back to SMS if the email genuinely fails
+        # to send (mirrors kumpi's sendVerificationOTP pattern). Whichever
+        # channel actually delivers is the only one required — the other
+        # flag is pre-marked verified so _signup_draft_payload's next_step
+        # and _finalize_signup_draft don't wait on a code that was never sent.
+        otp_code = _generate_otp_code()
+        channel = None
+        email_result = _send_email(
+            draft.email,
+            "Mpola — Verify Your Email Address",
+            _build_otp_email_html(draft.username, otp_code, purpose="verification"),
+        )
+        if email_result.get("status") == 200:
+            channel = "email"
+        else:
+            logger.warning(
+                f"register_start: email send failed for draft {draft.id} ({email_result.get('message')}), falling back to SMS"
+            )
+            if normalized_phone:
+                sms_text = f"Your Mpola verification code is: {otp_code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
+                if send_sms(normalized_phone, sms_text):
+                    channel = "phone"
+
+        if channel is None:
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail="Unable to send a verification code via email or SMS right now. Please try again shortly.",
+            )
+
+        if channel == "email":
+            draft.phone_verified = True
+            AuthRepo._upsert_signup_otp(db, draft.id, "signup_email", otp_code)
+            logger.debug(f"[DEV ONLY] Signup email OTP for draft {draft.id}: {otp_code}")
+            message = "Registration started. Verify your email to continue."
+        else:
+            draft.email_verified = True
+            AuthRepo._upsert_signup_otp(db, draft.id, "signup_phone", otp_code, phone_number=normalized_phone)
+            logger.debug(f"[DEV ONLY] Signup phone OTP for draft {draft.id}: {otp_code}")
+            message = "Registration started. Verify your phone to continue."
 
         _audit(
             db,
@@ -602,24 +646,13 @@ class AuthRepo:
             resource_type="signup_draft",
             resource_id=draft.id,
             ip_address=ip_address,
-            details={"role": requested_role, "email": draft.email},
+            details={"role": requested_role, "email": draft.email, "otp_channel": channel},
         )
         db.commit()
 
-        logger.debug(f"[DEV ONLY] Signup email OTP for draft {draft.id}: {email_code}")
-        threading.Thread(
-            target=_send_email,
-            args=(
-                draft.email,
-                "Mpola — Verify Your Email Address",
-                _build_otp_email_html(draft.username, email_code, purpose="verification"),
-            ),
-            daemon=True,
-        ).start()
-
         return {
             "status": 200,
-            "message": "Registration started. Verify your email to continue.",
+            "message": message,
             "draft_id": draft.id,
             "email": draft.email,
             "phone_number": draft.phone_number,
@@ -1411,7 +1444,11 @@ class AuthRepo:
     @staticmethod
     def send_password_reset_code(db: Session, identifier: str):
         user = AuthRepo._find_user_by_identifier(db, identifier)
-        _generic_ok = {"status": 200, "message": "If this account exists, a reset code has been sent."}
+        # Wording deliberately doesn't commit to one channel: the account-exists
+        # check must stay silent either way, and a chosen channel (e.g. email)
+        # can silently fall back to the other (SMS) below — so the message has
+        # to stay accurate regardless of which one actually fired.
+        _generic_ok = {"status": 200, "message": "If this account exists, a reset code has been sent to your email or phone."}
         if not user:
             return _generic_ok
 
@@ -1436,18 +1473,28 @@ class AuthRepo:
 
         logger.debug(f"[DEV ONLY] Reset code for {user.username}: {code}")
 
-        # Send via the channel the user chose
-        if "@" in identifier:
-            html = _build_otp_email_html(user.username, code, purpose="password_reset")
-            threading.Thread(
-                target=_send_email,
-                args=(user.email, "Mpola — Password Reset Code", html),
-                daemon=True,
-            ).start()
-        else:
+        # Send via the channel the user chose; if they asked for email and it
+        # fails to send, fall back to SMS (if we have a phone on file) rather
+        # than silently stranding them, same pattern as register_start.
+        sent = False
+        if "@" in identifier and user.email:
+            email_result = _send_email(
+                user.email, "Mpola — Password Reset Code",
+                _build_otp_email_html(user.username, code, purpose="password_reset"),
+            )
+            sent = email_result.get("status") == 200
+            if not sent:
+                logger.warning(
+                    f"send_password_reset_code: email failed for {user.username} ({email_result.get('message')}), falling back to SMS"
+                )
+
+        if not sent and user.phone_number:
             normalized = normalizePhoneNumber(user.phone_number) or user.phone_number
             message = f"Your Mpola password reset code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
-            threading.Thread(target=send_sms, args=(normalized, message), daemon=True).start()
+            sent = send_sms(normalized, message)
+
+        if not sent:
+            logger.error(f"send_password_reset_code: failed to deliver reset code for {user.username} via any channel")
 
         return _generic_ok
 
