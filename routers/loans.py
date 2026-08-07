@@ -49,7 +49,9 @@ def _loan_amount_bounds(db: Session) -> tuple[float, float]:
 
 
 def _max_interest_rate(db: Session) -> float:
-    return _platform_setting(db, "max_interest_rate", 25)
+    """Admin-configurable ceiling on a lender's interest_rate, expressed as
+    %/month (see Admin Settings > Max Interest Rate)."""
+    return _platform_setting(db, "max_interest_rate", 10)
 
 
 # ═══════════════════════════════════════════════
@@ -70,9 +72,9 @@ async def create_application(
             detail=f"Amount must be between {min_amount:,.0f} and {max_amount:,.0f}",
         )
 
-    # Calculate estimated monthly payment (simple interest)
-    rate = 15.0  # default platform rate
-    total_interest = data.amount * (rate / 100) * (data.duration / 12)
+    # Calculate estimated monthly payment (simple interest, rate is % per month)
+    rate = 3.0  # default platform rate — a display estimate only; real lender offers set their own
+    total_interest = data.amount * (rate / 100) * data.duration
     total_repayable = data.amount + total_interest
     monthly_payment = total_repayable / data.duration
 
@@ -408,9 +410,9 @@ async def make_offer(
 
     max_rate = _max_interest_rate(db)
     if data.interest_rate > max_rate:
-        raise HTTPException(status_code=400, detail=f"Interest rate cannot exceed {max_rate}% p.a.")
+        raise HTTPException(status_code=400, detail=f"Interest rate cannot exceed {max_rate}%/month")
 
-    total_interest = data.amount * (data.interest_rate / 100) * (data.duration / 12)
+    total_interest = data.amount * (data.interest_rate / 100) * data.duration
     total_repayable = data.amount + total_interest
     monthly_payment = total_repayable / data.duration
 
@@ -429,7 +431,7 @@ async def make_offer(
         title="New offer received",
         message=(
             f"{user.full_name or user.username} offered UGX {data.amount:,.0f} "
-            f"at {data.interest_rate}% p.a. for {data.duration} months on your loan request."
+            f"at {data.interest_rate}%/month for {data.duration} months on your loan request."
         ),
         type="loan_offer",
         data={"application_id": app.id},
@@ -741,7 +743,7 @@ def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanAppli
 
 
 def _create_offer_from_template(db: Session, app: LoanApplication, template: LenderOfferTemplate) -> LoanOffer:
-    total_interest = app.amount * (template.interest_rate / 100) * (app.duration / 12)
+    total_interest = app.amount * (template.interest_rate / 100) * app.duration
     total_repayable = app.amount + total_interest
     monthly_payment = total_repayable / app.duration
 
@@ -763,7 +765,7 @@ def _create_offer_from_template(db: Session, app: LoanApplication, template: Len
         title="New offer received",
         message=(
             f"{lender.full_name if lender else 'A lender'} auto-offered UGX {app.amount:,.0f} "
-            f"at {template.interest_rate}% p.a. for {app.duration} months, matching your loan request."
+            f"at {template.interest_rate}%/month for {app.duration} months, matching your loan request."
         ),
         type="loan_offer",
         data={"application_id": app.id},
