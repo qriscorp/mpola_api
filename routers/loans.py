@@ -494,11 +494,16 @@ async def respond_to_offer(
     if data.status not in ("accepted", "declined"):
         raise HTTPException(status_code=400, detail="Status must be 'accepted' or 'declined'")
 
-    offer = db.query(LoanOffer).filter(LoanOffer.id == offer_id).first()
+    # Locked for the rest of this request — without this, two concurrent
+    # accept requests for the same offer (double-click, two tabs) could both
+    # read status=="pending" before either commits, both pass every check
+    # below, and both create a Loan. The second request now simply blocks
+    # here until the first commits, then sees status=="accepted" and 400s.
+    offer = db.query(LoanOffer).filter(LoanOffer.id == offer_id).with_for_update().first()
     if not offer:
         raise HTTPException(status_code=404, detail="Offer not found")
 
-    app = db.query(LoanApplication).filter(LoanApplication.id == offer.application_id).first()
+    app = db.query(LoanApplication).filter(LoanApplication.id == offer.application_id).with_for_update().first()
     if not app or app.borrower_id != user.id:
         raise HTTPException(status_code=403, detail="Not authorized")
 
@@ -1078,7 +1083,11 @@ async def approve_disbursement(
     creates it as 'pending_disbursement' without moving any money). The
     balance check happens here, not at accept time, since the lender's
     balance can change between the borrower's acceptance and this approval."""
-    loan = db.query(Loan).filter(Loan.id == loan_id).first()
+    # Locked for the rest of this request — without this, two concurrent
+    # approve calls (double-click, two devices) could both pass the
+    # pending_disbursement check before either commits and both disburse,
+    # debiting the lender and crediting the borrower twice for one loan.
+    loan = db.query(Loan).filter(Loan.id == loan_id).with_for_update().first()
     if not loan:
         raise HTTPException(status_code=404, detail="Loan not found")
     if loan.lender_id != user.id:
@@ -1086,8 +1095,18 @@ async def approve_disbursement(
     if loan.status != "pending_disbursement":
         raise HTTPException(status_code=400, detail=f"Loan is not awaiting disbursement (status: {loan.status})")
 
-    lender_wallet = db.query(Wallet).filter(Wallet.user_id == loan.lender_id).first()
-    borrower_wallet = db.query(Wallet).filter(Wallet.user_id == loan.borrower_id).first()
+    # Lock both wallets in a fixed order (ascending user_id) — not just
+    # lender-then-borrower — so this never deadlocks against a concurrent
+    # make_repayment on a *different* loan between the same two users (which
+    # locks borrower-then-lender for that loan; if the user_ids happen to be
+    # reversed between the two loans, opposite lock order would deadlock).
+    first_uid, second_uid = sorted([loan.lender_id, loan.borrower_id])
+    wallets_by_uid = {
+        w.user_id: w
+        for w in db.query(Wallet).filter(Wallet.user_id.in_([first_uid, second_uid])).with_for_update().all()
+    }
+    lender_wallet = wallets_by_uid.get(loan.lender_id)
+    borrower_wallet = wallets_by_uid.get(loan.borrower_id)
     if not lender_wallet or not lender_wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Set up your wallet before approving disbursement")
     if not borrower_wallet or not borrower_wallet.is_wallet_setup:
@@ -1168,7 +1187,12 @@ async def make_repayment(
     user: User = Depends(current_active_user),
 ):
     """Borrower makes a repayment on an active loan."""
-    loan = db.query(Loan).filter(Loan.id == data.loan_id, Loan.borrower_id == user.id).first()
+    # Locked for the rest of this request — without this, two concurrent
+    # repayment submissions on the same loan (double-click) could both read
+    # the same paid_instalments/total_paid baseline and both apply on top
+    # of it, silently losing one payment's worth of progress, or both debit
+    # the borrower's wallet for what the UI showed as a single payment.
+    loan = db.query(Loan).filter(Loan.id == data.loan_id, Loan.borrower_id == user.id).with_for_update().first()
     if not loan:
         raise HTTPException(status_code=404, detail="Loan not found")
     if loan.status not in ("active", "overdue"):
@@ -1202,11 +1226,20 @@ async def make_repayment(
         # the platform also takes LATE_FEE_PLATFORM_CUT_RATE (5%) of just that
         # portion — carved out of what would otherwise go to the lender, not
         # an extra charge to the borrower. See utils/fee.py for both rates.
-        wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+        # Lock both wallets in a fixed order (ascending user_id), matching
+        # approve_disbursement's convention — prevents a deadlock if a
+        # repayment and a disbursement between the same two users (on two
+        # different loans, with lender/borrower roles reversed) land at the
+        # same moment.
+        first_uid, second_uid = sorted([user.id, loan.lender_id])
+        wallets_by_uid = {
+            w.user_id: w
+            for w in db.query(Wallet).filter(Wallet.user_id.in_([first_uid, second_uid])).with_for_update().all()
+        }
+        wallet = wallets_by_uid.get(user.id)
+        lender_wallet = wallets_by_uid.get(loan.lender_id)
         if not wallet or not wallet.is_wallet_setup:
             raise HTTPException(status_code=400, detail="Please set up your wallet first")
-
-        lender_wallet = db.query(Wallet).filter(Wallet.user_id == loan.lender_id).first()
         if not lender_wallet or not lender_wallet.is_wallet_setup:
             raise HTTPException(status_code=400, detail="Lender's wallet is not set up — repayment cannot be completed")
 

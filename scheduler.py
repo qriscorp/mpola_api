@@ -196,8 +196,7 @@ def _reconcile_pending_payments() -> None:
     _notify() -> WebSocket -> frontend invalidation, independent of whether
     the client is still around.
     """
-    from routers.wallet import _finalize_card_deposit, _finalize_bank_withdrawal
-    from utils.upg_client import UPGClient
+    from routers.wallet import _recheck_card_deposit, _recheck_bank_withdrawal
     from database.tables import Wallet, WalletTransaction
 
     db = SessionLocal()
@@ -206,37 +205,32 @@ def _reconcile_pending_payments() -> None:
         expiry_hours = _setting(db, "payment_pending_expiry_hours", 48)
         cutoff = now - timedelta(hours=expiry_hours)
 
-        pending = db.query(WalletTransaction).filter(
-            WalletTransaction.status == "pending",
-            WalletTransaction.type.in_(["deposit", "withdrawal"]),
-            WalletTransaction.created_at >= cutoff,
-        ).all()
+        pending_ids = [
+            row[0] for row in db.query(WalletTransaction.id).filter(
+                WalletTransaction.status == "pending",
+                WalletTransaction.type.in_(["deposit", "withdrawal"]),
+                WalletTransaction.created_at >= cutoff,
+            ).all()
+        ]
 
-        for tx in pending:
-            wallet = db.query(Wallet).filter(Wallet.id == tx.wallet_id).first()
-            user = db.query(User).filter(User.id == wallet.user_id).first() if wallet else None
-            if not wallet or not user:
-                continue
+        for tx_id in pending_ids:
             try:
                 # Only /deposit/card and /withdraw/bank ever leave a tx "pending" —
                 # mobile money deposit/withdraw resolve synchronously — so type
-                # alone tells us which UPG endpoint to re-check.
-                if tx.type == "deposit":
-                    resp = UPGClient().get_transaction(tx.reference)
-                    upg_status = (resp.get("status") or "").upper()
-                    if upg_status == "SUCCESS":
-                        _finalize_card_deposit(db, tx, wallet, user)
-                    elif upg_status in ("FAILED", "REVERSED"):
-                        tx.status = "failed"
+                # alone tells us which UPG endpoint to re-check. Both helpers lock
+                # the transaction row before touching it, so if the OWNER happens
+                # to be polling /status/{reference} for this exact transaction at
+                # the same moment, one of us blocks and no-ops instead of both
+                # finalizing (double-crediting) it.
+                tx_type = db.query(WalletTransaction.type).filter(WalletTransaction.id == tx_id).scalar()
+                if tx_type == "deposit":
+                    _recheck_card_deposit(db, tx_id)
                 else:
-                    resp = UPGClient().get_payout_status(tx.reference)
-                    upg_status = (resp.get("status") or "").lower()
-                    if upg_status == "success":
-                        _finalize_bank_withdrawal(db, tx, wallet, user)
-                    elif upg_status == "failed":
-                        tx.status = "failed"
+                    _recheck_bank_withdrawal(db, tx_id)
+                db.commit()
             except Exception as e:
-                logger.warning(f"Reconciliation check failed for tx {tx.id} ({tx.reference}): {e}")
+                db.rollback()
+                logger.warning(f"Reconciliation check failed for tx {tx_id}: {e}")
                 continue  # leave pending, retry next run
 
         # Transactions stuck pending past the expiry window are almost certainly
@@ -246,8 +240,10 @@ def _reconcile_pending_payments() -> None:
             WalletTransaction.status == "pending",
             WalletTransaction.type.in_(["deposit", "withdrawal"]),
             WalletTransaction.created_at < cutoff,
-        ).all()
+        ).with_for_update().all()
         for tx in expired:
+            if tx.status != "pending":
+                continue  # resolved by the loop above (or a concurrent poll) between the two queries
             wallet = db.query(Wallet).filter(Wallet.id == tx.wallet_id).first()
             if not wallet:
                 continue

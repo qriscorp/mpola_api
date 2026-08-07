@@ -17,7 +17,7 @@ from repository.dependencies import get_db
 from repository.models import (
     AuthUser, AdminRoleUpdate, AdminAccessUpdate, PlatformSettingUpdate,
     DisputeResolve, SupportMessageCreate, SupportTicketStatusUpdate,
-    KYCReviewUpdate, DocumentVerifyUpdate,
+    KYCReviewUpdate, DocumentVerifyUpdate, WalletAdjustmentModel,
 )
 from repository.security import require_admin, require_super_admin
 from repository.user_repo import UserRepo
@@ -1037,9 +1037,9 @@ def get_reconciliation_report(
         for tx in txs:
             if tx.status != "completed":
                 continue
-            if tx.type == "withdrawal":
+            if tx.type in ("withdrawal", "admin_debit"):
                 is_debit = True
-            elif tx.type == "deposit":
+            elif tx.type in ("deposit", "admin_credit"):
                 is_debit = False
             else:  # repayment or disbursement — direction inferred above
                 is_debit = tx.id in debit_marked_tx_ids
@@ -1100,6 +1100,72 @@ def get_reconciliation_report(
         "gateway_mismatches": gateway_mismatches,
         "checked_count": len(wallets) + len(recent_txs),
         "generated_at": str(datetime.now(timezone.utc)),
+    }
+
+
+@router.post("/wallets/{username}/adjust")
+def adjust_wallet_balance(
+    username: str,
+    data: WalletAdjustmentModel,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_super_admin),
+):
+    """Manual correction tool for support/dispute resolution — the
+    reconciliation report (GET /admin/reconciliation) can DETECT a wrong
+    balance, but until this existed there was no way to actually FIX one.
+    Gated at super-admin since it moves real money with no gateway/borrower
+    counterpart to double-check it — every use is fully audited (before/after
+    balance, reason, which admin) and the user is notified with a real
+    WalletTransaction entry, so nothing here is silent or untraceable.
+    """
+    target = db.query(User).filter(User.username == username).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Locked — the same lost-update/overdraft class of bug this session
+    # already fixed on the ordinary money-movement endpoints applies here too.
+    wallet = db.query(Wallet).filter(Wallet.user_id == target.id).with_for_update().first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="User has no wallet")
+
+    balance_before = wallet.balance
+    wallet.balance += data.amount
+    is_credit = data.amount > 0
+
+    tx = WalletTransaction(
+        wallet_id=wallet.id,
+        amount=abs(data.amount),
+        type="admin_credit" if is_credit else "admin_debit",
+        status="completed",
+        description=f"Balance adjustment by {admin.username}: {data.reason}",
+        counterparty=admin.username,
+    )
+    db.add(tx)
+
+    _audit(db, "wallet_adjusted", username=admin.username, user_id=target.id,
+           resource_type="wallet", resource_id=wallet.id,
+           details={
+               "amount": data.amount,
+               "reason": data.reason,
+               "balance_before": balance_before,
+               "balance_after": wallet.balance,
+           })
+    _notify(
+        db, target.id,
+        title="Wallet balance adjusted",
+        message=(
+            f"Your wallet was {'credited' if is_credit else 'debited'} UGX {abs(data.amount):,.0f} "
+            f"by support: {data.reason}"
+        ),
+        type="payment",
+    )
+    db.commit()
+
+    return {
+        "status": 200,
+        "message": "Wallet adjusted",
+        "balance_before": balance_before,
+        "balance_after": wallet.balance,
     }
 
 

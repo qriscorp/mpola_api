@@ -75,7 +75,11 @@ async def deposit(
     user: User = Depends(current_active_user),
 ):
     """Deposit funds from mobile money to wallet."""
-    wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+    # Locked for the rest of this request — a concurrent balance-mutating
+    # request on this same wallet now blocks until this one commits, instead
+    # of both computing their new balance from the same stale read and one
+    # silently clobbering the other's credit/debit (lost update).
+    wallet = db.query(Wallet).filter(Wallet.user_id == user.id).with_for_update().first()
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
 
@@ -127,7 +131,11 @@ async def withdraw(
     the Interswitch MTN/Airtel surcharge is charged on top, debited from the
     wallet — the recipient still receives the full amount requested.
     """
-    wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+    # Locked for the rest of this request, held across the UPG payout call —
+    # real money leaves via UPG below, so a concurrent withdrawal on this
+    # wallet must wait rather than risk both passing the balance check and
+    # sending out more than the wallet actually has.
+    wallet = db.query(Wallet).filter(Wallet.user_id == user.id).with_for_update().first()
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
 
@@ -275,6 +283,64 @@ def _finalize_bank_withdrawal(db: Session, tx: WalletTransaction, wallet: Wallet
     )
 
 
+def _recheck_card_deposit(db: Session, tx_id: str) -> WalletTransaction | None:
+    """Single entry point for 'is this card deposit done yet' — used by both
+    the client-poll endpoint below AND the scheduler's reconciliation job.
+    Both can reach the same still-pending transaction at nearly the same
+    moment; locking the transaction row here means whichever caller loses
+    the race simply blocks until the winner commits, then re-reads a
+    status that's no longer "pending" and safely no-ops, instead of both
+    calling UPG and both crediting the wallet for one deposit.
+    """
+    tx = db.query(WalletTransaction).filter(WalletTransaction.id == tx_id).with_for_update().first()
+    if not tx or tx.status != "pending":
+        return tx
+
+    wallet = db.query(Wallet).filter(Wallet.id == tx.wallet_id).with_for_update().first()
+    if not wallet:
+        return tx
+    user = db.query(User).filter(User.id == wallet.user_id).first()
+
+    try:
+        resp = UPGClient().get_transaction(tx.reference)
+    except Exception:
+        return tx  # transient gateway error — leave pending, next check retries
+
+    # /transactions/{id} status is UPPERCASE, unlike /collect, /disburse, /checkout, /payout.
+    upg_status = (resp.get("status") or "").upper()
+    if upg_status == "SUCCESS":
+        _finalize_card_deposit(db, tx, wallet, user)
+    elif upg_status in ("FAILED", "REVERSED"):
+        tx.status = "failed"
+    return tx
+
+
+def _recheck_bank_withdrawal(db: Session, tx_id: str) -> WalletTransaction | None:
+    """Same purpose as _recheck_card_deposit, for bank payouts — used by both
+    the client-poll endpoint below and the scheduler's reconciliation job."""
+    tx = db.query(WalletTransaction).filter(WalletTransaction.id == tx_id).with_for_update().first()
+    if not tx or tx.status != "pending":
+        return tx
+
+    wallet = db.query(Wallet).filter(Wallet.id == tx.wallet_id).with_for_update().first()
+    if not wallet:
+        return tx
+    user = db.query(User).filter(User.id == wallet.user_id).first()
+
+    try:
+        resp = UPGClient().get_payout_status(tx.reference)
+    except Exception:
+        return tx  # transient gateway error — leave pending, next check retries
+
+    # /payout/{reference} status is lowercase, matching /collect, /disburse, /checkout.
+    upg_status = (resp.get("status") or "").lower()
+    if upg_status == "success":
+        _finalize_bank_withdrawal(db, tx, wallet, user)
+    elif upg_status == "failed":
+        tx.status = "failed"
+    return tx
+
+
 # ═══════════════════════════════════════
 #  Card deposit (Flutterwave hosted checkout — async)
 # ═══════════════════════════════════════
@@ -344,24 +410,14 @@ async def get_card_deposit_status(
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
-    if tx.status != "pending":
-        return {"status": tx.status, "balance": wallet.balance}
-
-    try:
-        resp = UPGClient().get_transaction(reference)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Payment gateway error: {e}")
-
-    # /transactions/{id} status is UPPERCASE, unlike /collect, /disburse, /checkout, /payout.
-    upg_status = (resp.get("status") or "").upper()
-
-    if upg_status == "SUCCESS":
-        _finalize_card_deposit(db, tx, wallet, user)
+    if tx.status == "pending":
+        # Swallows transient gateway errors and leaves the tx pending rather
+        # than raising — same behavior the scheduler's reconciliation job
+        # relies on, so both paths retry later instead of surfacing a 502
+        # for what's usually just a slow/flaky upstream check.
+        tx = _recheck_card_deposit(db, tx.id)
         db.commit()
-    elif upg_status in ("FAILED", "REVERSED"):
-        tx.status = "failed"
-        db.commit()
-    # PENDING / PROCESSING: leave as-is, caller keeps polling.
+        db.refresh(wallet)
 
     return {"status": tx.status, "balance": wallet.balance}
 
@@ -392,7 +448,10 @@ async def initiate_bank_withdraw(
     """Start a bank-transfer withdrawal. Balance is only debited once
     /withdraw/bank/status/{reference} confirms success — never on initiate.
     """
-    wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+    # Locked for the rest of this request — makes the "one pending withdrawal
+    # at a time" check below actually reliable instead of a TOCTOU race where
+    # two concurrent initiate calls both see "none pending" and both proceed.
+    wallet = db.query(Wallet).filter(Wallet.user_id == user.id).with_for_update().first()
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
 
@@ -468,24 +527,14 @@ async def get_bank_withdraw_status(
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
-    if tx.status != "pending":
-        return {"status": tx.status, "balance": wallet.balance}
-
-    try:
-        resp = UPGClient().get_payout_status(reference)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Payment gateway error: {e}")
-
-    # /payout/{reference} status is lowercase, matching /collect, /disburse, /checkout.
-    upg_status = (resp.get("status") or "").lower()
-
-    if upg_status == "success":
-        _finalize_bank_withdrawal(db, tx, wallet, user)
+    if tx.status == "pending":
+        # Swallows transient gateway errors and leaves the tx pending rather
+        # than raising — same behavior the scheduler's reconciliation job
+        # relies on, so both paths retry later instead of surfacing a 502
+        # for what's usually just a slow/flaky upstream check.
+        tx = _recheck_bank_withdrawal(db, tx.id)
         db.commit()
-    elif upg_status == "failed":
-        tx.status = "failed"
-        db.commit()
-    # pending / processing: leave as-is, caller keeps polling.
+        db.refresh(wallet)
 
     fee_tx = db.query(PlatformFeeTransaction).filter(
         PlatformFeeTransaction.wallet_transaction_id == tx.id

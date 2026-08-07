@@ -344,6 +344,25 @@ class DisputeResolve(BaseModel):
     resolution_note: Optional[str] = None
 
 
+class WalletAdjustmentModel(BaseModel):
+    # Positive = credit the user, negative = debit — one field covers both
+    # directions so the audit trail reads as a single signed delta.
+    amount: float
+    reason: str = Field(..., min_length=3, max_length=500)
+
+    @field_validator('amount')
+    @classmethod
+    def amount_not_zero(cls, v: float) -> float:
+        # Field(..., ne=0) looks like it should do this but Pydantic v2 has
+        # no such numeric constraint — 'ne' is silently accepted as an
+        # unrecognized kwarg and never validated, letting amount=0 through
+        # to create a no-op WalletTransaction. Caught via live-testing this
+        # exact endpoint, not by inspection.
+        if v == 0:
+            raise ValueError("amount must not be zero")
+        return v
+
+
 # ─── Support tickets ───────────────────────────
 
 class SupportTicketCreate(BaseModel):
