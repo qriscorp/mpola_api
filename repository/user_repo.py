@@ -42,6 +42,11 @@ class UserRepo:
             "gender": user.gender,
             "date_of_birth": str(user.date_of_birth) if user.date_of_birth else None,
             "two_factor_enabled": user.two_factor_enabled,
+            "notif_new_application": user.notif_new_application,
+            "notif_repayment_received": user.notif_repayment_received,
+            "notif_loan_overdue": user.notif_loan_overdue,
+            "notif_portfolio_digest": user.notif_portfolio_digest,
+            "notif_login_alerts": user.notif_login_alerts,
             "created_at": str(user.created_at),
         }
 

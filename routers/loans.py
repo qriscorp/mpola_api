@@ -11,7 +11,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from config import BASE_URL, FRONTEND_URL
-from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction, PlatformFeeTransaction
+from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction, PlatformFeeTransaction, LenderApplicationSkip
 from helpers import generateReferenceNumber, generateUniqueId, normalizePhoneNumber
 from repository.auth_repo import _audit, _notify, _notify_admins, send_sms
 from repository.dependencies import get_db, current_active_user
@@ -344,7 +344,13 @@ async def browse_marketplace(
     user: User = Depends(current_active_user),
 ):
     """Browse available loan applications (for lenders)."""
-    query = db.query(LoanApplication).filter(LoanApplication.status == "pending")
+    skipped_ids = db.query(LenderApplicationSkip.application_id).filter(
+        LenderApplicationSkip.lender_id == user.id
+    )
+    query = db.query(LoanApplication).filter(
+        LoanApplication.status == "pending",
+        ~LoanApplication.id.in_(skipped_ids),
+    )
     if loan_type:
         query = query.filter(LoanApplication.loan_type == loan_type)
     if min_amount:
@@ -355,6 +361,30 @@ async def browse_marketplace(
     total = query.count()
     apps = query.order_by(LoanApplication.created_at.desc()).offset(skip).limit(limit).all()
     return {"total": total, "applications": [_app_response(a) for a in apps]}
+
+
+@router.post("/marketplace/{application_id}/skip")
+async def skip_marketplace_application(
+    application_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Lender declines to offer on this application — hides it from their
+    own marketplace/applications view only. Every other lender still sees
+    it, and the application's status is untouched."""
+    app = db.query(LoanApplication).filter(LoanApplication.id == application_id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    existing = db.query(LenderApplicationSkip).filter(
+        LenderApplicationSkip.lender_id == user.id,
+        LenderApplicationSkip.application_id == application_id,
+    ).first()
+    if not existing:
+        db.add(LenderApplicationSkip(lender_id=user.id, application_id=application_id))
+        db.commit()
+
+    return {"status": 200, "message": "Application hidden from your marketplace view"}
 
 
 # ═══════════════════════════════════════════════
@@ -747,6 +777,7 @@ def _create_offer_from_template(db: Session, app: LoanApplication, template: Len
         ),
         type="lender_offer_template",
         data={"application_id": app.id},
+        pref_key="notif_new_application",
     )
     _audit(db, "offer_auto_matched", username=lender.username if lender else None,
            resource_type="loan_offer", resource_id=offer.id,
@@ -990,6 +1021,7 @@ async def make_repayment(
             message=f"{user.full_name or user.username} has fully repaid their UGX {loan.amount:,.0f} loan.",
             type="repayment",
             data={"loan_id": loan.id},
+            pref_key="notif_repayment_received",
         )
     else:
         loan.next_payment_date = datetime.now(timezone.utc) + timedelta(days=30)
@@ -999,6 +1031,7 @@ async def make_repayment(
             title="Payment received",
             message=f"{user.full_name or user.username} paid UGX {data.amount:,.0f} (instalment #{repayment.instalment_number}).",
             type="repayment",
+            pref_key="notif_repayment_received",
             data={"loan_id": loan.id},
         )
 

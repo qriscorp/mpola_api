@@ -179,11 +179,22 @@ def _audit(db: Session, action: str, username: str | None = None, user_id: str |
 
 
 def _notify(db: Session, user_id: str, title: str, message: str,
-            type: str | None = None, data: dict | None = None):
+            type: str | None = None, data: dict | None = None,
+            pref_key: str | None = None):
     """Create an in-app notification for a user, and best-effort push it
     out live (WebSocket, if they're connected) and to their device (Expo
     push, if they've registered a token).
+
+    `pref_key` names one of the User.notif_* columns (Settings page toggles)
+    — if given and that user has switched it off, the notification is
+    silently skipped. Independent of _notify_admins' platform-wide gate.
     """
+    target_user = None
+    if pref_key:
+        target_user = db.query(User).filter(User.id == user_id).first()
+        if target_user is not None and getattr(target_user, pref_key, True) is False:
+            return
+
     try:
         n = Notification(
             user_id=user_id,
@@ -212,7 +223,7 @@ def _notify(db: Session, user_id: str, title: str, message: str,
         logger.error(f"WebSocket notify failed: {e}")
 
     try:
-        user = db.query(User).filter(User.id == user_id).first()
+        user = target_user if target_user is not None else db.query(User).filter(User.id == user_id).first()
         if user and user.push_token:
             from utils.push import send_expo_push
             send_expo_push(user.push_token, title, message, data)
@@ -1117,6 +1128,13 @@ class AuthRepo:
         _audit(db, "login_success", username=user.username, user_id=user.id,
                resource_type="user", ip_address=ip_address)
         _log_login_session(db, user.id, ip_address, user_agent)
+        _notify(
+            db, user.id,
+            title="New sign-in",
+            message=f"Your account was just signed in to{f' from {ip_address}' if ip_address else ''}. Wasn't you? Reset your password immediately.",
+            type="login",
+            pref_key="notif_login_alerts",
+        )
         db.commit()
 
         return {

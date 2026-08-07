@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from sqlalchemy import (
     Column, String, Integer, Float, Boolean, Text, DateTime,
-    ForeignKey, Enum, func,
+    ForeignKey, Enum, UniqueConstraint, func,
 )
 from sqlalchemy.orm import declarative_base, relationship
 from helpers import generateUniqueId
@@ -56,6 +56,15 @@ class User(Base, TimestampMixin):
     refresh_token = Column(Text, nullable=True)
     refresh_token_expires_at = Column(DateTime, nullable=True)
     two_factor_enabled = Column(Boolean, default=False)
+    # Per-user notification preferences (Settings page toggles). Independent
+    # of the admin-level PlatformSetting kill switches in _notify_admins —
+    # those gate whether a category sends AT ALL platform-wide; these gate
+    # whether one specific user wants to receive it.
+    notif_new_application = Column(Boolean, default=True)
+    notif_repayment_received = Column(Boolean, default=True)
+    notif_loan_overdue = Column(Boolean, default=True)
+    notif_portfolio_digest = Column(Boolean, default=False)
+    notif_login_alerts = Column(Boolean, default=True)
     referral_code = Column(String(20), unique=True, nullable=True, index=True)
     referred_by_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
 
@@ -299,6 +308,20 @@ class LoanOffer(Base, TimestampMixin):
 
     application = relationship("LoanApplication", back_populates="offers")
     lender = relationship("User", back_populates="offers_made", foreign_keys=[lender_id])
+
+
+class LenderApplicationSkip(Base, TimestampMixin):
+    """A lender explicitly declining to offer on a marketplace application.
+    Hides it from that lender's own marketplace/applications view only —
+    the application stays open and visible to every other lender; this
+    does not change the application's status or block other offers."""
+    __tablename__ = "lender_application_skips"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    lender_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    application_id = Column(String(50), ForeignKey("loan_applications.id", ondelete="CASCADE"), nullable=False)
+
+    __table_args__ = (UniqueConstraint("lender_id", "application_id", name="uq_lender_application_skip"),)
 
 
 class LenderOfferTemplate(Base, TimestampMixin):

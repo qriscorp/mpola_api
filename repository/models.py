@@ -131,6 +131,11 @@ class UserUpdate(BaseModel):
     date_of_birth: Optional[datetime] = None
     account_type: Optional[str] = None
     two_factor_enabled: Optional[bool] = None
+    notif_new_application: Optional[bool] = None
+    notif_repayment_received: Optional[bool] = None
+    notif_loan_overdue: Optional[bool] = None
+    notif_portfolio_digest: Optional[bool] = None
+    notif_login_alerts: Optional[bool] = None
 
 
 class PushTokenUpdate(BaseModel):

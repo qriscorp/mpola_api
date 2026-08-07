@@ -108,6 +108,7 @@ def _flag_overdue(db, now, grace_days: float, late_fee_rate: float) -> None:
             message=f"A repayment on your UGX {loan.amount:,.0f} loan is now overdue.",
             type="loan_overdue",
             data={"loan_id": loan.id},
+            pref_key="notif_loan_overdue",
         )
         # The lender who actually owns this loan is notified above — that's
         # the right person to act on it. Admins don't get a per-loan ping
@@ -142,6 +143,7 @@ def _flag_defaulted(db, now, grace_days: float, default_days: float) -> None:
             message=f"A borrower has defaulted on your UGX {loan.amount:,.0f} loan.",
             type="loan_defaulted",
             data={"loan_id": loan.id},
+            pref_key="notif_loan_overdue",
         )
         # Same reasoning as overdue above — the lender is notified directly;
         # admins get the weekly digest total instead of a per-loan ping.
