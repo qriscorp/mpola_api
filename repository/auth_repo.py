@@ -431,13 +431,13 @@ class AuthRepo:
         if requested_portal == "borrower" and role == "lender":
             raise HTTPException(
                 status_code=403,
-                detail="This account is registered as a lender. Please sign in from the lender portal.",
+                detail="This account is registered as a lender. Please use the lender portal.",
             )
 
         if requested_portal == "lender" and role == "borrower":
             raise HTTPException(
                 status_code=403,
-                detail="This account is registered as a borrower. Please sign in from the borrower portal.",
+                detail="This account is registered as a borrower. Please use the borrower portal.",
             )
 
     @staticmethod
