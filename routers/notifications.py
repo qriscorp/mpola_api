@@ -41,7 +41,7 @@ async def list_notifications(
     }
 
 
-@router.patch("/{notification_id}/read")
+@router.put("/{notification_id}/read")
 async def mark_read(
     notification_id: str,
     db: Session = Depends(get_db),

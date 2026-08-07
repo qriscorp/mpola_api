@@ -15,7 +15,7 @@ from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplat
 from helpers import generateReferenceNumber, generateUniqueId, normalizePhoneNumber
 from repository.auth_repo import _audit, _notify, _notify_admins, send_sms
 from repository.dependencies import get_db, current_active_user
-from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, RepaymentCreate, GuarantorCreate, GuarantorRespond
+from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, LenderOfferTemplateExpiryUpdate, RepaymentCreate, GuarantorCreate, GuarantorRespond
 from repository.security import require_roles
 from utils.upg_client import UPGClient, _detect_carrier
 from utils.fee import calc_platform_fee
@@ -483,7 +483,7 @@ async def offers_received(
     return {"total": total, "offers": [_offer_response(o) for o in offers]}
 
 
-@router.patch("/offers/{offer_id}")
+@router.put("/offers/{offer_id}")
 async def respond_to_offer(
     offer_id: str,
     data: LoanOfferUpdate,
@@ -683,7 +683,7 @@ def _get_own_template(db: Session, template_id: str, user: User) -> LenderOfferT
     return template
 
 
-@router.patch("/offer-templates/{template_id}")
+@router.put("/offer-templates/{template_id}")
 async def update_offer_template(
     template_id: str,
     data: LenderOfferTemplateUpdate,
@@ -774,6 +774,31 @@ async def unfreeze_own_offer_template(
     db.commit()
     db.refresh(template)
     return {"status": 200, "message": "Unfrozen", "template": _offer_template_response(template)}
+
+
+@router.put("/offer-templates/{template_id}/expiry")
+async def extend_offer_template_expiry(
+    template_id: str,
+    data: LenderOfferTemplateExpiryUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Lender extends (or clears) the expiry on their own APPROVED standing
+    offer — the one field editable post-approval without a new admin review,
+    since it can't change the loan terms themselves. Once valid_until passes,
+    _template_matches permanently excludes the offer; this is the only way
+    to revive it short of submitting a whole new template."""
+    template = _get_own_template(db, template_id, user)
+    if template.status != "approved":
+        raise HTTPException(status_code=400, detail="Only approved offers can have their expiry updated here — edit the offer directly while it's pending review")
+
+    template.valid_until = data.valid_until
+    _audit(db, "offer_template_expiry_updated", username=user.username, user_id=user.id,
+           resource_type="lender_offer_template", resource_id=template.id,
+           details={"valid_until": str(data.valid_until) if data.valid_until else None})
+    db.commit()
+    db.refresh(template)
+    return {"status": 200, "message": "Expiry updated", "template": _offer_template_response(template)}
 
 
 # ═══════════════════════════════════════════════

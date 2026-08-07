@@ -276,6 +276,10 @@ class LenderOfferTemplateUpdate(BaseModel):
     max_concurrent_loans: Optional[int] = None
 
 
+class LenderOfferTemplateExpiryUpdate(BaseModel):
+    valid_until: Optional[datetime] = None  # null clears the expiry (no longer time-limited)
+
+
 # ─── Wallet ───────────────────────────────────
 
 class WalletSetupModel(BaseModel):

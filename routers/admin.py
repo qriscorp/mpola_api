@@ -487,7 +487,7 @@ def get_user_detail(
     }
 
 
-@router.patch("/users/{username}/kyc")
+@router.put("/users/{username}/kyc")
 def review_kyc(
     username: str,
     data: KYCReviewUpdate,
@@ -530,7 +530,7 @@ def review_kyc(
     }
 
 
-@router.patch("/documents/{document_id}/verify")
+@router.put("/documents/{document_id}/verify")
 def verify_document(
     document_id: str,
     data: DocumentVerifyUpdate,
@@ -551,7 +551,7 @@ def verify_document(
     return {"success": True, "document_id": document.id, "verified": document.verified}
 
 
-@router.patch("/kyc-documents/{document_id}/verify")
+@router.put("/kyc-documents/{document_id}/verify")
 def verify_kyc_document(
     document_id: str,
     data: DocumentVerifyUpdate,
@@ -571,7 +571,7 @@ def verify_kyc_document(
     return {"success": True, "document_id": document.id, "verified": document.verified}
 
 
-@router.patch("/users/{username}/suspend")
+@router.put("/users/{username}/suspend")
 def suspend_user(
     username: str,
     db: Session = Depends(get_db),
@@ -606,7 +606,7 @@ def suspend_user(
     }
 
 
-@router.patch("/users/{username}/role")
+@router.put("/users/{username}/role")
 def change_user_role(
     username: str,
     data: AdminRoleUpdate,
@@ -641,7 +641,7 @@ def change_user_role(
     }
 
 
-@router.patch("/users/{username}/admin-access")
+@router.put("/users/{username}/admin-access")
 def set_admin_access(
     username: str,
     data: AdminAccessUpdate,
@@ -785,7 +785,7 @@ def list_applications(
     }
 
 
-@router.patch("/applications/{app_id}")
+@router.put("/applications/{app_id}")
 def admin_update_application(
     app_id: str,
     action: str = Query(..., description="approve or reject"),
@@ -1031,7 +1031,7 @@ def list_offer_templates(
     }
 
 
-@router.patch("/offer-templates/{template_id}")
+@router.put("/offer-templates/{template_id}")
 def review_offer_template(
     template_id: str,
     action: str = Query(..., description="approve or reject"),
@@ -1254,7 +1254,7 @@ def list_disputes(
     }
 
 
-@router.patch("/disputes/{dispute_id}")
+@router.put("/disputes/{dispute_id}")
 def resolve_dispute(
     dispute_id: str,
     data: DisputeResolve,
@@ -1379,7 +1379,7 @@ def reply_to_support_ticket(
     return {"status": 200, "message": "Reply sent"}
 
 
-@router.patch("/support-tickets/{ticket_id}/status")
+@router.put("/support-tickets/{ticket_id}/status")
 def update_support_ticket_status(
     ticket_id: str,
     data: SupportTicketStatusUpdate,
