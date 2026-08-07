@@ -215,6 +215,7 @@ class LoanApplicationCreate(BaseModel):
     duration: int = Field(..., ge=3, le=24)
     loan_type: str  # personal, business, education, agricultural, emergency
     purpose: Optional[str] = None
+    max_interest_rate: Optional[float] = Field(None, ge=0.1, le=25)  # borrower's optional cap, %/month
 
 
 class LoanApplicationUpdate(BaseModel):
@@ -261,6 +262,18 @@ class LenderOfferTemplateCreate(BaseModel):
     valid_until: Optional[datetime] = None
     max_concurrent_loans: Optional[int] = None
     is_draft: bool = False
+
+
+class LenderOfferTemplateUpdate(BaseModel):
+    max_amount: Optional[float] = Field(None, ge=100000)
+    min_amount: Optional[float] = Field(None, ge=0)
+    interest_rate: Optional[float] = Field(None, ge=0.1, le=25)
+    max_duration: Optional[int] = Field(None, ge=1, le=36)
+    accepted_loan_types: Optional[list[str]] = None
+    required_documents: Optional[list[str]] = None
+    description: Optional[str] = None
+    valid_until: Optional[datetime] = None
+    max_concurrent_loans: Optional[int] = None
 
 
 # ─── Wallet ───────────────────────────────────

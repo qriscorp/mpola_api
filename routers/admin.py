@@ -50,11 +50,15 @@ def get_dashboard_stats(
     total_active_loans = db.query(func.count(Loan.id)).filter(Loan.status == "active").scalar()
     total_completed_loans = db.query(func.count(Loan.id)).filter(Loan.status == "completed").scalar()
     total_defaulted_loans = db.query(func.count(Loan.id)).filter(Loan.status == "defaulted").scalar()
-    total_loans_count = db.query(func.count(Loan.id)).scalar()
-    total_loan_volume = db.query(func.sum(Loan.amount)).scalar() or 0
-    total_repaid = db.query(func.sum(Loan.total_paid)).scalar() or 0
-    total_repayable = db.query(func.sum(Loan.total_repayable)).scalar() or 0
-    avg_interest_rate = db.query(func.avg(Loan.interest_rate)).scalar() or 0.0
+    # Excludes pending_disbursement — no money has moved on those loans yet,
+    # so counting their amount/rate in these totals would overstate real
+    # platform lending activity.
+    _funded_loans = db.query(Loan).filter(Loan.status != "pending_disbursement")
+    total_loans_count = _funded_loans.with_entities(func.count(Loan.id)).scalar()
+    total_loan_volume = _funded_loans.with_entities(func.sum(Loan.amount)).scalar() or 0
+    total_repaid = _funded_loans.with_entities(func.sum(Loan.total_paid)).scalar() or 0
+    total_repayable = _funded_loans.with_entities(func.sum(Loan.total_repayable)).scalar() or 0
+    avg_interest_rate = _funded_loans.with_entities(func.avg(Loan.interest_rate)).scalar() or 0.0
 
     total_wallet_balance = db.query(func.sum(Wallet.balance)).scalar() or 0
 
@@ -63,7 +67,7 @@ def get_dashboard_stats(
     # not ours. Same approximation used in the lender earnings endpoint:
     # every repayment carries the same interest/principal split as the loan.
     total_interest_generated = 0.0
-    for amount, total_repayable_, total_paid in db.query(Loan.amount, Loan.total_repayable, Loan.total_paid).all():
+    for amount, total_repayable_, total_paid in _funded_loans.with_entities(Loan.amount, Loan.total_repayable, Loan.total_paid).all():
         if total_repayable_:
             total_interest_generated += total_paid * (total_repayable_ - amount) / total_repayable_
 
@@ -1018,6 +1022,8 @@ def list_offer_templates(
                 "valid_until": str(t.valid_until) if t.valid_until else None,
                 "max_concurrent_loans": t.max_concurrent_loans,
                 "status": t.status,
+                "is_frozen": t.is_frozen,
+                "frozen_by": t.frozen_by,
                 "created_at": str(t.created_at),
             }
             for t in templates
@@ -1054,6 +1060,50 @@ def review_offer_template(
 
     db.commit()
     return {"success": True, "status": template.status, "offers_created": matched}
+
+
+@router.post("/offer-templates/{template_id}/freeze")
+def freeze_offer_template(
+    template_id: str,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Admin pauses ANY lender's approved standing offer — e.g. for abuse
+    or a dispute. Only an admin can undo this (see unfreeze below)."""
+    template = db.query(LenderOfferTemplate).filter(LenderOfferTemplate.id == template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="Offer template not found")
+    if template.status != "approved":
+        raise HTTPException(status_code=400, detail="Only approved offers can be frozen")
+
+    template.is_frozen = True
+    template.frozen_by = "admin"
+    _audit(db, "offer_template_frozen_by_admin", username=admin.username,
+           resource_type="lender_offer_template", resource_id=template.id)
+    db.commit()
+    return {"status": 200, "message": "Frozen"}
+
+
+@router.post("/offer-templates/{template_id}/unfreeze")
+def unfreeze_offer_template(
+    template_id: str,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Admin un-pauses a standing offer — works regardless of whether the
+    lender or a previous admin action froze it."""
+    template = db.query(LenderOfferTemplate).filter(LenderOfferTemplate.id == template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="Offer template not found")
+    if not template.is_frozen:
+        raise HTTPException(status_code=400, detail="Not frozen")
+
+    template.is_frozen = False
+    template.frozen_by = None
+    _audit(db, "offer_template_unfrozen_by_admin", username=admin.username,
+           resource_type="lender_offer_template", resource_id=template.id)
+    db.commit()
+    return {"status": 200, "message": "Unfrozen"}
 
 
 # ═══════════════════════════════════════════════

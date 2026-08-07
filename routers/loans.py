@@ -15,7 +15,7 @@ from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplat
 from helpers import generateReferenceNumber, generateUniqueId, normalizePhoneNumber
 from repository.auth_repo import _audit, _notify, _notify_admins, send_sms
 from repository.dependencies import get_db, current_active_user
-from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, RepaymentCreate, GuarantorCreate, GuarantorRespond
+from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, RepaymentCreate, GuarantorCreate, GuarantorRespond
 from repository.security import require_roles
 from utils.upg_client import UPGClient, _detect_carrier
 from utils.fee import calc_platform_fee
@@ -88,6 +88,7 @@ async def create_application(
         interest_rate=rate,
         total_repayable=round(total_repayable, 2),
         monthly_payment=round(monthly_payment, 2),
+        max_interest_rate=data.max_interest_rate,
     )
     db.add(app)
     db.commit()
@@ -411,6 +412,8 @@ async def make_offer(
     max_rate = _max_interest_rate(db)
     if data.interest_rate > max_rate:
         raise HTTPException(status_code=400, detail=f"Interest rate cannot exceed {max_rate}%/month")
+    if app.max_interest_rate is not None and data.interest_rate > app.max_interest_rate:
+        raise HTTPException(status_code=400, detail=f"Borrower capped this request at {app.max_interest_rate}%/month")
 
     total_interest = data.amount * (data.interest_rate / 100) * data.duration
     total_repayable = data.amount + total_interest
@@ -519,9 +522,10 @@ async def respond_to_offer(
                 ),
             )
 
-        # Disbursement is wallet-to-wallet: the lender must have the funds sitting
-        # in their own Mpola wallet already, plus the 0.5% platform fee — the
-        # borrower's wallet is credited the exact amount requested.
+        # Disbursement is a separate, lender-approved step (see
+        # approve_disbursement below) — only check that both parties have a
+        # wallet *set up* here; the lender's balance is checked at approval
+        # time instead, since it can change between accept and approval.
         lender_wallet = db.query(Wallet).filter(Wallet.user_id == offer.lender_id).first()
         if not lender_wallet or not lender_wallet.is_wallet_setup:
             raise HTTPException(status_code=400, detail="Lender has not set up their wallet yet — cannot disburse this loan")
@@ -530,50 +534,12 @@ async def respond_to_offer(
         if not borrower_wallet or not borrower_wallet.is_wallet_setup:
             raise HTTPException(status_code=400, detail="Please set up your wallet before accepting a loan offer")
 
-        platform_fee = calc_platform_fee(offer.amount)
-        total_debit = offer.amount + platform_fee
-        if lender_wallet.balance < total_debit:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Lender has insufficient wallet balance to fund this loan — needs UGX {total_debit:,.0f} (UGX {platform_fee:,.0f} platform fee included)",
-            )
-
         offer.status = "accepted"
         app.status = "funded"
 
-        lender_wallet.balance -= total_debit
-        borrower_wallet.balance += offer.amount
-
-        lender_tx = WalletTransaction(
-            wallet_id=lender_wallet.id,
-            amount=offer.amount,
-            type="disbursement",
-            status="completed",
-            description=f"Loan disbursed to {user.full_name or user.username}",
-            counterparty=user.username,
-        )
-        db.add(lender_tx)
-        db.flush()
-        db.add(PlatformFeeTransaction(
-            user_id=offer.lender_id,
-            wallet_transaction_id=lender_tx.id,
-            category="loan_disbursement",
-            platform_fee=platform_fee,
-            provider_fee=0,
-            total_fee=platform_fee,
-        ))
-
-        borrower_tx = WalletTransaction(
-            wallet_id=borrower_wallet.id,
-            amount=offer.amount,
-            type="disbursement",
-            status="completed",
-            description=f"Loan received from {offer.lender.full_name or offer.lender.username}",
-            counterparty=offer.lender.username,
-        )
-        db.add(borrower_tx)
-
-        # Create active loan
+        # Loan starts pending_disbursement — no money moves and no
+        # next_payment_date/disbursed_at until the lender approves via
+        # POST /loans/active/{loan_id}/approve-disbursement.
         loan = Loan(
             application_id=app.id,
             borrower_id=app.borrower_id,
@@ -584,18 +550,27 @@ async def respond_to_offer(
             monthly_payment=offer.monthly_payment,
             total_repayable=offer.total_repayable,
             total_instalments=offer.duration,
-            next_payment_date=datetime.now(timezone.utc) + timedelta(days=30),
-            next_payment_amount=offer.monthly_payment,
-            disbursed_at=datetime.now(timezone.utc),
+            status="pending_disbursement",
         )
         db.add(loan)
+        db.flush()
 
+        platform_fee = calc_platform_fee(offer.amount)
+        total_needed = offer.amount + platform_fee
+        shortfall_note = (
+            f" Your wallet balance looks insufficient (need UGX {total_needed:,.0f}, "
+            f"including the platform fee) — deposit before approving."
+            if lender_wallet.balance < total_needed else ""
+        )
         _notify(
             db, offer.lender_id,
-            title="Offer accepted",
-            message=f"{user.full_name or user.username} accepted your offer of UGX {offer.amount:,.0f}. Funds have been disbursed.",
-            type="offer_accepted",
-            data={"application_id": app.id},
+            title="Loan needs your approval to disburse",
+            message=(
+                f"{user.full_name or user.username} accepted your offer of UGX {offer.amount:,.0f}. "
+                f"Approve disbursement to release the funds.{shortfall_note}"
+            ),
+            type="loan_pending_disbursement",
+            data={"application_id": app.id, "loan_id": loan.id},
         )
 
         # Decline other pending offers, and let those lenders know
@@ -641,6 +616,8 @@ def _offer_template_response(t: LenderOfferTemplate) -> dict:
         "valid_until": str(t.valid_until) if t.valid_until else None,
         "max_concurrent_loans": t.max_concurrent_loans,
         "status": t.status,
+        "is_frozen": t.is_frozen,
+        "frozen_by": t.frozen_by,
         "created_at": str(t.created_at),
     }
 
@@ -697,6 +674,108 @@ async def my_offer_templates(
     return {"templates": [_offer_template_response(t) for t in templates]}
 
 
+def _get_own_template(db: Session, template_id: str, user: User) -> LenderOfferTemplate:
+    template = db.query(LenderOfferTemplate).filter(LenderOfferTemplate.id == template_id).first()
+    if not template:
+        raise HTTPException(status_code=404, detail="Offer template not found")
+    if template.lender_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    return template
+
+
+@router.patch("/offer-templates/{template_id}")
+async def update_offer_template(
+    template_id: str,
+    data: LenderOfferTemplateUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Lender edits their own standing offer — only while it's still pending
+    admin review. Once approved/rejected, use freeze/unfreeze instead."""
+    template = _get_own_template(db, template_id, user)
+    if template.status != "pending_review":
+        raise HTTPException(status_code=400, detail="Only templates pending review can be edited")
+
+    update_dict = data.model_dump(exclude_unset=True)
+    for key, val in update_dict.items():
+        if key in ("accepted_loan_types", "required_documents"):
+            setattr(template, key, json.dumps(val))
+        else:
+            setattr(template, key, val)
+
+    _audit(db, "offer_template_updated", username=user.username, user_id=user.id,
+           resource_type="lender_offer_template", resource_id=template.id)
+    db.commit()
+    db.refresh(template)
+    return {"status": 200, "message": "Updated", "template": _offer_template_response(template)}
+
+
+@router.delete("/offer-templates/{template_id}")
+async def delete_offer_template(
+    template_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Lender deletes their own standing offer — only while it's still
+    pending admin review."""
+    template = _get_own_template(db, template_id, user)
+    if template.status != "pending_review":
+        raise HTTPException(status_code=400, detail="Only templates pending review can be deleted")
+
+    _audit(db, "offer_template_deleted", username=user.username, user_id=user.id,
+           resource_type="lender_offer_template", resource_id=template.id)
+    db.delete(template)
+    db.commit()
+    return {"status": 200, "message": "Deleted"}
+
+
+@router.post("/offer-templates/{template_id}/freeze")
+async def freeze_own_offer_template(
+    template_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Lender pauses their own approved standing offer — it stops matching
+    new applications, but stays approved (not deleted/rejected) so it can
+    be unfrozen later."""
+    template = _get_own_template(db, template_id, user)
+    if template.status != "approved":
+        raise HTTPException(status_code=400, detail="Only approved offers can be frozen")
+    if template.is_frozen:
+        raise HTTPException(status_code=400, detail="Already frozen")
+
+    template.is_frozen = True
+    template.frozen_by = "lender"
+    _audit(db, "offer_template_frozen_by_lender", username=user.username, user_id=user.id,
+           resource_type="lender_offer_template", resource_id=template.id)
+    db.commit()
+    db.refresh(template)
+    return {"status": 200, "message": "Frozen", "template": _offer_template_response(template)}
+
+
+@router.post("/offer-templates/{template_id}/unfreeze")
+async def unfreeze_own_offer_template(
+    template_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Lender un-pauses their own standing offer — blocked if an admin was
+    the one who froze it (only admin can undo that)."""
+    template = _get_own_template(db, template_id, user)
+    if not template.is_frozen:
+        raise HTTPException(status_code=400, detail="Not frozen")
+    if template.frozen_by == "admin":
+        raise HTTPException(status_code=403, detail="This offer was frozen by an admin and can only be unfrozen by them")
+
+    template.is_frozen = False
+    template.frozen_by = None
+    _audit(db, "offer_template_unfrozen_by_lender", username=user.username, user_id=user.id,
+           resource_type="lender_offer_template", resource_id=template.id)
+    db.commit()
+    db.refresh(template)
+    return {"status": 200, "message": "Unfrozen", "template": _offer_template_response(template)}
+
+
 # ═══════════════════════════════════════════════
 #  STANDING OFFER AUTO-MATCHING
 # ═══════════════════════════════════════════════
@@ -711,6 +790,8 @@ async def my_offer_templates(
 def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanApplication) -> bool:
     if template.status != "approved":
         return False
+    if template.is_frozen:
+        return False
     if template.lender_id == app.borrower_id:
         return False
     if template.valid_until and template.valid_until < datetime.now(timezone.utc):
@@ -718,6 +799,8 @@ def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanAppli
     if not (template.min_amount <= app.amount <= template.max_amount):
         return False
     if app.duration > template.max_duration:
+        return False
+    if app.max_interest_rate is not None and template.interest_rate > app.max_interest_rate:
         return False
 
     accepted_types = json.loads(template.accepted_loan_types) if template.accepted_loan_types else []
@@ -727,7 +810,7 @@ def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanAppli
     if template.max_concurrent_loans is not None:
         active_count = db.query(func.count(Loan.id)).filter(
             Loan.lender_id == template.lender_id,
-            Loan.status.in_(["active", "overdue"]),
+            Loan.status.in_(["pending_disbursement", "active", "overdue"]),
         ).scalar()
         if active_count >= template.max_concurrent_loans:
             return False
@@ -843,7 +926,12 @@ async def my_earnings(
     offers are priced (see make_offer/create_application), since no
     amortization schedule is tracked to split payments more precisely.
     """
-    loans = db.query(Loan).filter(Loan.lender_id == user.id).all()
+    # Excludes pending_disbursement — that money hasn't actually left the
+    # lender's wallet yet, so it isn't "deployed"/earning anything.
+    loans = db.query(Loan).filter(
+        Loan.lender_id == user.id,
+        Loan.status != "pending_disbursement",
+    ).all()
 
     def interest_ratio(loan: Loan) -> float:
         return (loan.total_repayable - loan.amount) / loan.total_repayable if loan.total_repayable else 0.0
@@ -918,6 +1006,96 @@ async def get_loan(
     if loan.borrower_id != user.id and loan.lender_id != user.id and not user.has_admin_access:
         raise HTTPException(status_code=403, detail="Not authorized")
     return _loan_response(loan, include_repayments=True)
+
+
+@router.post("/active/{loan_id}/approve-disbursement")
+async def approve_disbursement(
+    loan_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Lender approves and triggers the actual wallet-to-wallet transfer for
+    a loan the borrower already accepted (see respond_to_offer, which
+    creates it as 'pending_disbursement' without moving any money). The
+    balance check happens here, not at accept time, since the lender's
+    balance can change between the borrower's acceptance and this approval."""
+    loan = db.query(Loan).filter(Loan.id == loan_id).first()
+    if not loan:
+        raise HTTPException(status_code=404, detail="Loan not found")
+    if loan.lender_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if loan.status != "pending_disbursement":
+        raise HTTPException(status_code=400, detail=f"Loan is not awaiting disbursement (status: {loan.status})")
+
+    lender_wallet = db.query(Wallet).filter(Wallet.user_id == loan.lender_id).first()
+    borrower_wallet = db.query(Wallet).filter(Wallet.user_id == loan.borrower_id).first()
+    if not lender_wallet or not lender_wallet.is_wallet_setup:
+        raise HTTPException(status_code=400, detail="Set up your wallet before approving disbursement")
+    if not borrower_wallet or not borrower_wallet.is_wallet_setup:
+        raise HTTPException(status_code=400, detail="Borrower's wallet is no longer set up — cannot disburse")
+
+    platform_fee = calc_platform_fee(loan.amount)
+    total_debit = loan.amount + platform_fee
+    if lender_wallet.balance < total_debit:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Insufficient wallet balance to fund this loan — needs UGX {total_debit:,.0f} "
+                f"(UGX {platform_fee:,.0f} platform fee included). "
+                f"You need UGX {total_debit - lender_wallet.balance:,.0f} more."
+            ),
+        )
+
+    borrower = db.query(User).filter(User.id == loan.borrower_id).first()
+    lender_wallet.balance -= total_debit
+    borrower_wallet.balance += loan.amount
+
+    lender_tx = WalletTransaction(
+        wallet_id=lender_wallet.id,
+        amount=loan.amount,
+        type="disbursement",
+        status="completed",
+        description=f"Loan disbursed to {borrower.full_name or borrower.username}",
+        counterparty=borrower.username,
+    )
+    db.add(lender_tx)
+    db.flush()
+    db.add(PlatformFeeTransaction(
+        user_id=loan.lender_id,
+        wallet_transaction_id=lender_tx.id,
+        category="loan_disbursement",
+        platform_fee=platform_fee,
+        provider_fee=0,
+        total_fee=platform_fee,
+    ))
+
+    db.add(WalletTransaction(
+        wallet_id=borrower_wallet.id,
+        amount=loan.amount,
+        type="disbursement",
+        status="completed",
+        description=f"Loan received from {user.full_name or user.username}",
+        counterparty=user.username,
+    ))
+
+    loan.status = "active"
+    loan.disbursed_at = datetime.now(timezone.utc)
+    loan.next_payment_date = datetime.now(timezone.utc) + timedelta(days=30)
+    loan.next_payment_amount = loan.monthly_payment
+
+    _notify(
+        db, loan.borrower_id,
+        title="Funds disbursed",
+        message=f"{user.full_name or user.username} approved your loan — UGX {loan.amount:,.0f} has been disbursed to your Mpola wallet.",
+        type="loan_disbursed",
+        data={"loan_id": loan.id},
+    )
+
+    _audit(db, "loan_disbursed", username=user.username, user_id=user.id,
+           resource_type="loan", resource_id=loan.id, details={"amount": loan.amount})
+
+    db.commit()
+    return {"status": 200, "message": "Loan disbursed", "loan": _loan_response(loan)}
 
 
 # ═══════════════════════════════════════════════
@@ -1110,6 +1288,7 @@ def _app_response(app: LoanApplication, include_offers: bool = False) -> dict:
         "interest_rate": app.interest_rate,
         "monthly_payment": app.monthly_payment,
         "total_repayable": app.total_repayable,
+        "max_interest_rate": app.max_interest_rate,
         "created_at": str(app.created_at),
         "borrower": {
             "id": app.borrower.id,

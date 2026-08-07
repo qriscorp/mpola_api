@@ -236,6 +236,7 @@ class LoanApplication(Base, TimestampMixin):
     monthly_payment = Column(Float, nullable=True)
     interest_rate = Column(Float, nullable=True)
     total_repayable = Column(Float, nullable=True)
+    max_interest_rate = Column(Float, nullable=True)  # borrower's optional cap, %/month — enforced in _template_matches and make_offer
 
     borrower = relationship("User", back_populates="loan_applications", foreign_keys=[borrower_id])
     offers = relationship("LoanOffer", back_populates="application", cascade="all, delete-orphan")
@@ -345,6 +346,12 @@ class LenderOfferTemplate(Base, TimestampMixin):
     valid_until = Column(DateTime, nullable=True)
     max_concurrent_loans = Column(Integer, nullable=True)
     status = Column(String(20), default="pending_review")  # pending_review, draft, approved, rejected
+    # Freeze is orthogonal to the admin review lifecycle above — a template
+    # stays "approved" while frozen, it just stops matching. frozen_by
+    # records who paused it, since only admin can undo an admin-initiated
+    # freeze (a lender can always undo their own).
+    is_frozen = Column(Boolean, default=False)
+    frozen_by = Column(String(20), nullable=True)  # "lender" or "admin"
 
     lender = relationship("User")
 
@@ -370,7 +377,7 @@ class Loan(Base, TimestampMixin):
     total_instalments = Column(Integer, nullable=False)
     next_payment_date = Column(DateTime, nullable=True)
     next_payment_amount = Column(Float, nullable=True)
-    status = Column(String(20), default="active")  # active, completed, overdue, defaulted
+    status = Column(String(20), default="active")  # pending_disbursement, active, completed, overdue, defaulted
     disbursed_at = Column(DateTime, nullable=True)
 
     application = relationship("LoanApplication", back_populates="loan")
