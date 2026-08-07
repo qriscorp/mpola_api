@@ -318,7 +318,7 @@ class WalletBankWithdrawInitiateModel(BaseModel):
 
 class RepaymentCreate(BaseModel):
     loan_id: str
-    amount: float
+    amount: float = Field(..., gt=0)
     payment_method: str = "wallet"  # wallet or mobile_money
     phone_number: Optional[str] = None  # required when payment_method=mobile_money
     carrier: Optional[str] = None       # MTN or AIRTEL; auto-detected if omitted

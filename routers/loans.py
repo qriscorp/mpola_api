@@ -18,7 +18,7 @@ from repository.dependencies import get_db, current_active_user
 from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, LenderOfferTemplateExpiryUpdate, RepaymentCreate, GuarantorCreate, GuarantorRespond
 from repository.security import require_roles
 from utils.upg_client import UPGClient, _detect_carrier
-from utils.fee import calc_platform_fee
+from utils.fee import calc_platform_fee, calc_late_fee_platform_cut
 
 # Guarantors must reach this many "accepted" responses before a loan can be disbursed.
 REQUIRED_ACCEPTED_GUARANTORS = 2
@@ -793,6 +793,7 @@ async def extend_offer_template_expiry(
         raise HTTPException(status_code=400, detail="Only approved offers can have their expiry updated here — edit the offer directly while it's pending review")
 
     template.valid_until = data.valid_until
+    template.expiry_notified = False
     _audit(db, "offer_template_expiry_updated", username=user.username, user_id=user.id,
            resource_type="lender_offer_template", resource_id=template.id,
            details={"valid_until": str(data.valid_until) if data.valid_until else None})
@@ -1163,7 +1164,11 @@ async def make_repayment(
         repayment.transaction_id = UPGClient.transaction_id(resp)
     else:
         # Wallet repayment — wallet-to-wallet: the borrower pays the amount plus
-        # a 0.5% platform fee; the lender's wallet is credited the exact amount.
+        # a 0.5% platform fee (TX_FEE_RATE, charged on every wallet transaction).
+        # Separately, if part of this payment covers an outstanding late fee,
+        # the platform also takes LATE_FEE_PLATFORM_CUT_RATE (5%) of just that
+        # portion — carved out of what would otherwise go to the lender, not
+        # an extra charge to the borrower. See utils/fee.py for both rates.
         wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
         if not wallet or not wallet.is_wallet_setup:
             raise HTTPException(status_code=400, detail="Please set up your wallet first")
@@ -1180,8 +1185,17 @@ async def make_repayment(
                 detail=f"Insufficient wallet balance — you need UGX {total_debit:,.0f} (UGX {platform_fee:,.0f} platform fee included)",
             )
 
+        # Outstanding late fee is collected first out of whatever the borrower
+        # pays this instalment; only that slice is subject to the platform's cut.
+        outstanding_late_fee = max(0.0, (loan.late_fee_amount or 0.0) - (loan.late_fee_paid or 0.0))
+        late_fee_portion = min(data.amount, outstanding_late_fee)
+        late_fee_platform_cut = calc_late_fee_platform_cut(late_fee_portion)
+        lender_credit = data.amount - late_fee_platform_cut
+
         wallet.balance -= total_debit
-        lender_wallet.balance += data.amount
+        lender_wallet.balance += lender_credit
+        if late_fee_portion > 0:
+            loan.late_fee_paid = (loan.late_fee_paid or 0.0) + late_fee_portion
 
         wallet_tx = WalletTransaction(
             wallet_id=wallet.id,
@@ -1192,7 +1206,20 @@ async def make_repayment(
             counterparty=loan.id,
         )
         db.add(wallet_tx)
-        db.flush()  # populate wallet_tx.id before using it as the repayment's reference
+
+        lender_tx_description = f"Repayment received from {user.full_name or user.username} — instalment #{loan.paid_instalments + 1}"
+        if late_fee_platform_cut > 0:
+            lender_tx_description += f" (includes UGX {late_fee_portion:,.0f} late fee, UGX {late_fee_platform_cut:,.0f} platform cut)"
+        lender_tx = WalletTransaction(
+            wallet_id=lender_wallet.id,
+            amount=lender_credit,
+            type="repayment",
+            status="completed",
+            description=lender_tx_description,
+            counterparty=loan.id,
+        )
+        db.add(lender_tx)
+        db.flush()  # populate tx ids before using them as references below
         repayment.transaction_id = wallet_tx.id
 
         db.add(PlatformFeeTransaction(
@@ -1203,16 +1230,15 @@ async def make_repayment(
             provider_fee=0,
             total_fee=platform_fee,
         ))
-
-        lender_tx = WalletTransaction(
-            wallet_id=lender_wallet.id,
-            amount=data.amount,
-            type="repayment",
-            status="completed",
-            description=f"Repayment received from {user.full_name or user.username} — instalment #{loan.paid_instalments + 1}",
-            counterparty=loan.id,
-        )
-        db.add(lender_tx)
+        if late_fee_platform_cut > 0:
+            db.add(PlatformFeeTransaction(
+                user_id=loan.lender_id,
+                wallet_transaction_id=lender_tx.id,
+                category="late_fee_platform_cut",
+                platform_fee=late_fee_platform_cut,
+                provider_fee=0,
+                total_fee=late_fee_platform_cut,
+            ))
 
     loan.total_paid += data.amount
     loan.paid_instalments += 1
@@ -1372,6 +1398,8 @@ def _loan_response(loan: Loan, include_repayments: bool = False) -> dict:
         "total_instalments": loan.total_instalments,
         "next_payment_date": str(loan.next_payment_date) if loan.next_payment_date else None,
         "next_payment_amount": loan.next_payment_amount,
+        "late_fee_amount": loan.late_fee_amount or 0.0,
+        "late_fee_paid": loan.late_fee_paid or 0.0,
         "status": loan.status,
         "disbursed_at": str(loan.disbursed_at) if loan.disbursed_at else None,
         "created_at": str(loan.created_at),

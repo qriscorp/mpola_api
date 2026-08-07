@@ -32,6 +32,24 @@ def calc_platform_fee(amount: float) -> int:
     return math.ceil(amount * TX_FEE_RATE)
 
 
+# ── Late fee platform cut ────────────────────────────────────────────────
+# When a loan goes overdue, scheduler.py adds a one-time late fee (2% of
+# monthly_payment by default) to what the borrower owes — that fee exists to
+# compensate the lender for the delay, but Mpola takes its own cut too, same
+# as it does on every other transaction. This is separate from TX_FEE_RATE
+# above: TX_FEE_RATE is charged on top of the whole repayment (borrower
+# pays extra); this rate is carved OUT of the late-fee portion of a
+# repayment before the rest is credited to the lender.
+LATE_FEE_PLATFORM_CUT_RATE = 0.05  # 5% of the late fee itself, not of the repayment
+
+
+def calc_late_fee_platform_cut(late_fee_portion: float) -> float:
+    """Platform's cut of the late-fee portion of a repayment — rounds up to the nearest UGX."""
+    if late_fee_portion <= 0:
+        return 0.0
+    return math.ceil(late_fee_portion * LATE_FEE_PLATFORM_CUT_RATE)
+
+
 # ── Provider (Interswitch) fee — MTN/Airtel mobile money withdrawals ────
 # Same tiered flat-fee schedule Interswitch charges kumpi.
 

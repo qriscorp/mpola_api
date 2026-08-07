@@ -352,6 +352,11 @@ class LenderOfferTemplate(Base, TimestampMixin):
     # freeze (a lender can always undo their own).
     is_frozen = Column(Boolean, default=False)
     frozen_by = Column(String(20), nullable=True)  # "lender" or "admin"
+    # Set once the collections job has pushed the "your offer expired" alert
+    # for the current valid_until, so it doesn't re-fire every day the offer
+    # sits expired. Reset to False whenever valid_until is changed (see
+    # extend_offer_template_expiry) so a fresh expiry can notify again.
+    expiry_notified = Column(Boolean, default=False)
 
     lender = relationship("User")
 
@@ -379,6 +384,13 @@ class Loan(Base, TimestampMixin):
     next_payment_amount = Column(Float, nullable=True)
     status = Column(String(20), default="active")  # pending_disbursement, active, completed, overdue, defaulted
     disbursed_at = Column(DateTime, nullable=True)
+    # One-time late fee applied when the loan first goes overdue (see
+    # scheduler._flag_overdue) — kept as its own running total (not just
+    # folded into total_repayable) so make_repayment can tell how much of an
+    # incoming payment is "late fee" vs principal/interest, since only the
+    # late-fee portion gets the platform's extra cut (see LATE_FEE_PLATFORM_CUT_RATE).
+    late_fee_amount = Column(Float, default=0.0)
+    late_fee_paid = Column(Float, default=0.0)
 
     application = relationship("LoanApplication", back_populates="loan")
     borrower = relationship("User", foreign_keys=[borrower_id])

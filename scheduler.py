@@ -22,7 +22,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func
 
 from database import SessionLocal
-from database.tables import User, Loan, LoanApplication, PlatformFeeTransaction, PlatformSetting, AuditLog
+from database.tables import User, Loan, LoanApplication, LenderOfferTemplate, PlatformFeeTransaction, PlatformSetting, AuditLog
 from logging_module import logger
 from repository.auth_repo import _audit, _notify, _send_email, _setting_enabled
 
@@ -49,6 +49,7 @@ def run_collections_job() -> None:
         _send_reminders(db, now, reminder_days)
         _flag_overdue(db, now, grace_days, late_fee_rate)
         _flag_defaulted(db, now, grace_days, default_days)
+        _flag_expired_offers(db, now)
 
         db.commit()
     except Exception as e:
@@ -91,6 +92,10 @@ def _flag_overdue(db, now, grace_days: float, late_fee_rate: float) -> None:
         loan.status = "overdue"
         if late_fee > 0:
             loan.total_repayable = (loan.total_repayable or 0) + late_fee
+            # Tracked separately from total_repayable so make_repayment can tell
+            # how much of a future payment is "late fee" vs principal/interest —
+            # only the late-fee portion gets the platform's extra cut.
+            loan.late_fee_amount = (loan.late_fee_amount or 0) + late_fee
 
         _audit(db, "loan_marked_overdue", resource_type="loan", resource_id=loan.id,
                details={"late_fee": late_fee, "due_date": str(loan.next_payment_date)})
@@ -147,6 +152,34 @@ def _flag_defaulted(db, now, grace_days: float, default_days: float) -> None:
         )
         # Same reasoning as overdue above — the lender is notified directly;
         # admins get the weekly digest total instead of a per-loan ping.
+
+
+def _flag_expired_offers(db, now) -> None:
+    """Approved standing offers whose valid_until has passed silently stop
+    matching (see _template_matches in routers/loans.py) — nothing else
+    would ever tell the lender that happened. Ping them once per expiry so
+    they know to extend it (PUT /loans/offer-templates/{id}/expiry) if they
+    want it live again. expiry_notified resets to False whenever that
+    endpoint is called, so a later re-expiry can notify again."""
+    templates = db.query(LenderOfferTemplate).filter(
+        LenderOfferTemplate.status == "approved",
+        LenderOfferTemplate.valid_until.isnot(None),
+        LenderOfferTemplate.valid_until < now,
+        LenderOfferTemplate.expiry_notified.is_(False),
+    ).all()
+    for template in templates:
+        template.expiry_notified = True
+        _audit(db, "offer_template_expired", resource_type="lender_offer_template",
+               resource_id=template.id, details={"valid_until": str(template.valid_until)})
+        _notify(
+            db, template.lender_id,
+            title="Standing offer expired",
+            message=f"Your standing offer (UGX {template.min_amount:,.0f}–{template.max_amount:,.0f} "
+                    f"at {template.interest_rate}%/month) has expired and will no longer be matched to "
+                    f"borrowers. Extend its expiry date to bring it back.",
+            type="offer_template_expired",
+            data={"template_id": template.id},
+        )
 
 
 def run_weekly_digest_job() -> None:
