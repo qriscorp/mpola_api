@@ -226,6 +226,55 @@ async def list_transactions(
     }
 
 
+def _finalize_card_deposit(db: Session, tx: WalletTransaction, wallet: Wallet, user: User) -> None:
+    """UPG confirmed this card deposit succeeded — credit the wallet, audit,
+    and notify. Shared by the client-poll endpoint below and the scheduler's
+    reconciliation job, so a deposit finalizes the same way whether the
+    client is still around to poll or not. Caller must db.commit()."""
+    wallet.balance += tx.amount
+    tx.status = "completed"
+    _audit(db, "wallet_card_deposit_completed", username=user.username, user_id=user.id,
+           resource_type="wallet", details={"amount": tx.amount, "reference": tx.reference})
+    _notify(
+        db, user.id,
+        title="Deposit successful",
+        message=f"UGX {tx.amount:,.0f} was added to your wallet via card.",
+        type="payment",
+    )
+
+
+def _finalize_bank_withdrawal(db: Session, tx: WalletTransaction, wallet: Wallet, user: User) -> None:
+    """UPG confirmed this bank payout succeeded — debit (or fail it if funds
+    moved since initiate), audit, and notify. Shared by the client-poll
+    endpoint below and the scheduler's reconciliation job. Caller must db.commit()."""
+    charges = calc_bank_withdrawal_charges(tx.amount)
+    total_debit = tx.amount + charges["total_fee"]
+    if wallet.balance < total_debit:
+        # Funds moved elsewhere since initiate — flag rather than push the balance negative.
+        tx.status = "failed"
+        tx.description = (tx.description or "") + " (insufficient balance at settlement)"
+        return
+
+    wallet.balance -= total_debit
+    tx.status = "completed"
+    db.add(PlatformFeeTransaction(
+        user_id=user.id,
+        wallet_transaction_id=tx.id,
+        category="bank_withdrawal",
+        platform_fee=charges["platform_fee"],
+        provider_fee=charges["provider_fee"],
+        total_fee=charges["total_fee"],
+    ))
+    _audit(db, "wallet_bank_withdraw_completed", username=user.username, user_id=user.id,
+           resource_type="wallet", details={"amount": tx.amount, "reference": tx.reference, "fee": charges["total_fee"]})
+    _notify(
+        db, user.id,
+        title="Withdrawal successful",
+        message=f"UGX {tx.amount:,.0f} was sent to your bank account (UGX {charges['total_fee']:,.0f} fee charged).",
+        type="payment",
+    )
+
+
 # ═══════════════════════════════════════
 #  Card deposit (Flutterwave hosted checkout — async)
 # ═══════════════════════════════════════
@@ -307,16 +356,7 @@ async def get_card_deposit_status(
     upg_status = (resp.get("status") or "").upper()
 
     if upg_status == "SUCCESS":
-        wallet.balance += tx.amount
-        tx.status = "completed"
-        _audit(db, "wallet_card_deposit_completed", username=user.username, user_id=user.id,
-               resource_type="wallet", details={"amount": tx.amount, "reference": reference})
-        _notify(
-            db, user.id,
-            title="Deposit successful",
-            message=f"UGX {tx.amount:,.0f} was added to your wallet via card.",
-            type="payment",
-        )
+        _finalize_card_deposit(db, tx, wallet, user)
         db.commit()
     elif upg_status in ("FAILED", "REVERSED"):
         tx.status = "failed"
@@ -440,31 +480,7 @@ async def get_bank_withdraw_status(
     upg_status = (resp.get("status") or "").lower()
 
     if upg_status == "success":
-        charges = calc_bank_withdrawal_charges(tx.amount)
-        total_debit = tx.amount + charges["total_fee"]
-        if wallet.balance < total_debit:
-            # Funds moved elsewhere since initiate — flag rather than push the balance negative.
-            tx.status = "failed"
-            tx.description = (tx.description or "") + " (insufficient balance at settlement)"
-        else:
-            wallet.balance -= total_debit
-            tx.status = "completed"
-            db.add(PlatformFeeTransaction(
-                user_id=user.id,
-                wallet_transaction_id=tx.id,
-                category="bank_withdrawal",
-                platform_fee=charges["platform_fee"],
-                provider_fee=charges["provider_fee"],
-                total_fee=charges["total_fee"],
-            ))
-            _audit(db, "wallet_bank_withdraw_completed", username=user.username, user_id=user.id,
-                   resource_type="wallet", details={"amount": tx.amount, "reference": reference, "fee": charges["total_fee"]})
-            _notify(
-                db, user.id,
-                title="Withdrawal successful",
-                message=f"UGX {tx.amount:,.0f} was sent to your bank account (UGX {charges['total_fee']:,.0f} fee charged).",
-                type="payment",
-            )
+        _finalize_bank_withdrawal(db, tx, wallet, user)
         db.commit()
     elif upg_status == "failed":
         tx.status = "failed"

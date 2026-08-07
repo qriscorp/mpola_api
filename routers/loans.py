@@ -973,6 +973,38 @@ async def my_earnings(
         if active_loan_list else 0.0
     )
 
+    # Concentration warning — flags when too much of a lender's currently
+    # outstanding capital sits with one borrower or one loan type, a standard
+    # "don't put all your eggs in one basket" nudge on lending platforms.
+    # Only the single worst offender is reported to keep the UI simple.
+    concentration_warning = None
+    active_deployed = sum(l.amount for l in active_loan_list)
+    if active_deployed > 0:
+        by_borrower: dict = {}
+        by_type: dict = {}
+        for l in active_loan_list:
+            by_borrower[l.borrower_id] = by_borrower.get(l.borrower_id, 0.0) + l.amount
+            by_type[l.loan_type] = by_type.get(l.loan_type, 0.0) + l.amount
+
+        worst_borrower_id = max(by_borrower, key=by_borrower.get)
+        worst_borrower_pct = by_borrower[worst_borrower_id] / active_deployed * 100
+        worst_type = max(by_type, key=by_type.get)
+        worst_type_pct = by_type[worst_type] / active_deployed * 100
+
+        if worst_borrower_pct >= worst_type_pct and worst_borrower_pct > 40:
+            borrower_loan = next(l for l in active_loan_list if l.borrower_id == worst_borrower_id)
+            concentration_warning = {
+                "type": "borrower",
+                "label": borrower_loan.borrower.full_name if borrower_loan.borrower else "One borrower",
+                "pct": round(worst_borrower_pct, 1),
+            }
+        elif worst_type_pct > 40:
+            concentration_warning = {
+                "type": "loan_type",
+                "label": worst_type,
+                "pct": round(worst_type_pct, 1),
+            }
+
     loan_by_id = {l.id: l for l in loans}
     monthly_totals = {}
     this_month_earned = 0.0
@@ -1017,6 +1049,7 @@ async def my_earnings(
         "this_month_earned": round(this_month_earned, 2),
         "avg_yield": round(avg_yield, 2),
         "monthly_earnings": monthly_earnings,
+        "concentration_warning": concentration_warning,
     }
 
 

@@ -986,6 +986,123 @@ def get_revenue(
     }
 
 
+@router.get("/reconciliation")
+def get_reconciliation_report(
+    lookback_days: int = Query(7, description="How far back to cross-check completed/failed transactions against UPG"),
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Financial integrity report, computed on demand (not stored/scheduled —
+    this is an occasionally-viewed admin report, not a live/push feature).
+    Two independent checks:
+
+    1. Wallet drift — every wallet's stored balance should exactly equal the
+       running sum of its own WalletTransaction rows. Any mismatch means a
+       bug or an out-of-band DB edit happened; this should always come back
+       empty on a healthy system.
+    2. Gateway cross-check — for deposit/withdrawal transactions in the
+       lookback window, re-ask UPG what it thinks the status is and flag any
+       disagreement with what we have stored. Best-effort: UPG errors for an
+       individual reference are skipped, not fatal to the whole report.
+    """
+    from utils.upg_client import UPGClient
+
+    # ── 1. Wallet ledger drift ──────────────────────────────────────────
+    # deposit is always a credit, withdrawal always a debit (both are pure
+    # external<->wallet movement, unambiguous). repayment/disbursement are
+    # each written as TWO WalletTransaction rows sharing the same `type` —
+    # one debit (payer), one credit (payee) — with no direction column, so
+    # direction has to be inferred: the 0.5% TX_FEE_RATE platform fee is
+    # only ever attached (via PlatformFeeTransaction.wallet_transaction_id)
+    # to the PAYING side's own transaction (category "loan_repayment" for
+    # the borrower's repayment row, "loan_disbursement" for the lender's
+    # disbursement row — see routers/loans.py's make_repayment and
+    # approve_disbursement). The "late_fee_platform_cut" category is
+    # deliberately excluded here — it attaches to the *credit*-side
+    # (lender's) repayment row, not the debit side, so including it would
+    # misclassify that row as a debit.
+    debit_marker_categories = ("loan_repayment", "loan_disbursement")
+    debit_marked_tx_ids = {
+        row[0] for row in db.query(PlatformFeeTransaction.wallet_transaction_id)
+        .filter(PlatformFeeTransaction.category.in_(debit_marker_categories))
+        .all()
+        if row[0]
+    }
+
+    wallet_drift = []
+    wallets = db.query(Wallet).all()
+    for wallet in wallets:
+        txs = db.query(WalletTransaction).filter(WalletTransaction.wallet_id == wallet.id).all()
+        ledger_balance = 0.0
+        for tx in txs:
+            if tx.status != "completed":
+                continue
+            if tx.type == "withdrawal":
+                is_debit = True
+            elif tx.type == "deposit":
+                is_debit = False
+            else:  # repayment or disbursement — direction inferred above
+                is_debit = tx.id in debit_marked_tx_ids
+            ledger_balance += -tx.amount if is_debit else tx.amount
+        delta = round(wallet.balance - ledger_balance, 2)
+        if abs(delta) > 0.01:
+            user = db.query(User).filter(User.id == wallet.user_id).first()
+            wallet_drift.append({
+                "user_id": wallet.user_id,
+                "username": user.username if user else None,
+                "stored_balance": round(wallet.balance, 2),
+                "ledger_balance": round(ledger_balance, 2),
+                "delta": delta,
+            })
+
+    # ── 2. Gateway cross-check ──────────────────────────────────────────
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    recent_txs = db.query(WalletTransaction).filter(
+        WalletTransaction.type.in_(["deposit", "withdrawal"]),
+        WalletTransaction.status.in_(["completed", "failed"]),
+        WalletTransaction.created_at >= cutoff,
+        WalletTransaction.reference.isnot(None),
+    ).all()
+    gateway_mismatches = []
+    client = UPGClient()
+    for tx in recent_txs:
+        try:
+            if tx.type == "deposit":
+                resp = client.get_transaction(tx.reference)
+                gateway_status = (resp.get("status") or "").upper()
+                agrees = (gateway_status == "SUCCESS" and tx.status == "completed") or \
+                         (gateway_status in ("FAILED", "REVERSED") and tx.status == "failed")
+            else:
+                resp = client.get_payout_status(tx.reference)
+                gateway_status = (resp.get("status") or "").lower()
+                agrees = (gateway_status == "success" and tx.status == "completed") or \
+                         (gateway_status == "failed" and tx.status == "failed")
+            if not agrees:
+                gateway_mismatches.append({
+                    "transaction_id": tx.id,
+                    "reference": tx.reference,
+                    "type": tx.type,
+                    "our_status": tx.status,
+                    "gateway_status": gateway_status,
+                })
+        except Exception as e:
+            logger_msg = str(e)
+            gateway_mismatches.append({
+                "transaction_id": tx.id,
+                "reference": tx.reference,
+                "type": tx.type,
+                "our_status": tx.status,
+                "gateway_status": f"error: {logger_msg[:200]}",
+            })
+
+    return {
+        "wallet_drift": wallet_drift,
+        "gateway_mismatches": gateway_mismatches,
+        "checked_count": len(wallets) + len(recent_txs),
+        "generated_at": str(datetime.now(timezone.utc)),
+    }
+
+
 # ═══════════════════════════════════════════════
 #  LENDER STANDING OFFER REVIEW
 # ═══════════════════════════════════════════════

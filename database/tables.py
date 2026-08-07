@@ -180,6 +180,10 @@ class Wallet(Base, TimestampMixin):
     currency = Column(String(10), default="UGX")
     is_wallet_setup = Column(Boolean, default=False)
     pin_hash = Column(String(255), nullable=True)
+    # Set when the low-balance nudge fires (see scheduler._notify_low_balance_lenders),
+    # cleared the moment balance recovers above threshold — re-arms a fresh dip
+    # to notify immediately rather than waiting out a stale cooldown.
+    low_balance_notified_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="wallets")
     transactions = relationship("WalletTransaction", back_populates="wallet", cascade="all, delete-orphan")
