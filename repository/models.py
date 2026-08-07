@@ -150,6 +150,7 @@ class ChangePasswordModel(BaseModel):
 class SendPasswordResetCodeModel(BaseModel):
     email: str
     phone_number: str  # both must match the SAME account — stronger than either alone
+    portal: str | None = None  # "borrower" | "lender" — which reset page this came from
 
 
 class VerifyPasswordResetCodeModel(BaseModel):

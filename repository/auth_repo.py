@@ -1442,7 +1442,7 @@ class AuthRepo:
         )
 
     @staticmethod
-    def send_password_reset_code(db: Session, email: str, phone_number: str):
+    def send_password_reset_code(db: Session, email: str, phone_number: str, portal: str | None = None):
         """Requires BOTH email and phone to match the same account (mirrors
         kumpi's sendPasswordResetOTP) — a stronger check than either alone,
         so it's safe to be direct about whether a match was found instead of
@@ -1458,6 +1458,10 @@ class AuthRepo:
         ).first()
         if not user:
             raise HTTPException(status_code=404, detail="No account found matching that email and phone number.")
+
+        # Same portal separation as sign-in: a lender resetting from the
+        # borrower page (or vice versa) shouldn't get a code at all.
+        AuthRepo._enforce_portal_role(user, portal)
 
         code = _generate_otp_code()
         hashed = _hash_otp(code)
