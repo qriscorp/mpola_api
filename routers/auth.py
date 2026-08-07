@@ -117,7 +117,7 @@ async def verify_phone_otp(data: VerifyPhoneOTPModel, db: Session = Depends(get_
 
 @router.post("/send_password_reset_code")
 async def send_reset_code(data: SendPasswordResetCodeModel, db: Session = Depends(get_db)):
-    return AuthRepo.send_password_reset_code(db, data.identifier)
+    return AuthRepo.send_password_reset_code(db, data.email, data.phone_number)
 
 
 @router.post("/verify_password_reset_code")

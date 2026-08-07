@@ -148,7 +148,8 @@ class ChangePasswordModel(BaseModel):
 
 
 class SendPasswordResetCodeModel(BaseModel):
-    identifier: str  # email address OR phone number
+    email: str
+    phone_number: str  # both must match the SAME account — stronger than either alone
 
 
 class VerifyPasswordResetCodeModel(BaseModel):

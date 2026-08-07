@@ -1442,15 +1442,22 @@ class AuthRepo:
         )
 
     @staticmethod
-    def send_password_reset_code(db: Session, identifier: str):
-        user = AuthRepo._find_user_by_identifier(db, identifier)
-        # Wording deliberately doesn't commit to one channel: the account-exists
-        # check must stay silent either way, and a chosen channel (e.g. email)
-        # can silently fall back to the other (SMS) below — so the message has
-        # to stay accurate regardless of which one actually fired.
-        _generic_ok = {"status": 200, "message": "If this account exists, a reset code has been sent to your email or phone."}
+    def send_password_reset_code(db: Session, email: str, phone_number: str):
+        """Requires BOTH email and phone to match the same account (mirrors
+        kumpi's sendPasswordResetOTP) — a stronger check than either alone,
+        so it's safe to be direct about whether a match was found instead of
+        a generic always-200 response. Tries email first, falls back to SMS
+        only if the email send genuinely fails, same as register_start."""
+        normalized_phone = normalizePhoneNumber(phone_number)
+        if not normalized_phone:
+            raise HTTPException(status_code=400, detail="Invalid phone number")
+
+        user = db.query(User).filter(
+            func.lower(User.email) == email.lower().strip(),
+            User.phone_number == normalized_phone,
+        ).first()
         if not user:
-            return _generic_ok
+            raise HTTPException(status_code=404, detail="No account found matching that email and phone number.")
 
         code = _generate_otp_code()
         hashed = _hash_otp(code)
@@ -1473,30 +1480,32 @@ class AuthRepo:
 
         logger.debug(f"[DEV ONLY] Reset code for {user.username}: {code}")
 
-        # Send via the channel the user chose; if they asked for email and it
-        # fails to send, fall back to SMS (if we have a phone on file) rather
-        # than silently stranding them, same pattern as register_start.
-        sent = False
-        if "@" in identifier and user.email:
-            email_result = _send_email(
-                user.email, "Mpola — Password Reset Code",
-                _build_otp_email_html(user.username, code, purpose="password_reset"),
+        channel = None
+        email_result = _send_email(
+            user.email, "Mpola — Password Reset Code",
+            _build_otp_email_html(user.username, code, purpose="password_reset"),
+        )
+        if email_result.get("status") == 200:
+            channel = "email"
+        else:
+            logger.warning(
+                f"send_password_reset_code: email failed for {user.username} ({email_result.get('message')}), falling back to SMS"
             )
-            sent = email_result.get("status") == 200
-            if not sent:
-                logger.warning(
-                    f"send_password_reset_code: email failed for {user.username} ({email_result.get('message')}), falling back to SMS"
-                )
-
-        if not sent and user.phone_number:
-            normalized = normalizePhoneNumber(user.phone_number) or user.phone_number
             message = f"Your Mpola password reset code is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
-            sent = send_sms(normalized, message)
+            if send_sms(normalized_phone, message):
+                channel = "phone"
 
-        if not sent:
-            logger.error(f"send_password_reset_code: failed to deliver reset code for {user.username} via any channel")
+        if channel is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Unable to send a reset code via email or SMS right now. Please try again shortly.",
+            )
 
-        return _generic_ok
+        return {
+            "status": 200,
+            "message": f"Reset code sent to your {'email' if channel == 'email' else 'phone'}.",
+            "channel": channel,
+        }
 
     @staticmethod
     def verify_password_reset_code(db: Session, identifier: str, code: str):
