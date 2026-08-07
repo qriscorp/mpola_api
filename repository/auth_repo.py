@@ -1533,7 +1533,9 @@ class AuthRepo:
         )
         db.delete(otp)
         db.commit()
-        return {"status": 200, "access_token": token, "message": "Code verified"}
+        # Safe to reveal role here — the code just proved account ownership,
+        # unlike send_password_reset_code's identifier-only generic response.
+        return {"status": 200, "access_token": token, "message": "Code verified", "role": user.role}
 
     @staticmethod
     def reset_password(db: Session, new_password: str, access_token: str):
