@@ -536,6 +536,7 @@ async def make_offer(
         duration=data.duration,
         total_repayable=round(total_repayable, 2),
         monthly_payment=round(monthly_payment, 2),
+        required_documents=json.dumps(data.required_documents) if data.required_documents else None,
     )
     db.add(offer)
     _notify(

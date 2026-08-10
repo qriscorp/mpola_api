@@ -255,6 +255,7 @@ class LoanOfferCreate(BaseModel):
     amount: float = Field(..., ge=1000)
     interest_rate: float = Field(..., ge=0.1, le=25)
     duration: int = Field(..., ge=1, le=36)
+    required_documents: list[str] = Field(default_factory=list)
 
 
 class LoanOfferUpdate(BaseModel):
