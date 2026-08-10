@@ -220,7 +220,14 @@ class LoanApplicationCreate(BaseModel):
 
 
 class LoanApplicationUpdate(BaseModel):
-    status: Optional[str] = None  # approved, rejected
+    """Borrower edits their own application — only while it's still
+    awaiting_guarantors/pending (see PUT /loans/applications/{id})."""
+    amount: Optional[float] = Field(None, ge=100000, le=50000000)
+    duration: Optional[int] = Field(None, ge=3, le=24)
+    loan_type: Optional[str] = None
+    purpose: Optional[str] = None
+    max_interest_rate: Optional[float] = Field(None, ge=0.1, le=25)
+    valid_until: Optional[datetime] = None
 
 
 class GuarantorAttach(BaseModel):

@@ -14,7 +14,7 @@ from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplat
 from helpers import generateReferenceNumber, generateUniqueId
 from repository.auth_repo import _audit, _notify, _notify_admins
 from repository.dependencies import get_db, current_active_user
-from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, LenderOfferTemplateExpiryUpdate, RepaymentCreate, GuarantorAttach
+from repository.models import LoanApplicationCreate, LoanApplicationUpdate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, LenderOfferTemplateExpiryUpdate, RepaymentCreate, GuarantorAttach
 from repository.security import require_roles
 from utils.upg_client import UPGClient, _detect_carrier
 from utils.fee import calc_platform_fee, calc_late_fee_platform_cut
@@ -215,6 +215,202 @@ async def attach_guarantors(
 
 
 # ═══════════════════════════════════════════════
+#  APPLICATION LIFECYCLE (Borrower) — edit, withdraw, pause
+# ═══════════════════════════════════════════════
+#  Mirrors the LenderOfferTemplate lifecycle below (edit/delete/freeze/
+#  unfreeze), scoped to "not yet matched into a funded loan" instead of
+#  "pending admin review" — applications don't need admin approval before
+#  going live, so the whole awaiting_guarantors/pending window is editable.
+
+def _get_own_application(db: Session, app_id: str, user: User) -> LoanApplication:
+    app = db.query(LoanApplication).filter(LoanApplication.id == app_id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if app.borrower_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    return app
+
+
+def _cancel_pending_offers(db: Session, app: LoanApplication, reason: str) -> None:
+    """Declines every still-pending LoanOffer on this application and tells
+    the lender why — used whenever the application changes in a way that
+    invalidates offers already extended against its old terms (an edit that
+    changes amount/duration/loan_type) or the application goes away entirely
+    (withdrawal)."""
+    pending_offers = [o for o in app.offers if o.status == "pending"]
+    for offer in pending_offers:
+        offer.status = "declined"
+        _notify(
+            db, offer.lender_id,
+            title="Offer no longer available",
+            message=f"{reason} Your offer on this request has been withdrawn.",
+            type="offer_declined",
+            data={"application_id": app.id},
+        )
+
+
+def _reset_guarantors_for_new_terms(db: Session, app: LoanApplication, borrower_name: str) -> None:
+    """A guarantor's accept/decline was given for a specific amount/duration/
+    loan_type — if the borrower changes any of those, that response no
+    longer means anything, so every guarantor goes back to pending and gets
+    re-notified. Mirrors the standing invariant that no application can be
+    matched without ITS guarantors (for these exact terms) approving."""
+    responded = [g for g in app.guarantors if g.status != "pending"]
+    for g in responded:
+        g.status = "pending"
+        g.responded_at = None
+        g.last_reminded_at = None
+        _notify(
+            db, g.guarantor_user_id,
+            title="Loan request updated — please re-confirm",
+            message=(
+                f"{borrower_name} changed the terms of the loan you were guarding. "
+                f"Please review the new UGX {app.amount:,.0f} request and respond again."
+            ),
+            type="guarantor_invite_received",
+            data={"application_id": app.id},
+        )
+    if responded:
+        app.status = "awaiting_guarantors"
+
+
+@router.put("/applications/{app_id}")
+async def update_application(
+    app_id: str,
+    data: LoanApplicationUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Borrower edits their own request — only while it hasn't been matched
+    into a funded loan yet (awaiting_guarantors or pending)."""
+    app = _get_own_application(db, app_id, user)
+    if app.status not in ("awaiting_guarantors", "pending"):
+        raise HTTPException(status_code=400, detail="Only requests that haven't been matched yet can be edited")
+
+    update_dict = data.model_dump(exclude_unset=True)
+    if not update_dict:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    if "amount" in update_dict:
+        min_amount, max_amount = _loan_amount_bounds(db)
+        if update_dict["amount"] < min_amount or update_dict["amount"] > max_amount:
+            raise HTTPException(status_code=400, detail=f"Amount must be between {min_amount:,.0f} and {max_amount:,.0f}")
+
+    if "valid_until" in update_dict and update_dict["valid_until"] is not None:
+        valid_until = update_dict["valid_until"].replace(tzinfo=None)
+        if valid_until <= datetime.now(timezone.utc).replace(tzinfo=None):
+            raise HTTPException(status_code=400, detail="Valid-until date must be in the future")
+        update_dict["valid_until"] = valid_until
+
+    terms_changed = any(
+        k in update_dict and update_dict[k] != getattr(app, k)
+        for k in ("amount", "duration", "loan_type")
+    )
+
+    for key, val in update_dict.items():
+        setattr(app, key, val)
+
+    if terms_changed:
+        rate = app.interest_rate or 3.0
+        total_interest = app.amount * (rate / 100) * app.duration
+        total_repayable = app.amount + total_interest
+        app.total_repayable = round(total_repayable, 2)
+        app.monthly_payment = round(total_repayable / app.duration, 2)
+
+        was_pending = app.status == "pending"
+        _reset_guarantors_for_new_terms(db, app, user.full_name or user.username)
+        if was_pending:
+            _cancel_pending_offers(db, app, "The borrower updated this loan request.")
+            app.status = "awaiting_guarantors"
+
+    _audit(db, "application_updated", username=user.username, user_id=user.id,
+           resource_type="loan_application", resource_id=app.id,
+           details={"fields": list(update_dict.keys()), "terms_changed": terms_changed})
+    db.commit()
+    db.refresh(app)
+    return {"status": 200, "message": "Updated", "application": _app_response(app)}
+
+
+@router.delete("/applications/{app_id}")
+async def delete_application(
+    app_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Borrower withdraws their own request — only while it hasn't been
+    matched into a funded loan yet. Notifies any guarantor who was pending
+    or had already accepted, and any lender with a still-pending offer, that
+    it's gone."""
+    app = _get_own_application(db, app_id, user)
+    if app.status not in ("awaiting_guarantors", "pending"):
+        raise HTTPException(status_code=400, detail="Only requests that haven't been matched yet can be withdrawn")
+
+    for g in app.guarantors:
+        if g.status in ("pending", "accepted"):
+            _notify(
+                db, g.guarantor_user_id,
+                title="Loan request withdrawn",
+                message="The loan request you were guaranteeing was withdrawn by the borrower — no action needed.",
+                type="guarantor_request_expired",
+                data={"application_id": app.id},
+            )
+    _cancel_pending_offers(db, app, "The borrower withdrew this loan request.")
+
+    _audit(db, "application_withdrawn", username=user.username, user_id=user.id,
+           resource_type="loan_application", resource_id=app.id)
+    db.delete(app)
+    db.commit()
+    return {"status": 200, "message": "Withdrawn"}
+
+
+@router.post("/applications/{app_id}/freeze")
+async def freeze_own_application(
+    app_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Borrower pauses their own request — it stops being matched to new
+    lender offers, but stays open (not withdrawn) so it can be unfrozen
+    later. Existing guarantor invites and any pending offers are untouched."""
+    app = _get_own_application(db, app_id, user)
+    if app.status not in ("awaiting_guarantors", "pending"):
+        raise HTTPException(status_code=400, detail="Only requests that haven't been matched yet can be frozen")
+    if app.is_frozen:
+        raise HTTPException(status_code=400, detail="Already frozen")
+
+    app.is_frozen = True
+    app.frozen_by = "borrower"
+    _audit(db, "application_frozen_by_borrower", username=user.username, user_id=user.id,
+           resource_type="loan_application", resource_id=app.id)
+    db.commit()
+    db.refresh(app)
+    return {"status": 200, "message": "Frozen", "application": _app_response(app)}
+
+
+@router.post("/applications/{app_id}/unfreeze")
+async def unfreeze_own_application(
+    app_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Borrower un-pauses their own request — blocked if an admin was the
+    one who froze it (only admin can undo that)."""
+    app = _get_own_application(db, app_id, user)
+    if not app.is_frozen:
+        raise HTTPException(status_code=400, detail="Not frozen")
+    if app.frozen_by == "admin":
+        raise HTTPException(status_code=403, detail="This request was frozen by an admin and can only be unfrozen by them")
+
+    app.is_frozen = False
+    app.frozen_by = None
+    _audit(db, "application_unfrozen_by_borrower", username=user.username, user_id=user.id,
+           resource_type="loan_application", resource_id=app.id)
+    db.commit()
+    db.refresh(app)
+    return {"status": 200, "message": "Unfrozen", "application": _app_response(app)}
+
+
+# ═══════════════════════════════════════════════
 #  APPLICATION DOCUMENTS
 # ═══════════════════════════════════════════════
 
@@ -317,6 +513,7 @@ async def browse_marketplace(
     )
     query = db.query(LoanApplication).filter(
         LoanApplication.status == "pending",
+        LoanApplication.is_frozen == False,  # noqa: E712 — SQLAlchemy needs `== False`, not `is False`
         ~LoanApplication.id.in_(skipped_ids),
     )
     if loan_type:
@@ -789,6 +986,8 @@ def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanAppli
     if template.is_frozen:
         return False
     if template.lender_id == app.borrower_id:
+        return False
+    if app.is_frozen:
         return False
     # template.valid_until round-trips through MySQL as a naive datetime even
     # though it's always written as UTC — compare naive-to-naive rather than
@@ -1381,6 +1580,8 @@ def _app_response(app: LoanApplication, include_offers: bool = False) -> dict:
         "total_repayable": app.total_repayable,
         "max_interest_rate": app.max_interest_rate,
         "valid_until": str(app.valid_until) if app.valid_until else None,
+        "is_frozen": app.is_frozen,
+        "frozen_by": app.frozen_by,
         "created_at": str(app.created_at),
         "borrower": {
             "id": app.borrower.id,

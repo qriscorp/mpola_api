@@ -246,6 +246,10 @@ class LoanApplication(Base, TimestampMixin):
     # optional/nullable shape as LenderOfferTemplate.valid_until). Enforced
     # in _template_matches and auto-expired by scheduler._expire_stale_applications.
     valid_until = Column(DateTime, nullable=True)
+    # Mirrors LenderOfferTemplate.is_frozen/frozen_by — pauses matching
+    # without deleting or changing the application. "borrower" or "admin".
+    is_frozen = Column(Boolean, default=False)
+    frozen_by = Column(String(20), nullable=True)
 
     borrower = relationship("User", back_populates="loan_applications", foreign_keys=[borrower_id])
     offers = relationship("LoanOffer", back_populates="application", cascade="all, delete-orphan")

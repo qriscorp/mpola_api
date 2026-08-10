@@ -778,6 +778,8 @@ def list_applications(
                 "status": a.status,
                 "interest_rate": a.interest_rate,
                 "offer_count": len(a.offers) if a.offers else 0,
+                "is_frozen": a.is_frozen,
+                "frozen_by": a.frozen_by,
                 "created_at": str(a.created_at),
             }
             for a in apps
@@ -788,26 +790,103 @@ def list_applications(
 @router.put("/applications/{app_id}")
 def admin_update_application(
     app_id: str,
-    action: str = Query(..., description="approve or reject"),
+    action: str = Query(..., description="reject"),
     db: Session = Depends(get_db),
     admin: AuthUser = Depends(require_admin),
 ):
-    """Admin approve/reject a loan application."""
+    """Admin takes down a loan application — e.g. fraud or a policy
+    violation. There's no "approve" here: unlike LenderOfferTemplate,
+    applications don't sit behind admin review before going live (they're
+    matched automatically once their guarantors accept), so there's nothing
+    for an admin to approve into. For routine pausing, use freeze/unfreeze
+    below instead — reject is a one-way takedown."""
+    if action != "reject":
+        raise HTTPException(status_code=400, detail="Action must be 'reject' — use freeze/unfreeze to pause an application")
+
     app = db.query(LoanApplication).filter(LoanApplication.id == app_id).first()
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
+    if app.status not in ("awaiting_guarantors", "pending"):
+        raise HTTPException(status_code=400, detail="Only requests that haven't been matched yet can be rejected")
 
-    if action == "approve":
-        app.status = "approved"
-    elif action == "reject":
-        app.status = "rejected"
-    else:
-        raise HTTPException(status_code=400, detail="Action must be 'approve' or 'reject'")
+    app.status = "rejected"
+    for g in app.guarantors:
+        if g.status in ("pending", "accepted"):
+            _notify(
+                db, g.guarantor_user_id,
+                title="Loan request closed",
+                message="The loan request you were guaranteeing was closed by an admin — no action needed.",
+                type="guarantor_request_expired",
+                data={"application_id": app.id},
+            )
+    for offer in app.offers:
+        if offer.status == "pending":
+            offer.status = "declined"
+            _notify(
+                db, offer.lender_id,
+                title="Offer no longer available",
+                message="This loan request was closed by an admin. Your offer on it has been withdrawn.",
+                type="offer_declined",
+                data={"application_id": app.id},
+            )
+    _notify(
+        db, app.borrower_id,
+        title="Loan request closed",
+        message=f"Your UGX {app.amount:,.0f} loan request was closed by an admin.",
+        type="application_expired",
+        data={"application_id": app.id},
+    )
 
-    _audit(db, f"application_{action}", username=admin.username,
+    _audit(db, "application_rejected", username=admin.username,
            resource_type="loan_application", resource_id=app.id)
     db.commit()
     return {"success": True, "status": app.status}
+
+
+@router.post("/applications/{app_id}/freeze")
+def freeze_application(
+    app_id: str,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Admin pauses ANY borrower's request — e.g. for a dispute or a KYC
+    concern. Only an admin can undo this (see unfreeze below)."""
+    app = db.query(LoanApplication).filter(LoanApplication.id == app_id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if app.status not in ("awaiting_guarantors", "pending"):
+        raise HTTPException(status_code=400, detail="Only requests that haven't been matched yet can be frozen")
+    if app.is_frozen:
+        raise HTTPException(status_code=400, detail="Already frozen")
+
+    app.is_frozen = True
+    app.frozen_by = "admin"
+    _audit(db, "application_frozen_by_admin", username=admin.username,
+           resource_type="loan_application", resource_id=app.id)
+    db.commit()
+    return {"status": 200, "message": "Frozen"}
+
+
+@router.post("/applications/{app_id}/unfreeze")
+def unfreeze_application(
+    app_id: str,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Admin un-pauses a request — works regardless of whether the borrower
+    or a previous admin action froze it."""
+    app = db.query(LoanApplication).filter(LoanApplication.id == app_id).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if not app.is_frozen:
+        raise HTTPException(status_code=400, detail="Not frozen")
+
+    app.is_frozen = False
+    app.frozen_by = None
+    _audit(db, "application_unfrozen_by_admin", username=admin.username,
+           resource_type="loan_application", resource_id=app.id)
+    db.commit()
+    return {"status": 200, "message": "Unfrozen"}
 
 
 # ═══════════════════════════════════════════════
