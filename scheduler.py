@@ -22,7 +22,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func
 
 from database import SessionLocal
-from database.tables import User, Loan, LoanApplication, LenderOfferTemplate, Wallet, PlatformFeeTransaction, PlatformSetting, AuditLog
+from database.tables import User, Loan, LoanApplication, LenderOfferTemplate, Guarantor, Wallet, PlatformFeeTransaction, PlatformSetting, AuditLog
 from logging_module import logger
 from repository.auth_repo import _audit, _notify, _send_email, _setting_enabled
 
@@ -52,6 +52,7 @@ def run_collections_job() -> None:
         _flag_expired_offers(db, now)
         _notify_low_balance_lenders(db, now)
         _recompute_borrower_credit_scores(db)
+        _remind_pending_guarantors(db, now)
 
         db.commit()
     except Exception as e:
@@ -383,6 +384,60 @@ def _recompute_borrower_credit_scores(db) -> None:
         user = db.query(User).filter(User.id == borrower_id).first()
         if user and user.credit_score != score:
             user.credit_score = score
+
+
+def _remind_pending_guarantors(db, now) -> None:
+    """A guarantor who hasn't responded blocks the application from ever
+    matching (see auto_match_offers_for_application) — the borrower can
+    manually nudge them (POST /guarantors/{id}/remind), but many won't
+    think to. This runs daily and does it for them: once a pending request
+    has sat unanswered past `guarantor_reminder_after_hours`, nudge the
+    guarantor to act AND tell the borrower it's still pending (so they know
+    to follow up directly or replace them) — gated by the same
+    last_reminded_at cooldown the manual endpoint uses, so the two paths
+    can't be combined to spam anyone faster than the configured rate.
+    """
+    reminder_after_hours = _setting(db, "guarantor_reminder_after_hours", 24)
+    reminder_cooldown_hours = _setting(db, "guarantor_reminder_cooldown_hours", 24)
+    stale_cutoff = now - timedelta(hours=reminder_after_hours)
+
+    pending = db.query(Guarantor).filter(
+        Guarantor.status == "pending",
+        Guarantor.created_at < stale_cutoff,
+    ).all()
+
+    for g in pending:
+        if g.last_reminded_at:
+            last = g.last_reminded_at.replace(tzinfo=timezone.utc)
+            if now - last < timedelta(hours=reminder_cooldown_hours):
+                continue
+
+        app = db.query(LoanApplication).filter(LoanApplication.id == g.application_id).first()
+        if not app or app.status != "awaiting_guarantors":
+            continue
+
+        g.last_reminded_at = now
+        borrower = db.query(User).filter(User.id == app.borrower_id).first()
+        guarantor_user = db.query(User).filter(User.id == g.guarantor_user_id).first()
+        borrower_name = borrower.full_name or borrower.username if borrower else "Someone"
+        guarantor_name = guarantor_user.full_name or guarantor_user.username if guarantor_user else "Your guarantor"
+
+        _notify(
+            db, g.guarantor_user_id,
+            title="Reminder: guarantor request pending",
+            message=f"{borrower_name} is still waiting for you to approve or decline "
+                    f"their UGX {app.amount:,.0f} loan request.",
+            type="guarantor_invite_received",
+            data={"application_id": app.id},
+        )
+        _notify(
+            db, app.borrower_id,
+            title="Guarantor hasn't responded yet",
+            message=f"{guarantor_name} hasn't responded to your guarantor request yet. "
+                    f"You can send another reminder or replace them.",
+            type="guarantor_still_pending",
+            data={"application_id": app.id, "guarantor_id": g.id},
+        )
 
 
 def run_weekly_digest_job() -> None:

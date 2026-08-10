@@ -295,6 +295,10 @@ class Guarantor(Base, TimestampMixin):
     relationship_type = Column(String(50), nullable=True)  # friend, family, colleague — optional label
     status = Column(String(20), default="pending")  # pending, accepted, declined
     responded_at = Column(DateTime, nullable=True)
+    # Set on every reminder (manual, via POST /guarantors/{id}/remind, or
+    # automatic, via scheduler._remind_pending_guarantors) — shared cooldown
+    # so the two paths can't be combined to spam the guarantor.
+    last_reminded_at = Column(DateTime, nullable=True)
 
     application = relationship("LoanApplication", back_populates="guarantors")
     guarantor_user = relationship("User", foreign_keys=[guarantor_user_id])

@@ -1,21 +1,35 @@
 """
 Guarantors router — responding to a per-application guarantor request,
-and replacing a declined one. Adding guarantors happens inline in
-routers/loans.py (POST /loans/applications/{app_id}/guarantors), right
-after the application itself is created — this file only covers what
-happens next: the invited person accepting/declining, and the borrower
-swapping out a decline.
+replacing a declined one, and reminding one who hasn't responded yet.
+Adding guarantors happens inline in routers/loans.py (POST
+/loans/applications/{app_id}/guarantors), right after the application
+itself is created — this file covers everything that happens next.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from database.tables import User, Guarantor, LoanApplication
+from database.tables import User, Guarantor, LoanApplication, PlatformSetting
 from repository.auth_repo import _audit, _notify
 from repository.dependencies import get_db, current_active_user
 from repository.models import GuarantorRespond, GuarantorReplace
 
 router = APIRouter(prefix="/guarantors", tags=["Guarantors"])
+
+REMINDER_COOLDOWN_HOURS_DEFAULT = 24
+
+
+def _reminder_cooldown_hours(db: Session) -> float:
+    """Shared by the manual remind endpoint and the scheduled job below, so
+    a manual nudge and the automatic one can't be combined to spam the
+    guarantor faster than the configured rate."""
+    setting = db.query(PlatformSetting).filter(PlatformSetting.key == "guarantor_reminder_cooldown_hours").first()
+    if not setting:
+        return REMINDER_COOLDOWN_HOURS_DEFAULT
+    try:
+        return float(setting.value)
+    except (TypeError, ValueError):
+        return REMINDER_COOLDOWN_HOURS_DEFAULT
 
 
 @router.get("/requests")
@@ -109,6 +123,52 @@ async def respond_to_guarantor_request(
     db.commit()
 
     return {"status": 200, "message": f"Guarantor request {data.status}"}
+
+
+@router.post("/{guarantor_id}/remind")
+async def remind_guarantor(
+    guarantor_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Borrower manually nudges a guarantor who hasn't responded yet —
+    re-fires the same real-time notification. Rate-limited by
+    last_reminded_at, shared with the automatic scheduler reminder
+    (scheduler._remind_pending_guarantors) so the two can't be combined to
+    spam the guarantor faster than the configured cooldown."""
+    g = db.query(Guarantor).filter(Guarantor.id == guarantor_id).first()
+    if not g:
+        raise HTTPException(status_code=404, detail="Guarantor request not found")
+    app = db.query(LoanApplication).filter(LoanApplication.id == g.application_id).first()
+    if not app or app.borrower_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if g.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Already {g.status}")
+
+    cooldown_hours = _reminder_cooldown_hours(db)
+    if g.last_reminded_at:
+        elapsed = datetime.now(timezone.utc) - g.last_reminded_at.replace(tzinfo=timezone.utc)
+        remaining = timedelta(hours=cooldown_hours) - elapsed
+        if remaining > timedelta(0):
+            hours_left = max(1, round(remaining.total_seconds() / 3600))
+            raise HTTPException(status_code=400, detail=f"You already reminded them recently — try again in about {hours_left}h")
+
+    g.last_reminded_at = datetime.now(timezone.utc)
+    _notify(
+        db, g.guarantor_user_id,
+        title="Reminder: guarantor request pending",
+        message=(
+            f"{user.full_name or user.username} is still waiting for you to approve or decline "
+            f"their UGX {app.amount:,.0f} loan request."
+        ),
+        type="guarantor_invite_received",
+        data={"application_id": app.id},
+    )
+    _audit(db, "guarantor_reminded", username=user.username, user_id=user.id,
+           resource_type="loan_application", resource_id=app.id, details={"guarantor_id": g.id})
+    db.commit()
+
+    return {"status": 200, "message": "Reminder sent"}
 
 
 @router.put("/applications/{app_id}/{guarantor_id}/replace")
