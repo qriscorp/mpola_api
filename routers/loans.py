@@ -1565,6 +1565,41 @@ async def make_repayment(
     }
 
 
+@router.get("/repayments/mine")
+async def my_repayments(
+    skip: int = 0,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Full repayment history for the current borrower, across every loan
+    they've ever taken — powers a receipts list, not just 'the latest one'."""
+    query = (
+        db.query(Repayment)
+        .join(Loan, Loan.id == Repayment.loan_id)
+        .filter(Loan.borrower_id == user.id)
+    )
+    total = query.count()
+    repayments = query.order_by(Repayment.created_at.desc()).offset(skip).limit(limit).all()
+    return {
+        "total": total,
+        "repayments": [
+            {
+                "id": r.id,
+                "loan_id": r.loan_id,
+                "amount": r.amount,
+                "instalment_number": r.instalment_number,
+                "status": r.status,
+                "payment_method": r.payment_method,
+                "transaction_id": r.transaction_id,
+                "created_at": str(r.created_at),
+                "lender_name": r.loan.lender_user.full_name if r.loan and r.loan.lender_user else None,
+            }
+            for r in repayments
+        ],
+    }
+
+
 @router.get("/repayments/{repayment_id}/receipt")
 async def get_repayment_receipt(
     repayment_id: str,
