@@ -249,31 +249,6 @@ def _cancel_pending_offers(db: Session, app: LoanApplication, reason: str) -> No
         )
 
 
-def _reset_guarantors_for_new_terms(db: Session, app: LoanApplication, borrower_name: str) -> None:
-    """A guarantor's accept/decline was given for a specific amount/duration/
-    loan_type — if the borrower changes any of those, that response no
-    longer means anything, so every guarantor goes back to pending and gets
-    re-notified. Mirrors the standing invariant that no application can be
-    matched without ITS guarantors (for these exact terms) approving."""
-    responded = [g for g in app.guarantors if g.status != "pending"]
-    for g in responded:
-        g.status = "pending"
-        g.responded_at = None
-        g.last_reminded_at = None
-        _notify(
-            db, g.guarantor_user_id,
-            title="Loan request updated — please re-confirm",
-            message=(
-                f"{borrower_name} changed the terms of the loan you were guarding. "
-                f"Please review the new UGX {app.amount:,.0f} request and respond again."
-            ),
-            type="guarantor_invite_received",
-            data={"application_id": app.id},
-        )
-    if responded:
-        app.status = "awaiting_guarantors"
-
-
 @router.put("/applications/{app_id}")
 async def update_application(
     app_id: str,
@@ -282,10 +257,23 @@ async def update_application(
     user: User = Depends(current_active_user),
 ):
     """Borrower edits their own request — only while it hasn't been matched
-    into a funded loan yet (awaiting_guarantors or pending)."""
+    into a funded loan yet (awaiting_guarantors or pending), AND only while
+    no guarantor has accepted yet. A guarantor's acceptance is given for a
+    specific amount/duration/loan_type — once someone has actually committed
+    to guarantee this loan, its terms are locked; the borrower can still
+    freeze or withdraw it, but not quietly change what was agreed to. (Note:
+    status=="pending" always implies every guarantor already accepted, since
+    that's what flips it — the two checks below together cover both "some
+    have accepted while others are still deciding" and "all have accepted".)
+    """
     app = _get_own_application(db, app_id, user)
     if app.status not in ("awaiting_guarantors", "pending"):
         raise HTTPException(status_code=400, detail="Only requests that haven't been matched yet can be edited")
+    if any(g.status == "accepted" for g in app.guarantors):
+        raise HTTPException(
+            status_code=400,
+            detail="This request can no longer be edited — a guarantor has already approved it. You can still freeze or withdraw it.",
+        )
 
     update_dict = data.model_dump(exclude_unset=True)
     if not update_dict:
@@ -317,11 +305,22 @@ async def update_application(
         app.total_repayable = round(total_repayable, 2)
         app.monthly_payment = round(total_repayable / app.duration, 2)
 
-        was_pending = app.status == "pending"
-        _reset_guarantors_for_new_terms(db, app, user.full_name or user.username)
-        if was_pending:
-            _cancel_pending_offers(db, app, "The borrower updated this loan request.")
-            app.status = "awaiting_guarantors"
+        # The guard above already ruled out any "accepted" guarantor, so
+        # everyone left is "pending" (or "declined", who's moot either way)
+        # — nothing to reset, just keep their still-open invite honest about
+        # what they'd actually be guaranteeing if they accept now.
+        for g in app.guarantors:
+            if g.status == "pending":
+                _notify(
+                    db, g.guarantor_user_id,
+                    title="Loan request updated",
+                    message=(
+                        f"{user.full_name or user.username} updated the loan request you're being asked "
+                        f"to guarantee — it's now UGX {app.amount:,.0f} for {app.duration} months."
+                    ),
+                    type="guarantor_invite_received",
+                    data={"application_id": app.id},
+                )
 
     _audit(db, "application_updated", username=user.username, user_id=user.id,
            resource_type="loan_application", resource_id=app.id,
