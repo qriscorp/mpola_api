@@ -28,6 +28,12 @@ REQUIRED_ACCEPTED_GUARANTORS = 2
 MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
 ALLOWED_DOCUMENT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
 
+# Loan-specific paperwork required before an application can become
+# matching-eligible (see _try_activate_matching below) — separate from
+# identity/KYC documents, which are account-wide and live on the profile
+# page, not part of the apply wizard at all.
+REQUIRED_DOCUMENT_TYPES = ["bank_statement", "business_registration"]
+
 router = APIRouter(prefix="/loans", tags=["Loans"])
 
 
@@ -142,6 +148,50 @@ async def list_my_applications(
     total = query.count()
     apps = query.order_by(LoanApplication.created_at.desc()).offset(skip).limit(limit).all()
     return {"total": total, "applications": [_app_response(a) for a in apps]}
+
+
+@router.get("/applications/draft")
+async def get_draft_application(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """The apply wizard saves progress as real data starting from step 1 —
+    an application that's been created but hasn't had its guarantors
+    attached yet is, by definition, an unfinished draft (once guarantors
+    are attached, it's a real submitted request waiting on them, not a
+    draft — see attach_guarantors). Lets the wizard resume exactly where a
+    borrower left off after navigating away or closing the app. Registered
+    before /applications/{app_id} so "draft" isn't swallowed as a path
+    param (same reasoning as /users/search-guarantor-candidate)."""
+    candidates = (
+        db.query(LoanApplication)
+        .filter(
+            LoanApplication.borrower_id == user.id,
+            LoanApplication.status == "awaiting_guarantors",
+        )
+        .order_by(LoanApplication.created_at.desc())
+        .all()
+    )
+    draft = next((a for a in candidates if not a.guarantors), None)
+    if not draft:
+        return {"draft": None}
+
+    docs = db.query(LoanDocument).filter(LoanDocument.application_id == draft.id).all()
+    return {
+        "draft": {
+            **_app_response(draft),
+            "documents": [
+                {
+                    "id": d.id,
+                    "document_type": d.document_type,
+                    "file_url": d.file_url,
+                    "file_name": d.file_name,
+                    "verified": d.verified,
+                }
+                for d in docs
+            ],
+        }
+    }
 
 
 @router.get("/applications/{app_id}")
@@ -447,9 +497,11 @@ async def upload_document(
         file_name=file.filename,
     )
     db.add(doc)
+    db.flush()  # _documents_complete queries LoanDocument fresh — see database/__init__.py's autoflush=False note
+    activated = _try_activate_matching(db, app)
     _audit(db, "document_uploaded", username=user.username, user_id=user.id,
            resource_type="loan_application", resource_id=app_id,
-           details={"document_type": document_type})
+           details={"document_type": document_type, "activated_matching": activated})
     db.commit()
 
     return {
@@ -1096,6 +1148,38 @@ def auto_match_offers_for_application(db: Session, app: LoanApplication) -> int:
             _create_offer_from_template(db, app, template)
             created += 1
     return created
+
+
+def _documents_complete(db: Session, app_id: str) -> bool:
+    uploaded_types = {
+        t for (t,) in db.query(LoanDocument.document_type).filter(
+            LoanDocument.application_id == app_id,
+        ).all()
+    }
+    return all(t in uploaded_types for t in REQUIRED_DOCUMENT_TYPES)
+
+
+def _try_activate_matching(db: Session, app: LoanApplication) -> bool:
+    """An application only becomes matching-eligible once BOTH of its
+    guarantors have accepted AND its required documents are uploaded —
+    whichever of the two finishes last is what actually flips it. This is
+    the real enforcement point for "documents are required", not the apply
+    wizard UI: no matter what order or API path was used to build up an
+    application, it can never reach lenders without them. Called from here
+    (upload_document) and from the guarantor-respond endpoint in
+    routers/guarantors.py, since either event could be the final piece.
+    Returns whether it just activated."""
+    if app.status != "awaiting_guarantors":
+        return False
+    if not app.guarantors:
+        return False
+    if any(g.status != "accepted" for g in app.guarantors):
+        return False
+    if not _documents_complete(db, app.id):
+        return False
+    app.status = "pending"
+    auto_match_offers_for_application(db, app)
+    return True
 
 
 def auto_match_offers_for_template(db: Session, template: LenderOfferTemplate) -> int:

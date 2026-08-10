@@ -104,21 +104,16 @@ async def respond_to_guarantor_request(
         if data.status == "accepted" and app.status == "awaiting_guarantors":
             # This session disables autoflush (see database/__init__.py), so
             # the in-memory `g.status = data.status` above isn't visible to a
-            # fresh query on the same row until flushed — without this, the
-            # count below always finds this very row still "pending" and the
-            # last acceptance never flips the application to matching-eligible.
+            # fresh query/relationship-reload on this row until flushed —
+            # without this, _try_activate_matching always finds this very
+            # row still "pending" and the last acceptance never flips the
+            # application to matching-eligible.
             db.flush()
-            still_pending_or_declined = db.query(Guarantor).filter(
-                Guarantor.application_id == app.id,
-                Guarantor.status != "accepted",
-            ).count()
-            if still_pending_or_declined == 0:
-                # Import here, not at module level — routers/loans.py doesn't
-                # import this module, so this avoids introducing a circular
-                # import between the two guarantor-adjacent routers.
-                from routers.loans import auto_match_offers_for_application
-                app.status = "pending"
-                auto_match_offers_for_application(db, app)
+            # Import here, not at module level — routers/loans.py doesn't
+            # import this module, so this avoids introducing a circular
+            # import between the two guarantor-adjacent routers.
+            from routers.loans import _try_activate_matching
+            _try_activate_matching(db, app)
 
     _audit(db, "guarantor_responded", username=user.username, user_id=user.id,
            resource_type="loan_application", resource_id=g.application_id,
