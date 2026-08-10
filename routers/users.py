@@ -3,12 +3,13 @@ Users router — profile management.
 """
 
 import os
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from config import BASE_URL
 from database.tables import User, KYCDocument
-from helpers import generateUniqueId
+from helpers import generateUniqueId, normalizePhoneNumber
 from repository.auth_repo import _audit
 from repository.dependencies import get_db, current_active_user
 from repository.models import UserUpdate, PushTokenUpdate
@@ -133,6 +134,38 @@ async def list_my_kyc_documents(
             }
             for d in docs
         ]
+    }
+
+
+@router.get("/search-guarantor-candidate")
+async def search_guarantor_candidate(
+    email: str = Query(...),
+    phone_number: str = Query(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Find a real Mpola account to invite as a guarantor — requires BOTH
+    email and phone number to match the same account (mirrors the same
+    two-factor pattern used for password-reset lookups in auth_repo.py),
+    a stronger check than either field alone. Exact match only, no fuzzy
+    search, and 404s rather than returning an empty/null result on no
+    match — a single field alone should never reveal whether an account
+    exists."""
+    normalized_phone = normalizePhoneNumber(phone_number) or phone_number
+    candidate = db.query(User).filter(
+        func.lower(User.email) == email.lower().strip(),
+        User.phone_number == normalized_phone,
+    ).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="No account found matching that email and phone number")
+    if candidate.id == user.id:
+        raise HTTPException(status_code=400, detail="You can't add yourself as a guarantor")
+
+    return {
+        "id": candidate.id,
+        "username": candidate.username,
+        "full_name": candidate.full_name,
+        "role": candidate.role,
     }
 
 

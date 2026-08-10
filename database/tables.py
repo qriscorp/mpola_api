@@ -236,7 +236,7 @@ class LoanApplication(Base, TimestampMixin):
     duration = Column(Integer, nullable=False)  # months
     loan_type = Column(String(30), nullable=False)  # personal, business, education, agricultural, emergency
     purpose = Column(Text, nullable=True)
-    status = Column(String(30), default="pending")  # pending, approved, rejected, funded, completed, defaulted
+    status = Column(String(30), default="pending")  # awaiting_guarantors, pending, approved, rejected, funded, completed, defaulted
     monthly_payment = Column(Float, nullable=True)
     interest_rate = Column(Float, nullable=True)
     total_repayable = Column(Float, nullable=True)
@@ -279,19 +279,25 @@ class KYCDocument(Base, TimestampMixin):
 
 
 class Guarantor(Base, TimestampMixin):
+    """A guarantor is a real Mpola user (any role) vouching for one specific
+    loan application — not a standing relationship and not a freeform
+    name/phone entry. The borrower finds them by exact email+phone match
+    (see GET /users/search-guarantor-candidate) and stages them client-side
+    in the apply wizard; rows here are only created at application submit
+    time, which is also when the invited user gets a real-time notification
+    to accept or decline. Auto-matching for the application is gated on
+    every row here reaching status == "accepted" (see auto_match_offers_for_application)."""
     __tablename__ = "guarantors"
 
     id = Column(String(50), primary_key=True, default=generateUniqueId)
     application_id = Column(String(50), ForeignKey("loan_applications.id", ondelete="CASCADE"), nullable=False)
-    name = Column(String(200), nullable=False)
-    phone = Column(String(20), nullable=False)
-    relationship_type = Column(String(50), nullable=True)  # friend, family, colleague
+    guarantor_user_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    relationship_type = Column(String(50), nullable=True)  # friend, family, colleague — optional label
     status = Column(String(20), default="pending")  # pending, accepted, declined
-    # Secret, single-use link sent by SMS so the guarantor (who has no account) can respond.
-    confirmation_token = Column(String(64), unique=True, nullable=True)
     responded_at = Column(DateTime, nullable=True)
 
     application = relationship("LoanApplication", back_populates="guarantors")
+    guarantor_user = relationship("User", foreign_keys=[guarantor_user_id])
 
 
 # ═══════════════════════════════════════

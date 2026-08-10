@@ -4,23 +4,25 @@ Loans router — applications, offers, active loans, repayments.
 
 import json
 import os
-import threading
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, Response
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from config import BASE_URL, FRONTEND_URL
+from config import BASE_URL
 from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction, PlatformFeeTransaction, LenderApplicationSkip
-from helpers import generateReferenceNumber, generateUniqueId, normalizePhoneNumber
-from repository.auth_repo import _audit, _notify, _notify_admins, send_sms
+from helpers import generateReferenceNumber, generateUniqueId
+from repository.auth_repo import _audit, _notify, _notify_admins
 from repository.dependencies import get_db, current_active_user
-from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, LenderOfferTemplateExpiryUpdate, RepaymentCreate, GuarantorCreate, GuarantorRespond
+from repository.models import LoanApplicationCreate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, LenderOfferTemplateExpiryUpdate, RepaymentCreate, GuarantorAttach
 from repository.security import require_roles
 from utils.upg_client import UPGClient, _detect_carrier
 from utils.fee import calc_platform_fee, calc_late_fee_platform_cut
 
-# Guarantors must reach this many "accepted" responses before a loan can be disbursed.
+# Also the exact count GuarantorAttach requires — auto-matching against lender
+# standing offers only starts once every attached guarantor has accepted
+# (see the respond endpoint in routers/guarantors.py); this check at
+# offer-accept time is now a defensive second gate, not the primary one.
 REQUIRED_ACCEPTED_GUARANTORS = 2
 
 MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
@@ -89,6 +91,11 @@ async def create_application(
         total_repayable=round(total_repayable, 2),
         monthly_payment=round(monthly_payment, 2),
         max_interest_rate=data.max_interest_rate,
+        # Not matching-eligible yet — the frontend attaches 2 guarantors in an
+        # immediate follow-up call (POST .../guarantors below), and matching
+        # only starts once both accept (see routers/guarantors.py). Admins are
+        # still notified now so review/oversight isn't gated on guarantors.
+        status="awaiting_guarantors",
     )
     db.add(app)
     db.commit()
@@ -102,8 +109,6 @@ async def create_application(
         data={"application_id": app.id},
         setting_key="notif_new_applications",
     )
-    auto_match_offers_for_application(db, app)
-    db.commit()
 
     return {
         "status": 200,
@@ -145,108 +150,58 @@ async def get_application(
 
 
 @router.post("/applications/{app_id}/guarantors")
-async def add_guarantor(
+async def attach_guarantors(
     app_id: str,
-    data: GuarantorCreate,
+    data: GuarantorAttach,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
 ):
-    """Add a guarantor and text them a link to accept or decline.
-    A loan can't be disbursed until REQUIRED_ACCEPTED_GUARANTORS have accepted.
-    """
+    """Attach the 2 required guarantors to a freshly-created application —
+    called immediately after POST /loans/applications by the same submit
+    flow. Each must be a real Mpola account (confirmed client-side via
+    GET /users/search-guarantor-candidate before this call). Fires a
+    real-time notification to each; the application stays
+    'awaiting_guarantors' — and is NOT matched to any lender — until both
+    accept (see PUT /guarantors/{id}/respond in routers/guarantors.py)."""
     app = db.query(LoanApplication).filter(
         LoanApplication.id == app_id, LoanApplication.borrower_id == user.id
     ).first()
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
+    if app.status != "awaiting_guarantors":
+        raise HTTPException(status_code=400, detail="This application already has its guarantors attached")
 
-    token = generateUniqueId(22)
-    g = Guarantor(
-        application_id=app_id,
-        name=data.name,
-        phone=data.phone,
-        relationship_type=data.relationship_type,
-        confirmation_token=token,
-    )
-    db.add(g)
-    _audit(db, "guarantor_added", username=user.username, user_id=user.id,
-           resource_type="loan_application", resource_id=app_id,
-           details={"guarantor_name": data.name, "guarantor_phone": data.phone})
-    db.commit()
+    guarantor_ids = data.guarantor_user_ids
+    if len(set(guarantor_ids)) != len(guarantor_ids):
+        raise HTTPException(status_code=400, detail="Guarantors must be two different people")
+    if user.id in guarantor_ids:
+        raise HTTPException(status_code=400, detail="You can't be your own guarantor")
 
-    normalized = normalizePhoneNumber(data.phone)
-    if normalized:
-        link = f"{FRONTEND_URL}/guarantor/{token}"
-        borrower_name = user.full_name or user.username
-        message = (
-            f"{borrower_name} asked you to be a guarantor on Mpola for a loan of "
-            f"UGX {app.amount:,.0f}. Confirm or decline: {link}"
-        )
-        threading.Thread(target=send_sms, args=(normalized, message), daemon=True).start()
+    candidates = db.query(User).filter(User.id.in_(guarantor_ids)).all()
+    if len(candidates) != len(guarantor_ids):
+        raise HTTPException(status_code=404, detail="One of those accounts no longer exists")
 
-    return {"status": 200, "message": "Guarantor added"}
-
-
-# ═══════════════════════════════════════════════
-#  GUARANTOR CONFIRMATION (public — guarantors have no account)
-# ═══════════════════════════════════════════════
-
-@router.get("/guarantors/{token}")
-async def get_guarantor_invite(token: str, db: Session = Depends(get_db)):
-    """Public lookup so a guarantor can see what they're being asked to confirm."""
-    g = db.query(Guarantor).filter(Guarantor.confirmation_token == token).first()
-    if not g:
-        raise HTTPException(status_code=404, detail="Invite not found")
-
-    app = db.query(LoanApplication).filter(LoanApplication.id == g.application_id).first()
-    borrower = app.borrower if app else None
-
-    return {
-        "guarantor": {
-            "id": g.id,
-            "name": g.name,
-            "status": g.status,
-        },
-        "application": {
-            "id": app.id if app else None,
-            "amount": app.amount if app else None,
-            "duration": app.duration if app else None,
-            "loan_type": app.loan_type if app else None,
-            "borrower_name": borrower.full_name if borrower else None,
-        },
-    }
-
-
-@router.post("/guarantors/{token}/respond")
-async def respond_to_guarantor_invite(
-    token: str,
-    data: GuarantorRespond,
-    db: Session = Depends(get_db),
-):
-    """Public — the guarantor accepts or declines via the SMS link. Single-use."""
-    if data.status not in ("accepted", "declined"):
-        raise HTTPException(status_code=400, detail="Status must be 'accepted' or 'declined'")
-
-    g = db.query(Guarantor).filter(Guarantor.confirmation_token == token).first()
-    if not g:
-        raise HTTPException(status_code=404, detail="Invite not found")
-    if g.status != "pending":
-        raise HTTPException(status_code=400, detail=f"Already {g.status}")
-
-    g.status = data.status
-    g.responded_at = datetime.now(timezone.utc)
-
-    app = db.query(LoanApplication).filter(LoanApplication.id == g.application_id).first()
-    if app:
+    borrower_name = user.full_name or user.username
+    for guarantor_user_id in guarantor_ids:
+        g = Guarantor(application_id=app_id, guarantor_user_id=guarantor_user_id)
+        db.add(g)
         _notify(
-            db, app.borrower_id,
-            title="Guarantor responded",
-            message=f"{g.name} {data.status} your request to be a guarantor.",
-            type="guarantor_response",
+            db, guarantor_user_id,
+            title="Guarantor request",
+            message=(
+                f"{borrower_name} added you as a guarantor on their UGX {app.amount:,.0f} "
+                f"loan request. Approve to help them get matched, or decline if you're not interested."
+            ),
+            type="guarantor_invite_received",
+            data={"application_id": app.id},
         )
+
+    _audit(db, "guarantors_attached", username=user.username, user_id=user.id,
+           resource_type="loan_application", resource_id=app_id,
+           details={"guarantor_user_ids": guarantor_ids})
     db.commit()
 
-    return {"status": 200, "message": f"Guarantor {data.status}"}
+    return {"status": 200, "message": "Guarantors added — waiting for them to accept"}
 
 
 # ═══════════════════════════════════════════════
@@ -825,7 +780,10 @@ def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanAppli
         return False
     if template.lender_id == app.borrower_id:
         return False
-    if template.valid_until and template.valid_until < datetime.now(timezone.utc):
+    # template.valid_until round-trips through MySQL as a naive datetime even
+    # though it's always written as UTC — compare naive-to-naive rather than
+    # against an aware `now` (mixing the two raises TypeError).
+    if template.valid_until and template.valid_until < datetime.now(timezone.utc).replace(tzinfo=None):
         return False
     if not (template.min_amount <= app.amount <= template.max_amount):
         return False
@@ -1415,14 +1373,20 @@ def _app_response(app: LoanApplication, include_offers: bool = False) -> dict:
         } if app.borrower else None,
         "offers_count": len(app.offers),
         "pending_offers_count": sum(1 for o in app.offers if o.status == "pending"),
+        "guarantors": [
+            {
+                "id": g.id,
+                "guarantor_user_id": g.guarantor_user_id,
+                "full_name": g.guarantor_user.full_name if g.guarantor_user else None,
+                "username": g.guarantor_user.username if g.guarantor_user else None,
+                "relationship_type": g.relationship_type,
+                "status": g.status,
+            }
+            for g in app.guarantors
+        ],
     }
     if include_offers:
         result["offers"] = [_offer_response(o) for o in app.offers]
-        result["guarantors"] = [
-            {"id": g.id, "name": g.name, "phone": g.phone,
-             "relationship_type": g.relationship_type, "status": g.status}
-            for g in app.guarantors
-        ]
     return result
 
 

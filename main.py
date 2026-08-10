@@ -5,7 +5,7 @@ import os
 
 from middleware.security import SecurityHeadersMiddleware, RateLimitMiddleware
 from routers import (
-    auth_router, users_router, loans_router,
+    auth_router, users_router, loans_router, guarantors_router,
     wallet_router, notifications_router, admin_router,
     ws_router, referrals_router, support_router,
     disputes_router, sessions_router,
@@ -87,6 +87,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(loans_router)
+app.include_router(guarantors_router)
 app.include_router(wallet_router)
 app.include_router(notifications_router)
 app.include_router(admin_router)

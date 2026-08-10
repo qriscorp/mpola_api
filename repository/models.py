@@ -222,14 +222,16 @@ class LoanApplicationUpdate(BaseModel):
     status: Optional[str] = None  # approved, rejected
 
 
-class GuarantorCreate(BaseModel):
-    name: str
-    phone: str
-    relationship_type: Optional[str] = None
+class GuarantorAttach(BaseModel):
+    guarantor_user_ids: list[str] = Field(..., min_length=2, max_length=2)
 
 
 class GuarantorRespond(BaseModel):
     status: str  # accepted or declined
+
+
+class GuarantorReplace(BaseModel):
+    new_guarantor_user_id: str
 
 
 class DocumentUpload(BaseModel):
