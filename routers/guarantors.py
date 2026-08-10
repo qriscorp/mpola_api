@@ -54,6 +54,7 @@ async def list_guarantor_requests(
                 "amount": g.application.amount if g.application else None,
                 "loan_type": g.application.loan_type if g.application else None,
                 "duration": g.application.duration if g.application else None,
+                "purpose": g.application.purpose if g.application else None,
                 "borrower_name": g.application.borrower.full_name if g.application and g.application.borrower else None,
                 "created_at": str(g.created_at),
             }

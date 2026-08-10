@@ -15,20 +15,40 @@ from logging_module import logger
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 
 
-def send_expo_push(push_token: str, title: str, body: str, data: dict | None = None) -> bool:
-    """Best-effort — a failed push should never block the caller."""
+def send_expo_push(
+    push_token: str,
+    title: str,
+    body: str,
+    data: dict | None = None,
+    urgent: bool = False,
+) -> bool:
+    """Best-effort — a failed push should never block the caller.
+
+    `urgent=True` marks time-sensitive, action-needed pushes (e.g. a
+    guarantor request) — Expo forwards `priority: high` to FCM so Android
+    delivers it as a heads-up notification even when the phone is locked,
+    and routes it through the app's "urgent" channel (registered in
+    src/services/push.ts) which is configured at MAX importance instead of
+    the default channel's normal importance. iOS has no separate priority
+    concept for a single alert push; `sound: default` is already the most
+    attention it can draw without a bundled custom sound file.
+    """
     if not push_token or not push_token.startswith(("ExponentPushToken", "ExpoPushToken")):
         return False
     try:
+        payload = {
+            "to": push_token,
+            "title": title,
+            "body": body,
+            "data": data or {},
+            "sound": "default",
+        }
+        if urgent:
+            payload["priority"] = "high"
+            payload["channelId"] = "urgent"
         resp = requests.post(
             EXPO_PUSH_URL,
-            json={
-                "to": push_token,
-                "title": title,
-                "body": body,
-                "data": data or {},
-                "sound": "default",
-            },
+            json=payload,
             headers={"Content-Type": "application/json", "Accept": "application/json"},
             timeout=10,
         )

@@ -178,6 +178,19 @@ def _audit(db: Session, action: str, username: str | None = None, user_id: str |
         logger.error(f"Audit log write failed: {e}")
 
 
+
+# Notification types that need a person to actually notice and act — not
+# just informational. These get a high-priority push routed through the
+# app's "urgent" Android channel (MAX importance, registered in
+# src/services/push.ts) so they can heads-up/wake the screen even when
+# the phone is locked, instead of sitting quietly in the tray like a
+# routine "offer received" push.
+URGENT_NOTIFICATION_TYPES = {
+    "guarantor_invite_received",
+    "guarantor_still_pending",
+}
+
+
 def _notify(db: Session, user_id: str, title: str, message: str,
             type: str | None = None, data: dict | None = None,
             pref_key: str | None = None):
@@ -226,7 +239,7 @@ def _notify(db: Session, user_id: str, title: str, message: str,
         user = target_user if target_user is not None else db.query(User).filter(User.id == user_id).first()
         if user and user.push_token:
             from utils.push import send_expo_push
-            send_expo_push(user.push_token, title, message, data)
+            send_expo_push(user.push_token, title, message, data, urgent=type in URGENT_NOTIFICATION_TYPES)
     except Exception as e:
         logger.error(f"Push notify failed: {e}")
 
