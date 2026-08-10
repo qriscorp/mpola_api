@@ -61,3 +61,23 @@ def normalizePhoneNumber(phone: str) -> str | None:
     if len(digits) >= 9:
         return "256" + digits[-9:]
     return None
+
+
+# Canonical resolution for a LenderOfferTemplate's required_documents labels
+# (free-text, picked from a fixed checklist on the post-offer form — see
+# DOCUMENTS/DOCUMENT_OPTIONS on both frontends). "National ID" reuses the
+# account-wide KYC upload (routers/users.py); everything else is a
+# BorrowerDocument — also account-wide/reusable, since a document a lender
+# asked for once is worth keeping for the next offer that asks for the same
+# thing, exactly like KYC already works. Single source of truth, shared by
+# routers/loans.py (resolving a specific offer's requirements at accept
+# time) and routers/users.py (validating uploads against the borrower_doc
+# half of this map). Whoever adds a new label to the frontend checklist
+# must add its resolution here too, or it'll never be satisfiable.
+DOCUMENT_LABEL_MAP: dict[str, tuple[str, str]] = {
+    "National ID": ("kyc", "national_id"),
+    "Bank Statement (3mo)": ("borrower_doc", "bank_statement"),
+    "Payslip / Business Proof": ("borrower_doc", "business_proof"),
+    "Land Title": ("borrower_doc", "land_title"),
+    "URA TIN": ("borrower_doc", "ura_tin"),
+}

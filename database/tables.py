@@ -287,6 +287,28 @@ class KYCDocument(Base, TimestampMixin):
     user = relationship("User")
 
 
+class BorrowerDocument(Base, TimestampMixin):
+    """Account-level, reusable supporting documents — bank statements,
+    payslips/business proof, land titles, URA TINs, etc. Separate from
+    KYCDocument (identity verification, admin-reviewed) and from the now-
+    retired per-application LoanDocument: a lender's standing offer names
+    what it needs in plain-language labels (LenderOfferTemplate.
+    required_documents), and DOCUMENT_LABEL_MAP (routers/loans.py) resolves
+    each label to either a KYCDocument type ("National ID") or one of these
+    types — uploaded once here, satisfies every current and future offer
+    that asks for the same thing, exactly like KYC already does."""
+    __tablename__ = "borrower_documents"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    user_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    document_type = Column(String(50), nullable=False)  # bank_statement, business_proof, land_title, ura_tin
+    file_url = Column(String(500), nullable=False)
+    file_name = Column(String(255), nullable=True)
+    verified = Column(Boolean, default=False)
+
+    user = relationship("User")
+
+
 class Guarantor(Base, TimestampMixin):
     """A guarantor is a real Mpola user (any role) vouching for one specific
     loan application — not a standing relationship and not a freeform
@@ -329,6 +351,13 @@ class LoanOffer(Base, TimestampMixin):
     monthly_payment = Column(Float, nullable=True)
     total_repayable = Column(Float, nullable=True)
     status = Column(String(20), default="pending")  # pending, accepted, declined, expired
+    # Copied from the originating LenderOfferTemplate at creation time (see
+    # _create_offer_from_template) — null for a lender's manual, non-
+    # template offer (POST /loans/offers), which has no document
+    # requirement concept today. Resolved against the borrower's KYC/
+    # BorrowerDocument records at accept time (see respond_to_offer) —
+    # accepting is blocked until every label here is satisfied.
+    required_documents = Column(Text, nullable=True)  # JSON list of labels
 
     application = relationship("LoanApplication", back_populates="offers")
     lender = relationship("User", back_populates="offers_made", foreign_keys=[lender_id])
@@ -414,6 +443,11 @@ class Loan(Base, TimestampMixin):
     # late-fee portion gets the platform's extra cut (see LATE_FEE_PLATFORM_CUT_RATE).
     late_fee_amount = Column(Float, default=0.0)
     late_fee_paid = Column(Float, default=0.0)
+    # Copied from the accepted LoanOffer at disbursement-accept time (see
+    # respond_to_offer) — lets the lender's approve_disbursement screen show
+    # exactly what was required next to what the borrower actually has on
+    # file, right before releasing funds.
+    required_documents = Column(Text, nullable=True)  # JSON list of labels
 
     application = relationship("LoanApplication", back_populates="loan")
     borrower = relationship("User", foreign_keys=[borrower_id])

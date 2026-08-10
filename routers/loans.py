@@ -3,15 +3,13 @@ Loans router — applications, offers, active loans, repayments.
 """
 
 import json
-import os
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from config import BASE_URL
-from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, LoanDocument, Wallet, WalletTransaction, PlatformFeeTransaction, LenderApplicationSkip
-from helpers import generateReferenceNumber, generateUniqueId
+from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, KYCDocument, BorrowerDocument, Wallet, WalletTransaction, PlatformFeeTransaction, LenderApplicationSkip
+from helpers import generateReferenceNumber, generateUniqueId, DOCUMENT_LABEL_MAP
 from repository.auth_repo import _audit, _notify, _notify_admins
 from repository.dependencies import get_db, current_active_user
 from repository.models import LoanApplicationCreate, LoanApplicationUpdate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, LenderOfferTemplateExpiryUpdate, RepaymentCreate, GuarantorAttach
@@ -24,15 +22,6 @@ from utils.fee import calc_platform_fee, calc_late_fee_platform_cut
 # (see the respond endpoint in routers/guarantors.py); this check at
 # offer-accept time is now a defensive second gate, not the primary one.
 REQUIRED_ACCEPTED_GUARANTORS = 2
-
-MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
-ALLOWED_DOCUMENT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
-
-# Loan-specific paperwork required before an application can become
-# matching-eligible (see _try_activate_matching below) — separate from
-# identity/KYC documents, which are account-wide and live on the profile
-# page, not part of the apply wizard at all.
-REQUIRED_DOCUMENT_TYPES = ["bank_statement", "business_registration"]
 
 router = APIRouter(prefix="/loans", tags=["Loans"])
 
@@ -107,24 +96,18 @@ async def create_application(
         monthly_payment=round(monthly_payment, 2),
         max_interest_rate=data.max_interest_rate,
         valid_until=valid_until,
-        # Not matching-eligible yet — the frontend attaches 2 guarantors in an
-        # immediate follow-up call (POST .../guarantors below), and matching
-        # only starts once both accept (see routers/guarantors.py). Admins are
-        # still notified now so review/oversight isn't gated on guarantors.
+        # Not matching-eligible yet — the apply wizard saves progress from
+        # this point on (see GET /applications/draft), attaching 2
+        # guarantors only once the borrower reaches the end of the wizard
+        # (POST .../guarantors below) — that's the real "submission" moment,
+        # not this one, so admins are notified there instead. Notifying here
+        # would fire for every wizard session that merely reaches step 1,
+        # including ones the borrower never finishes.
         status="awaiting_guarantors",
     )
     db.add(app)
     db.commit()
     db.refresh(app)
-
-    _notify_admins(
-        db,
-        title="New loan application",
-        message=f"{user.full_name or user.username} applied for a {data.loan_type} loan of UGX {data.amount:,.0f}.",
-        type="new_application",
-        data={"application_id": app.id},
-        setting_key="notif_new_applications",
-    )
 
     return {
         "status": 200,
@@ -176,22 +159,7 @@ async def get_draft_application(
     if not draft:
         return {"draft": None}
 
-    docs = db.query(LoanDocument).filter(LoanDocument.application_id == draft.id).all()
-    return {
-        "draft": {
-            **_app_response(draft),
-            "documents": [
-                {
-                    "id": d.id,
-                    "document_type": d.document_type,
-                    "file_url": d.file_url,
-                    "file_name": d.file_name,
-                    "verified": d.verified,
-                }
-                for d in docs
-            ],
-        }
-    }
+    return {"draft": _app_response(draft)}
 
 
 @router.get("/applications/{app_id}")
@@ -205,7 +173,7 @@ async def get_application(
         raise HTTPException(status_code=404, detail="Application not found")
     # Borrower can see own, lenders can see any, admin can see all
     if user.has_admin_access or user.role == "lender" or app.borrower_id == user.id:
-        return _app_response(app, include_offers=True)
+        return _app_response(app, db, include_offers=True)
     raise HTTPException(status_code=403, detail="Not authorized")
 
 
@@ -259,6 +227,19 @@ async def attach_guarantors(
     _audit(db, "guarantors_attached", username=user.username, user_id=user.id,
            resource_type="loan_application", resource_id=app_id,
            details={"guarantor_user_ids": guarantor_ids})
+
+    # This is the real "submission" moment under the save-as-you-go wizard —
+    # the borrower has finished all 4 steps and their guarantors are now
+    # being asked to approve, not just idly created a draft in step 1.
+    _notify_admins(
+        db,
+        title="New loan application",
+        message=f"{borrower_name} applied for a {app.loan_type} loan of UGX {app.amount:,.0f}.",
+        type="new_application",
+        data={"application_id": app.id},
+        setting_key="notif_new_applications",
+    )
+
     db.commit()
 
     return {"status": 200, "message": "Guarantors added — waiting for them to accept"}
@@ -460,91 +441,6 @@ async def unfreeze_own_application(
 
 
 # ═══════════════════════════════════════════════
-#  APPLICATION DOCUMENTS
-# ═══════════════════════════════════════════════
-
-@router.post("/applications/{app_id}/documents")
-async def upload_document(
-    app_id: str,
-    document_type: str = Form(...),
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    user: User = Depends(current_active_user),
-):
-    app = db.query(LoanApplication).filter(
-        LoanApplication.id == app_id, LoanApplication.borrower_id == user.id
-    ).first()
-    if not app:
-        raise HTTPException(status_code=404, detail="Application not found")
-
-    ext = os.path.splitext(file.filename or "")[1].lower()
-    if ext not in ALLOWED_DOCUMENT_EXTENSIONS:
-        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext or 'unknown'}")
-
-    contents = await file.read()
-    if len(contents) > MAX_DOCUMENT_SIZE_BYTES:
-        raise HTTPException(status_code=400, detail="File exceeds 10MB limit")
-
-    os.makedirs("uploads", exist_ok=True)
-    stored_name = f"{generateUniqueId(20)}{ext}"
-    with open(os.path.join("uploads", stored_name), "wb") as f:
-        f.write(contents)
-
-    doc = LoanDocument(
-        application_id=app_id,
-        document_type=document_type,
-        file_url=f"{BASE_URL}/uploads/{stored_name}",
-        file_name=file.filename,
-    )
-    db.add(doc)
-    db.flush()  # _documents_complete queries LoanDocument fresh — see database/__init__.py's autoflush=False note
-    activated = _try_activate_matching(db, app)
-    _audit(db, "document_uploaded", username=user.username, user_id=user.id,
-           resource_type="loan_application", resource_id=app_id,
-           details={"document_type": document_type, "activated_matching": activated})
-    db.commit()
-
-    return {
-        "status": 200,
-        "message": "Document uploaded",
-        "document": {
-            "id": doc.id,
-            "document_type": doc.document_type,
-            "file_url": doc.file_url,
-            "file_name": doc.file_name,
-            "verified": doc.verified,
-        },
-    }
-
-
-@router.get("/applications/{app_id}/documents")
-async def list_documents(
-    app_id: str,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_active_user),
-):
-    app = db.query(LoanApplication).filter(LoanApplication.id == app_id).first()
-    if not app:
-        raise HTTPException(status_code=404, detail="Application not found")
-    if not (user.has_admin_access or user.role == "lender") and app.borrower_id != user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
-
-    docs = db.query(LoanDocument).filter(LoanDocument.application_id == app_id).all()
-    return {
-        "documents": [
-            {
-                "id": d.id,
-                "document_type": d.document_type,
-                "file_url": d.file_url,
-                "file_name": d.file_name,
-                "verified": d.verified,
-            }
-            for d in docs
-        ]
-    }
-
-
-# ═══════════════════════════════════════════════
 #  LOAN MARKETPLACE (Lender)
 # ═══════════════════════════════════════════════
 
@@ -655,7 +551,7 @@ async def make_offer(
     db.commit()
     db.refresh(offer)
 
-    return {"status": 200, "message": "Offer submitted", "offer": _offer_response(offer)}
+    return {"status": 200, "message": "Offer submitted", "offer": _offer_response(offer, db)}
 
 
 @router.get("/offers/mine")
@@ -672,7 +568,7 @@ async def my_offers(
         query = query.filter(LoanOffer.status == status)
     total = query.count()
     offers = query.order_by(LoanOffer.created_at.desc()).offset(skip).limit(limit).all()
-    return {"total": total, "offers": [_offer_response(o) for o in offers]}
+    return {"total": total, "offers": [_offer_response(o, db) for o in offers]}
 
 
 @router.get("/offers/received")
@@ -693,7 +589,53 @@ async def offers_received(
         query = query.filter(LoanOffer.status == status)
     total = query.count()
     offers = query.order_by(LoanOffer.created_at.desc()).offset(skip).limit(limit).all()
-    return {"total": total, "offers": [_offer_response(o) for o in offers]}
+    return {"total": total, "offers": [_offer_response(o, db) for o in offers]}
+
+
+def _required_documents_status(db: Session, borrower_id: str, required_documents) -> list[dict]:
+    """Resolves an offer's required_documents (JSON list of labels, e.g.
+    "National ID", "Bank Statement (3mo)") against what the borrower
+    actually has on file — KYCDocument for identity labels, BorrowerDocument
+    (account-wide, reusable — see database/tables.py) for everything else.
+    See DOCUMENT_LABEL_MAP (helpers.py). Includes the file itself (not just
+    a satisfied flag) so a lender reviewing before disbursement can
+    actually open what was provided, not just see a checkmark."""
+    labels = json.loads(required_documents) if required_documents else []
+    if not labels:
+        return []
+
+    kyc_docs = {
+        d.document_type: d for d in db.query(KYCDocument).filter(KYCDocument.user_id == borrower_id).all()
+    }
+    borrower_docs = {
+        d.document_type: d for d in db.query(BorrowerDocument).filter(BorrowerDocument.user_id == borrower_id).all()
+    }
+
+    result = []
+    for label in labels:
+        source, type_key = DOCUMENT_LABEL_MAP.get(label, (None, None))
+        doc = None
+        if source == "kyc":
+            doc = kyc_docs.get(type_key)
+        elif source == "borrower_doc":
+            doc = borrower_docs.get(type_key)
+        satisfied = doc is not None
+        if source not in ("kyc", "borrower_doc"):
+            # Unknown label (e.g. a template saved before a checklist
+            # change) can't be resolved to anything uploadable — treat as
+            # satisfied rather than permanently blocking acceptance on a
+            # requirement nobody can ever fulfil.
+            satisfied = True
+        result.append({
+            "label": label,
+            "type": type_key,
+            "source": source,
+            "satisfied": satisfied,
+            "file_url": doc.file_url if doc else None,
+            "file_name": doc.file_name if doc else None,
+            "verified": doc.verified if doc else False,
+        })
+    return result
 
 
 @router.put("/offers/{offer_id}")
@@ -740,6 +682,16 @@ async def respond_to_offer(
                 ),
             )
 
+        missing_docs = [
+            d["label"] for d in _required_documents_status(db, app.borrower_id, offer.required_documents)
+            if not d["satisfied"]
+        ]
+        if missing_docs:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Upload the documents this offer requires before accepting: {', '.join(missing_docs)}.",
+            )
+
         # Disbursement is a separate, lender-approved step (see
         # approve_disbursement below) — only check that both parties have a
         # wallet *set up* here; the lender's balance is checked at approval
@@ -769,6 +721,7 @@ async def respond_to_offer(
             total_repayable=offer.total_repayable,
             total_instalments=offer.duration,
             status="pending_disbursement",
+            required_documents=offer.required_documents,
         )
         db.add(loan)
         db.flush()
@@ -1107,6 +1060,7 @@ def _create_offer_from_template(db: Session, app: LoanApplication, template: Len
         duration=app.duration,
         total_repayable=round(total_repayable, 2),
         monthly_payment=round(monthly_payment, 2),
+        required_documents=template.required_documents,
     )
     db.add(offer)
     db.flush()
@@ -1150,32 +1104,19 @@ def auto_match_offers_for_application(db: Session, app: LoanApplication) -> int:
     return created
 
 
-def _documents_complete(db: Session, app_id: str) -> bool:
-    uploaded_types = {
-        t for (t,) in db.query(LoanDocument.document_type).filter(
-            LoanDocument.application_id == app_id,
-        ).all()
-    }
-    return all(t in uploaded_types for t in REQUIRED_DOCUMENT_TYPES)
-
-
 def _try_activate_matching(db: Session, app: LoanApplication) -> bool:
-    """An application only becomes matching-eligible once BOTH of its
-    guarantors have accepted AND its required documents are uploaded —
-    whichever of the two finishes last is what actually flips it. This is
-    the real enforcement point for "documents are required", not the apply
-    wizard UI: no matter what order or API path was used to build up an
-    application, it can never reach lenders without them. Called from here
-    (upload_document) and from the guarantor-respond endpoint in
-    routers/guarantors.py, since either event could be the final piece.
-    Returns whether it just activated."""
+    """An application becomes matching-eligible the moment every one of its
+    guarantors has accepted — called from the guarantor-respond endpoint in
+    routers/guarantors.py. Documents are no longer part of this gate: a
+    lender's required_documents aren't even known until a specific offer
+    exists, so they're resolved and enforced at offer-accept time instead
+    (see respond_to_offer's document check below), not here. Returns
+    whether it just activated."""
     if app.status != "awaiting_guarantors":
         return False
     if not app.guarantors:
         return False
     if any(g.status != "accepted" for g in app.guarantors):
-        return False
-    if not _documents_complete(db, app.id):
         return False
     app.status = "pending"
     auto_match_offers_for_application(db, app)
@@ -1210,7 +1151,7 @@ async def my_active_loans(
     )
     total = query.count()
     loans = query.order_by(Loan.created_at.desc()).offset(skip).limit(limit).all()
-    return {"total": total, "loans": [_loan_response(l) for l in loans]}
+    return {"total": total, "loans": [_loan_response(l, db) for l in loans]}
 
 
 @router.get("/earnings")
@@ -1339,7 +1280,7 @@ async def get_loan(
         raise HTTPException(status_code=404, detail="Loan not found")
     if loan.borrower_id != user.id and loan.lender_id != user.id and not user.has_admin_access:
         raise HTTPException(status_code=403, detail="Not authorized")
-    return _loan_response(loan, include_repayments=True)
+    return _loan_response(loan, db, include_repayments=True)
 
 
 @router.post("/active/{loan_id}/approve-disbursement")
@@ -1443,7 +1384,7 @@ async def approve_disbursement(
            resource_type="loan", resource_id=loan.id, details={"amount": loan.amount})
 
     db.commit()
-    return {"status": 200, "message": "Loan disbursed", "loan": _loan_response(loan)}
+    return {"status": 200, "message": "Loan disbursed", "loan": _loan_response(loan, db)}
 
 
 # ═══════════════════════════════════════════════
@@ -1619,7 +1560,7 @@ async def make_repayment(
             "transaction_id": repayment.transaction_id,
             "created_at": str(repayment.created_at),
         },
-        "loan": _loan_response(loan),
+        "loan": _loan_response(loan, db),
     }
 
 
@@ -1663,7 +1604,7 @@ async def get_repayment_receipt(
 #  RESPONSE HELPERS
 # ═══════════════════════════════════════════════
 
-def _app_response(app: LoanApplication, include_offers: bool = False) -> dict:
+def _app_response(app: LoanApplication, db: Session = None, include_offers: bool = False) -> dict:
     result = {
         "id": app.id,
         "reference_number": app.reference_number,
@@ -1701,11 +1642,11 @@ def _app_response(app: LoanApplication, include_offers: bool = False) -> dict:
         ],
     }
     if include_offers:
-        result["offers"] = [_offer_response(o) for o in app.offers]
+        result["offers"] = [_offer_response(o, db) for o in app.offers]
     return result
 
 
-def _offer_response(offer: LoanOffer) -> dict:
+def _offer_response(offer: LoanOffer, db: Session) -> dict:
     app = offer.application
     return {
         "id": offer.id,
@@ -1722,11 +1663,15 @@ def _offer_response(offer: LoanOffer) -> dict:
         "monthly_payment": offer.monthly_payment,
         "total_repayable": offer.total_repayable,
         "status": offer.status,
+        "required_documents": json.loads(offer.required_documents) if offer.required_documents else [],
+        "required_documents_status": (
+            _required_documents_status(db, app.borrower_id, offer.required_documents) if app else []
+        ),
         "created_at": str(offer.created_at),
     }
 
 
-def _loan_response(loan: Loan, include_repayments: bool = False) -> dict:
+def _loan_response(loan: Loan, db: Session = None, include_repayments: bool = False) -> dict:
     result = {
         "id": loan.id,
         "borrower_id": loan.borrower_id,
@@ -1748,6 +1693,15 @@ def _loan_response(loan: Loan, include_repayments: bool = False) -> dict:
         "status": loan.status,
         "disbursed_at": str(loan.disbursed_at) if loan.disbursed_at else None,
         "created_at": str(loan.created_at),
+        "required_documents": json.loads(loan.required_documents) if loan.required_documents else [],
+        # Lets the lender's disbursement-approval screen show exactly what
+        # was required next to what the borrower actually has on file,
+        # right before releasing funds — only resolved when a db session is
+        # passed (every route handler has one; kept optional so this
+        # function still works from any db-less context).
+        "required_documents_status": (
+            _required_documents_status(db, loan.borrower_id, loan.required_documents) if db is not None else []
+        ),
     }
     if include_repayments:
         result["repayments"] = [

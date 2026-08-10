@@ -8,8 +8,8 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from config import BASE_URL
-from database.tables import User, KYCDocument
-from helpers import generateUniqueId, normalizePhoneNumber
+from database.tables import User, KYCDocument, BorrowerDocument
+from helpers import generateUniqueId, normalizePhoneNumber, DOCUMENT_LABEL_MAP
 from repository.auth_repo import _audit
 from repository.dependencies import get_db, current_active_user
 from repository.models import UserUpdate, PushTokenUpdate
@@ -25,6 +25,17 @@ router = APIRouter(prefix="/users", tags=["Users"])
 KYC_DOCUMENT_TYPES = {"national_id", "passport", "profile_photo", "proof_of_address"}
 MAX_KYC_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
 ALLOWED_KYC_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
+
+# The non-identity half of DOCUMENT_LABEL_MAP (helpers.py) — supporting
+# financial/business documents a lender's standing offer might ask for.
+# Derived from the same map a lender's required_documents resolves against
+# (routers/loans.py), so this can never drift out of sync with what's
+# actually satisfiable.
+BORROWER_DOCUMENT_TYPES = {
+    type_key for source, type_key in DOCUMENT_LABEL_MAP.values() if source == "borrower_doc"
+}
+MAX_BORROWER_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
+ALLOWED_BORROWER_DOCUMENT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
 
 
 @router.get("/me")
@@ -123,6 +134,90 @@ async def list_my_kyc_documents(
     user: User = Depends(current_active_user),
 ):
     docs = db.query(KYCDocument).filter(KYCDocument.user_id == user.id).all()
+    return {
+        "documents": [
+            {
+                "id": d.id,
+                "document_type": d.document_type,
+                "file_url": d.file_url,
+                "file_name": d.file_name,
+                "verified": d.verified,
+            }
+            for d in docs
+        ]
+    }
+
+
+@router.post("/me/documents")
+async def upload_borrower_document(
+    document_type: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Uploads (or replaces) one of the account's reusable supporting
+    documents — bank statement, payslip/business proof, land title, URA
+    TIN. Account-wide, not per-loan: once uploaded here, it satisfies every
+    current and future lender offer that asks for the same thing (see
+    DOCUMENT_LABEL_MAP / _required_documents_status in routers/loans.py)."""
+    if document_type not in BORROWER_DOCUMENT_TYPES:
+        raise HTTPException(status_code=400, detail=f"document_type must be one of {sorted(BORROWER_DOCUMENT_TYPES)}")
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_BORROWER_DOCUMENT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext or 'unknown'}")
+
+    contents = await file.read()
+    if len(contents) > MAX_BORROWER_DOCUMENT_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="File exceeds 10MB limit")
+
+    os.makedirs("uploads", exist_ok=True)
+    stored_name = f"{generateUniqueId(20)}{ext}"
+    with open(os.path.join("uploads", stored_name), "wb") as f:
+        f.write(contents)
+
+    # Replace any existing upload of the same type rather than piling up.
+    existing = db.query(BorrowerDocument).filter(
+        BorrowerDocument.user_id == user.id, BorrowerDocument.document_type == document_type
+    ).first()
+    if existing:
+        existing.file_url = f"{BASE_URL}/uploads/{stored_name}"
+        existing.file_name = file.filename
+        existing.verified = False
+        doc = existing
+    else:
+        doc = BorrowerDocument(
+            user_id=user.id,
+            document_type=document_type,
+            file_url=f"{BASE_URL}/uploads/{stored_name}",
+            file_name=file.filename,
+        )
+        db.add(doc)
+
+    _audit(db, "borrower_document_uploaded", username=user.username, user_id=user.id,
+           resource_type="borrower_document", details={"document_type": document_type})
+    db.commit()
+    db.refresh(doc)
+
+    return {
+        "status": 200,
+        "message": "Document uploaded",
+        "document": {
+            "id": doc.id,
+            "document_type": doc.document_type,
+            "file_url": doc.file_url,
+            "file_name": doc.file_name,
+            "verified": doc.verified,
+        },
+    }
+
+
+@router.get("/me/documents")
+async def list_my_borrower_documents(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    docs = db.query(BorrowerDocument).filter(BorrowerDocument.user_id == user.id).all()
     return {
         "documents": [
             {
