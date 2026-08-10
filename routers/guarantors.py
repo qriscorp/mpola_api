@@ -84,10 +84,13 @@ async def respond_to_guarantor_request(
     if g.status != "pending":
         raise HTTPException(status_code=400, detail=f"Already {g.status}")
 
+    app = db.query(LoanApplication).filter(LoanApplication.id == g.application_id).first()
+    if app and app.status == "expired":
+        raise HTTPException(status_code=400, detail="This loan request has expired — no response needed")
+
     g.status = data.status
     g.responded_at = datetime.now(timezone.utc)
 
-    app = db.query(LoanApplication).filter(LoanApplication.id == g.application_id).first()
     if app:
         _notify(
             db, app.borrower_id,
@@ -144,6 +147,8 @@ async def remind_guarantor(
         raise HTTPException(status_code=403, detail="Not authorized")
     if g.status != "pending":
         raise HTTPException(status_code=400, detail=f"Already {g.status}")
+    if app.status != "awaiting_guarantors":
+        raise HTTPException(status_code=400, detail="This loan request is no longer awaiting guarantors")
 
     cooldown_hours = _reminder_cooldown_hours(db)
     if g.last_reminded_at:

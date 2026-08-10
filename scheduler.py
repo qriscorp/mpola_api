@@ -53,6 +53,7 @@ def run_collections_job() -> None:
         _notify_low_balance_lenders(db, now)
         _recompute_borrower_credit_scores(db)
         _remind_pending_guarantors(db, now)
+        _expire_stale_applications(db, now)
 
         db.commit()
     except Exception as e:
@@ -438,6 +439,48 @@ def _remind_pending_guarantors(db, now) -> None:
             type="guarantor_still_pending",
             data={"application_id": app.id, "guarantor_id": g.id},
         )
+
+
+def _expire_stale_applications(db, now) -> None:
+    """A borrower can optionally cap how long their request stays live
+    (LoanApplication.valid_until — most people who set this need funds
+    urgently and don't want to be matched to a lender weeks after they've
+    already moved on). Once that date passes, retire the request instead of
+    letting it sit there: mark it expired, tell the borrower, and let any
+    guarantor who still hasn't responded know they no longer need to —
+    nothing further (matching, reminders) touches it after this. Requests
+    with no valid_until set are untouched — they stay open indefinitely,
+    exactly as before this feature existed."""
+    stale = db.query(LoanApplication).filter(
+        LoanApplication.status.in_(["awaiting_guarantors", "pending"]),
+        LoanApplication.valid_until.isnot(None),
+        LoanApplication.valid_until < now.replace(tzinfo=None),
+    ).all()
+
+    for app in stale:
+        app.status = "expired"
+        _audit(db, "application_expired", resource_type="loan_application", resource_id=app.id,
+               details={"valid_until": str(app.valid_until)})
+        _notify(
+            db, app.borrower_id,
+            title="Loan request expired",
+            message=f"Your UGX {app.amount:,.0f} loan request has expired without being funded. "
+                    f"You can submit a new request whenever you're ready.",
+            type="application_expired",
+            data={"application_id": app.id},
+        )
+
+        still_pending_guarantors = db.query(Guarantor).filter(
+            Guarantor.application_id == app.id, Guarantor.status == "pending",
+        ).all()
+        for g in still_pending_guarantors:
+            _notify(
+                db, g.guarantor_user_id,
+                title="Guarantor request no longer needed",
+                message="The loan request you were asked to guarantee has expired — no need to respond.",
+                type="guarantor_request_expired",
+                data={"application_id": app.id},
+            )
 
 
 def run_weekly_digest_job() -> None:

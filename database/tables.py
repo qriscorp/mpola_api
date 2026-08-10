@@ -236,11 +236,16 @@ class LoanApplication(Base, TimestampMixin):
     duration = Column(Integer, nullable=False)  # months
     loan_type = Column(String(30), nullable=False)  # personal, business, education, agricultural, emergency
     purpose = Column(Text, nullable=True)
-    status = Column(String(30), default="pending")  # awaiting_guarantors, pending, approved, rejected, funded, completed, defaulted
+    status = Column(String(30), default="pending")  # awaiting_guarantors, pending, approved, rejected, funded, completed, defaulted, expired
     monthly_payment = Column(Float, nullable=True)
     interest_rate = Column(Float, nullable=True)
     total_repayable = Column(Float, nullable=True)
     max_interest_rate = Column(Float, nullable=True)  # borrower's optional cap, %/month — enforced in _template_matches and make_offer
+    # Optional — a borrower who needs funds urgently can cap how long their
+    # request stays live; None means it never expires on its own (same
+    # optional/nullable shape as LenderOfferTemplate.valid_until). Enforced
+    # in _template_matches and auto-expired by scheduler._expire_stale_applications.
+    valid_until = Column(DateTime, nullable=True)
 
     borrower = relationship("User", back_populates="loan_applications", foreign_keys=[borrower_id])
     offers = relationship("LoanOffer", back_populates="application", cascade="all, delete-orphan")

@@ -216,6 +216,7 @@ class LoanApplicationCreate(BaseModel):
     loan_type: str  # personal, business, education, agricultural, emergency
     purpose: Optional[str] = None
     max_interest_rate: Optional[float] = Field(None, ge=0.1, le=25)  # borrower's optional cap, %/month
+    valid_until: Optional[datetime] = None  # borrower's optional urgency cap — None means it never expires
 
 
 class LoanApplicationUpdate(BaseModel):

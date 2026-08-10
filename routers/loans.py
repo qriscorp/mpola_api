@@ -73,6 +73,15 @@ async def create_application(
             status_code=400,
             detail=f"Amount must be between {min_amount:,.0f} and {max_amount:,.0f}",
         )
+    # Normalize to naive UTC regardless of whether the client sent an
+    # offset/'Z'-suffixed (aware) or plain (naive) value — MySQL DATETIME
+    # has no tz concept, and every other valid_until-style field in this
+    # codebase (LenderOfferTemplate.valid_until) is stored/compared the
+    # same naive-UTC way, so this keeps the convention consistent and
+    # avoids a naive/aware TypeError on the comparison below.
+    valid_until = data.valid_until.replace(tzinfo=None) if data.valid_until else None
+    if valid_until and valid_until <= datetime.now(timezone.utc).replace(tzinfo=None):
+        raise HTTPException(status_code=400, detail="Valid-until date must be in the future")
 
     # Calculate estimated monthly payment (simple interest, rate is % per month)
     rate = 3.0  # default platform rate — a display estimate only; real lender offers set their own
@@ -91,6 +100,7 @@ async def create_application(
         total_repayable=round(total_repayable, 2),
         monthly_payment=round(monthly_payment, 2),
         max_interest_rate=data.max_interest_rate,
+        valid_until=valid_until,
         # Not matching-eligible yet — the frontend attaches 2 guarantors in an
         # immediate follow-up call (POST .../guarantors below), and matching
         # only starts once both accept (see routers/guarantors.py). Admins are
@@ -785,6 +795,12 @@ def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanAppli
     # against an aware `now` (mixing the two raises TypeError).
     if template.valid_until and template.valid_until < datetime.now(timezone.utc).replace(tzinfo=None):
         return False
+    # Same naive-UTC comparison, same reasoning, for the borrower's own
+    # optional expiry — belt-and-suspenders alongside scheduler._expire_stale_applications,
+    # which flips app.status to "expired" once a day; this catches the gap
+    # in between (an application can expire mid-day, well before the next run).
+    if app.valid_until and app.valid_until < datetime.now(timezone.utc).replace(tzinfo=None):
+        return False
     if not (template.min_amount <= app.amount <= template.max_amount):
         return False
     if app.duration > template.max_duration:
@@ -1364,6 +1380,7 @@ def _app_response(app: LoanApplication, include_offers: bool = False) -> dict:
         "monthly_payment": app.monthly_payment,
         "total_repayable": app.total_repayable,
         "max_interest_rate": app.max_interest_rate,
+        "valid_until": str(app.valid_until) if app.valid_until else None,
         "created_at": str(app.created_at),
         "borrower": {
             "id": app.borrower.id,
