@@ -1389,6 +1389,14 @@ def update_setting(
     db: Session = Depends(get_db),
     admin: AuthUser = Depends(require_admin),
 ):
+    if key == "max_interest_rate":
+        try:
+            rate = float(data.value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Max Interest Rate must be a number")
+        if not (0.1 <= rate <= 25):
+            raise HTTPException(status_code=400, detail="Max Interest Rate must be between 0.1% and 25%")
+
     setting = db.query(PlatformSetting).filter(PlatformSetting.key == key).first()
     if not setting:
         setting = PlatformSetting(key=key, value=data.value)
