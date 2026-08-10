@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from database.tables import User, LoginSession
+from helpers import safe_isoformat
 from repository.auth_repo import _audit
 from repository.dependencies import get_db, current_active_user
 
@@ -35,7 +36,7 @@ def list_sessions(
                 "device_label": s.device_label,
                 "ip_address": s.ip_address,
                 "user_agent": s.user_agent,
-                "created_at": str(s.created_at),
+                "created_at": safe_isoformat(s.created_at),
                 "is_most_recent": i == 0,
             }
             for i, s in enumerate(sessions)

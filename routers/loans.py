@@ -9,7 +9,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, KYCDocument, BorrowerDocument, Wallet, WalletTransaction, PlatformFeeTransaction, LenderApplicationSkip
-from helpers import generateReferenceNumber, generateUniqueId, DOCUMENT_LABEL_MAP
+from helpers import generateReferenceNumber, generateUniqueId, DOCUMENT_LABEL_MAP, safe_isoformat
 from repository.auth_repo import _audit, _notify, _notify_admins
 from repository.dependencies import get_db, current_active_user
 from repository.models import LoanApplicationCreate, LoanApplicationUpdate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, LenderOfferTemplateExpiryUpdate, RepaymentCreate, GuarantorAttach
@@ -785,12 +785,12 @@ def _offer_template_response(t: LenderOfferTemplate) -> dict:
         "accepted_loan_types": json.loads(t.accepted_loan_types) if t.accepted_loan_types else [],
         "required_documents": json.loads(t.required_documents) if t.required_documents else [],
         "description": t.description,
-        "valid_until": str(t.valid_until) if t.valid_until else None,
+        "valid_until": safe_isoformat(t.valid_until),
         "max_concurrent_loans": t.max_concurrent_loans,
         "status": t.status,
         "is_frozen": t.is_frozen,
         "frozen_by": t.frozen_by,
-        "created_at": str(t.created_at),
+        "created_at": safe_isoformat(t.created_at),
     }
 
 
@@ -982,7 +982,7 @@ async def extend_offer_template_expiry(
     template.expiry_notified = False
     _audit(db, "offer_template_expiry_updated", username=user.username, user_id=user.id,
            resource_type="lender_offer_template", resource_id=template.id,
-           details={"valid_until": str(data.valid_until) if data.valid_until else None})
+           details={"valid_until": safe_isoformat(data.valid_until)})
     db.commit()
     db.refresh(template)
     return {"status": 200, "message": "Expiry updated", "template": _offer_template_response(template)}
@@ -1559,7 +1559,7 @@ async def make_repayment(
             "instalment_number": repayment.instalment_number,
             "payment_method": repayment.payment_method,
             "transaction_id": repayment.transaction_id,
-            "created_at": str(repayment.created_at),
+            "created_at": safe_isoformat(repayment.created_at),
         },
         "loan": _loan_response(loan, db),
     }
@@ -1592,7 +1592,7 @@ async def my_repayments(
                 "status": r.status,
                 "payment_method": r.payment_method,
                 "transaction_id": r.transaction_id,
-                "created_at": str(r.created_at),
+                "created_at": safe_isoformat(r.created_at),
                 "lender_name": r.loan.lender_user.full_name if r.loan and r.loan.lender_user else None,
             }
             for r in repayments
@@ -1653,10 +1653,10 @@ def _app_response(app: LoanApplication, db: Session = None, include_offers: bool
         "monthly_payment": app.monthly_payment,
         "total_repayable": app.total_repayable,
         "max_interest_rate": app.max_interest_rate,
-        "valid_until": str(app.valid_until) if app.valid_until else None,
+        "valid_until": safe_isoformat(app.valid_until),
         "is_frozen": app.is_frozen,
         "frozen_by": app.frozen_by,
-        "created_at": str(app.created_at),
+        "created_at": safe_isoformat(app.created_at),
         "borrower": {
             "id": app.borrower.id,
             "full_name": app.borrower.full_name,
@@ -1703,7 +1703,7 @@ def _offer_response(offer: LoanOffer, db: Session) -> dict:
         "required_documents_status": (
             _required_documents_status(db, app.borrower_id, offer.required_documents) if app else []
         ),
-        "created_at": str(offer.created_at),
+        "created_at": safe_isoformat(offer.created_at),
     }
 
 
@@ -1722,13 +1722,13 @@ def _loan_response(loan: Loan, db: Session = None, include_repayments: bool = Fa
         "total_paid": loan.total_paid,
         "paid_instalments": loan.paid_instalments,
         "total_instalments": loan.total_instalments,
-        "next_payment_date": str(loan.next_payment_date) if loan.next_payment_date else None,
+        "next_payment_date": safe_isoformat(loan.next_payment_date),
         "next_payment_amount": loan.next_payment_amount,
         "late_fee_amount": loan.late_fee_amount or 0.0,
         "late_fee_paid": loan.late_fee_paid or 0.0,
         "status": loan.status,
-        "disbursed_at": str(loan.disbursed_at) if loan.disbursed_at else None,
-        "created_at": str(loan.created_at),
+        "disbursed_at": safe_isoformat(loan.disbursed_at),
+        "created_at": safe_isoformat(loan.created_at),
         "required_documents": json.loads(loan.required_documents) if loan.required_documents else [],
         # Lets the lender's disbursement-approval screen show exactly what
         # was required next to what the borrower actually has on file,
@@ -1748,7 +1748,7 @@ def _loan_response(loan: Loan, db: Session = None, include_repayments: bool = Fa
                 "status": r.status,
                 "payment_method": r.payment_method,
                 "transaction_id": r.transaction_id,
-                "created_at": str(r.created_at),
+                "created_at": safe_isoformat(r.created_at),
             }
             for r in loan.repayments
         ]

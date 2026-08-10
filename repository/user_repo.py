@@ -10,6 +10,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database.tables import User, DeactivatedAccount, Wallet
+from helpers import safe_isoformat
 from logging_module import logger
 from repository.auth_repo import get_password_hash, _generate_unique_referral_code
 
@@ -40,14 +41,14 @@ class UserRepo:
             "bio": user.bio,
             "nin": user.nin,
             "gender": user.gender,
-            "date_of_birth": str(user.date_of_birth) if user.date_of_birth else None,
+            "date_of_birth": safe_isoformat(user.date_of_birth),
             "two_factor_enabled": user.two_factor_enabled,
             "notif_new_application": user.notif_new_application,
             "notif_repayment_received": user.notif_repayment_received,
             "notif_loan_overdue": user.notif_loan_overdue,
             "notif_portfolio_digest": user.notif_portfolio_digest,
             "notif_login_alerts": user.notif_login_alerts,
-            "created_at": str(user.created_at),
+            "created_at": safe_isoformat(user.created_at),
         }
 
     @staticmethod
@@ -106,8 +107,8 @@ class UserRepo:
                     "original_phone_number": u.original_phone_number,
                     "deactivated_by": u.deactivated_by,
                     "reason": u.reason,
-                    "scheduled_deletion_date": str(u.scheduled_deletion_date) if u.scheduled_deletion_date else None,
-                    "created_at": str(u.created_at) if u.created_at else None,
+                    "scheduled_deletion_date": safe_isoformat(u.scheduled_deletion_date),
+                    "created_at": safe_isoformat(u.created_at),
                 }
                 for u in users
             ],

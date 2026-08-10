@@ -12,6 +12,7 @@ from database.tables import (
     Notification, PlatformSetting, AuditLog, LoginAttempt, PlatformFeeTransaction,
     Dispute, SupportTicket, SupportMessage, LoanDocument, KYCDocument,
 )
+from helpers import safe_isoformat
 from repository.auth_repo import get_password_hash, _audit, _notify
 from repository.dependencies import get_db
 from repository.models import (
@@ -357,7 +358,7 @@ def get_users(
                 "credit_score": u.credit_score,
                 "active_loans": active_loans_by_borrower.get(u.id, 0),
                 "total_borrowed": round(borrowed_by_borrower.get(u.id, 0.0), 2),
-                "created_at": str(u.created_at),
+                "created_at": safe_isoformat(u.created_at),
             }
             for u in users
         ],
@@ -421,8 +422,8 @@ def get_user_detail(
             "total_repayable": l.total_repayable,
             "total_paid": l.total_paid,
             "status": l.status,
-            "disbursed_at": str(l.disbursed_at) if l.disbursed_at else None,
-            "created_at": str(l.created_at),
+            "disbursed_at": safe_isoformat(l.disbursed_at),
+            "created_at": safe_isoformat(l.created_at),
         }
 
     return {
@@ -442,7 +443,7 @@ def get_user_detail(
                 "amount": a.amount,
                 "loan_type": a.loan_type,
                 "status": a.status,
-                "created_at": str(a.created_at),
+                "created_at": safe_isoformat(a.created_at),
             }
             for a in applications
         ],
@@ -454,7 +455,7 @@ def get_user_detail(
                 "file_url": d.file_url,
                 "file_name": d.file_name,
                 "verified": d.verified,
-                "created_at": str(d.created_at),
+                "created_at": safe_isoformat(d.created_at),
             }
             for d in documents
         ],
@@ -465,7 +466,7 @@ def get_user_detail(
                 "file_url": d.file_url,
                 "file_name": d.file_name,
                 "verified": d.verified,
-                "created_at": str(d.created_at),
+                "created_at": safe_isoformat(d.created_at),
             }
             for d in kyc_documents
         ],
@@ -480,7 +481,7 @@ def get_user_detail(
                 "type": tx.type,
                 "status": tx.status,
                 "description": tx.description,
-                "created_at": str(tx.created_at),
+                "created_at": safe_isoformat(tx.created_at),
             }
             for tx in transactions
         ],
@@ -780,7 +781,7 @@ def list_applications(
                 "offer_count": len(a.offers) if a.offers else 0,
                 "is_frozen": a.is_frozen,
                 "frozen_by": a.frozen_by,
-                "created_at": str(a.created_at),
+                "created_at": safe_isoformat(a.created_at),
             }
             for a in apps
         ],
@@ -938,10 +939,10 @@ def list_all_loans(
                 "total_paid": l.total_paid,
                 "paid_instalments": l.paid_instalments,
                 "total_instalments": l.total_instalments,
-                "disbursed_at": str(l.disbursed_at) if l.disbursed_at else None,
-                "next_payment_date": str(l.next_payment_date) if l.next_payment_date else None,
+                "disbursed_at": safe_isoformat(l.disbursed_at),
+                "next_payment_date": safe_isoformat(l.next_payment_date),
                 "status": l.status,
-                "created_at": str(l.created_at),
+                "created_at": safe_isoformat(l.created_at),
             }
             for l in loans
         ],
@@ -982,7 +983,7 @@ def list_all_payments(
                 "status": tx.status,
                 "description": tx.description,
                 "reference": tx.reference,
-                "created_at": str(tx.created_at),
+                "created_at": safe_isoformat(tx.created_at),
             }
             for tx in txs
         ],
@@ -1058,7 +1059,7 @@ def get_revenue(
                 "username": r.user.full_name if r.user else None,
                 "category": r.category,
                 "platform_fee": r.platform_fee,
-                "created_at": str(r.created_at),
+                "created_at": safe_isoformat(r.created_at),
             }
             for r in rows
         ],
@@ -1178,7 +1179,7 @@ def get_reconciliation_report(
         "wallet_drift": wallet_drift,
         "gateway_mismatches": gateway_mismatches,
         "checked_count": len(wallets) + len(recent_txs),
-        "generated_at": str(datetime.now(timezone.utc)),
+        "generated_at": safe_isoformat(datetime.now(timezone.utc)),
     }
 
 
@@ -1281,12 +1282,12 @@ def list_offer_templates(
                 "accepted_loan_types": json.loads(t.accepted_loan_types) if t.accepted_loan_types else [],
                 "required_documents": json.loads(t.required_documents) if t.required_documents else [],
                 "description": t.description,
-                "valid_until": str(t.valid_until) if t.valid_until else None,
+                "valid_until": safe_isoformat(t.valid_until),
                 "max_concurrent_loans": t.max_concurrent_loans,
                 "status": t.status,
                 "is_frozen": t.is_frozen,
                 "frozen_by": t.frozen_by,
-                "created_at": str(t.created_at),
+                "created_at": safe_isoformat(t.created_at),
             }
             for t in templates
         ],
@@ -1444,7 +1445,7 @@ def get_audit_logs(
                 "resource_id": l.resource_id,
                 "ip_address": l.ip_address,
                 "details": json.loads(l.details) if l.details else None,
-                "created_at": str(l.created_at),
+                "created_at": safe_isoformat(l.created_at),
             }
             for l in logs
         ],
@@ -1508,8 +1509,8 @@ def list_disputes(
                 "status": d.status,
                 "resolution_note": d.resolution_note,
                 "resolved_by": d.resolved_by,
-                "resolved_at": str(d.resolved_at) if d.resolved_at else None,
-                "created_at": str(d.created_at),
+                "resolved_at": safe_isoformat(d.resolved_at),
+                "created_at": safe_isoformat(d.created_at),
             }
             for d in disputes
         ],
@@ -1576,7 +1577,7 @@ def list_support_tickets(
                 "category": t.category,
                 "status": t.status,
                 "message_count": len(t.messages) if t.messages else 0,
-                "created_at": str(t.created_at),
+                "created_at": safe_isoformat(t.created_at),
             }
             for t in tickets
         ],
@@ -1600,14 +1601,14 @@ def get_support_ticket(
             "subject": ticket.subject,
             "category": ticket.category,
             "status": ticket.status,
-            "created_at": str(ticket.created_at),
+            "created_at": safe_isoformat(ticket.created_at),
             "messages": [
                 {
                     "id": m.id,
                     "message": m.message,
                     "is_admin": m.is_admin,
                     "sender_name": m.sender.full_name if m.sender else None,
-                    "created_at": str(m.created_at),
+                    "created_at": safe_isoformat(m.created_at),
                 }
                 for m in ticket.messages
             ],

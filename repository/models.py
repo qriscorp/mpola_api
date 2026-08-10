@@ -438,3 +438,13 @@ class AdminAccessUpdate(BaseModel):
 
 class PlatformSettingUpdate(BaseModel):
     value: str
+
+
+class WebPushSubscribe(BaseModel):
+    endpoint: str
+    p256dh: str
+    auth: str
+
+
+class WebPushUnsubscribe(BaseModel):
+    endpoint: str

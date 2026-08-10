@@ -491,6 +491,22 @@ class Notification(Base, TimestampMixin):
     user = relationship("User", back_populates="notifications")
 
 
+class WebPushSubscription(Base, TimestampMixin):
+    """A browser's push subscription (from PushManager.subscribe()) — a
+    user can have several (one per browser/device they've granted
+    permission on), unlike the single Expo push_token column on User
+    which only ever tracks one mobile device at a time."""
+    __tablename__ = "web_push_subscriptions"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    user_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    endpoint = Column(Text, nullable=False)
+    p256dh = Column(String(255), nullable=False)
+    auth = Column(String(255), nullable=False)
+
+    user = relationship("User")
+
+
 # ═══════════════════════════════════════
 #  PLATFORM SETTINGS
 # ═══════════════════════════════════════

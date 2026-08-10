@@ -15,7 +15,7 @@ from repository.models import (
     WalletCardDepositInitiateModel,
     WalletBankWithdrawInitiateModel,
 )
-from helpers import generateUniqueId
+from helpers import generateUniqueId, safe_isoformat
 from utils.upg_client import UPGClient, _detect_carrier
 from utils.fee import calc_mobile_money_withdrawal_charges, calc_bank_withdrawal_charges
 
@@ -37,7 +37,7 @@ async def get_wallet(db: Session = Depends(get_db), user: User = Depends(current
         "balance": wallet.balance,
         "currency": wallet.currency,
         "is_wallet_setup": wallet.is_wallet_setup,
-        "created_at": str(wallet.created_at),
+        "created_at": safe_isoformat(wallet.created_at),
     }
 
 
@@ -227,7 +227,7 @@ async def list_transactions(
                 "description": tx.description,
                 "reference": tx.reference,
                 "counterparty": tx.counterparty,
-                "created_at": str(tx.created_at),
+                "created_at": safe_isoformat(tx.created_at),
             }
             for tx in txs
         ],

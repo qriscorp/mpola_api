@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database.tables import User, Dispute, Loan
+from helpers import safe_isoformat
 from repository.auth_repo import _audit, _notify
 from repository.dependencies import get_db, current_active_user
 from repository.models import DisputeCreate
@@ -23,8 +24,8 @@ def _dispute_response(d: Dispute) -> dict:
         "loan_id": d.loan_id,
         "resolution_note": d.resolution_note,
         "resolved_by": d.resolved_by,
-        "resolved_at": str(d.resolved_at) if d.resolved_at else None,
-        "created_at": str(d.created_at),
+        "resolved_at": safe_isoformat(d.resolved_at),
+        "created_at": safe_isoformat(d.created_at),
     }
 
 

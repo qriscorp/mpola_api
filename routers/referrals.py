@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from config import FRONTEND_URL
 from database.tables import User
+from helpers import safe_isoformat
 from repository.auth_repo import _generate_unique_referral_code
 from repository.dependencies import get_db, current_active_user
 
@@ -38,7 +39,7 @@ def my_referrals(
             {
                 "full_name": r.full_name,
                 "role": r.role,
-                "created_at": str(r.created_at),
+                "created_at": safe_isoformat(r.created_at),
             }
             for r in referred
         ],

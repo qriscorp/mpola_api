@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database.tables import User, SupportTicket, SupportMessage
+from helpers import safe_isoformat
 from repository.auth_repo import _audit
 from repository.dependencies import get_db, current_active_user
 from repository.models import SupportTicketCreate, SupportMessageCreate
@@ -21,7 +22,7 @@ def _message_response(m: SupportMessage) -> dict:
         "message": m.message,
         "is_admin": m.is_admin,
         "sender_name": m.sender.full_name if m.sender else None,
-        "created_at": str(m.created_at),
+        "created_at": safe_isoformat(m.created_at),
     }
 
 
@@ -31,7 +32,7 @@ def _ticket_response(t: SupportTicket, include_messages: bool = False) -> dict:
         "subject": t.subject,
         "category": t.category,
         "status": t.status,
-        "created_at": str(t.created_at),
+        "created_at": safe_isoformat(t.created_at),
         "message_count": len(t.messages) if t.messages else 0,
     }
     if include_messages:

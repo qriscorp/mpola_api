@@ -13,11 +13,22 @@ def utc_now():
 
 
 def safe_isoformat(dt):
+    """Serialize a datetime for the frontend as an unambiguous UTC ISO
+    string (with an explicit offset). Every model's DateTime columns are
+    naive-but-actually-UTC (populated via func.now()/datetime.now(timezone.utc)),
+    and plain str(dt)/dt.isoformat() on a naive datetime silently drops the
+    UTC marker. JS's `new Date(...)` then parses that as local time instead
+    of UTC, shifting every timestamp by the viewer's UTC offset (e.g. "just
+    now" rendering as "3 hours ago" for a UTC+3 user) — this makes the
+    UTC-ness explicit so the frontend parses it correctly.
+    """
     if dt is None:
         return None
     if isinstance(dt, str):
         return dt
-    return dt.isoformat()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
 
 
 def generateUniqueId(length=10):

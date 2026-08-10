@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from database.tables import User, Guarantor, LoanApplication, PlatformSetting
+from helpers import safe_isoformat
 from repository.auth_repo import _audit, _notify
 from repository.dependencies import get_db, current_active_user
 from repository.models import GuarantorRespond, GuarantorReplace
@@ -56,7 +57,7 @@ async def list_guarantor_requests(
                 "duration": g.application.duration if g.application else None,
                 "purpose": g.application.purpose if g.application else None,
                 "borrower_name": g.application.borrower.full_name if g.application and g.application.borrower else None,
-                "created_at": str(g.created_at),
+                "created_at": safe_isoformat(g.created_at),
             }
             for g in rows
         ]

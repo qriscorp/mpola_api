@@ -10,3 +10,4 @@ from routers.referrals import router as referrals_router
 from routers.support import router as support_router
 from routers.disputes import router as disputes_router
 from routers.sessions import router as sessions_router
+from routers.webpush import router as webpush_router

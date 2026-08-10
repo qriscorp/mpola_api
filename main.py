@@ -8,7 +8,7 @@ from routers import (
     auth_router, users_router, loans_router, guarantors_router,
     wallet_router, notifications_router, admin_router,
     ws_router, referrals_router, support_router,
-    disputes_router, sessions_router,
+    disputes_router, sessions_router, webpush_router,
 )
 from database import ENGINE
 from database.tables import Base
@@ -96,6 +96,7 @@ app.include_router(referrals_router)
 app.include_router(support_router)
 app.include_router(disputes_router)
 app.include_router(sessions_router)
+app.include_router(webpush_router)
 
 # ─── Static files ───────────────────────────────────────────
 os.makedirs("static", exist_ok=True)

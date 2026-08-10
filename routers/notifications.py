@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from database.tables import User, Notification
+from helpers import safe_isoformat
 from repository.dependencies import get_db, current_active_user
 
 router = APIRouter(prefix="/notifications", tags=["Notifications"])
@@ -34,7 +35,7 @@ async def list_notifications(
                 "type": n.type,
                 "is_read": n.is_read,
                 "data": n.data,
-                "created_at": str(n.created_at),
+                "created_at": safe_isoformat(n.created_at),
             }
             for n in items
         ],

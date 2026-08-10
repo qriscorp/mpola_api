@@ -23,6 +23,7 @@ from sqlalchemy import func
 
 from database import SessionLocal
 from database.tables import User, Loan, LoanApplication, LenderOfferTemplate, Guarantor, Wallet, PlatformFeeTransaction, PlatformSetting, AuditLog
+from helpers import safe_isoformat
 from logging_module import logger
 from repository.auth_repo import _audit, _notify, _send_email, _setting_enabled
 
@@ -102,7 +103,7 @@ def _flag_overdue(db, now, grace_days: float, late_fee_rate: float) -> None:
             loan.late_fee_amount = (loan.late_fee_amount or 0) + late_fee
 
         _audit(db, "loan_marked_overdue", resource_type="loan", resource_id=loan.id,
-               details={"late_fee": late_fee, "due_date": str(loan.next_payment_date)})
+               details={"late_fee": late_fee, "due_date": safe_isoformat(loan.next_payment_date)})
         _notify(
             db, loan.borrower_id,
             title="Payment overdue",
@@ -174,7 +175,7 @@ def _flag_expired_offers(db, now) -> None:
     for template in templates:
         template.expiry_notified = True
         _audit(db, "offer_template_expired", resource_type="lender_offer_template",
-               resource_id=template.id, details={"valid_until": str(template.valid_until)})
+               resource_id=template.id, details={"valid_until": safe_isoformat(template.valid_until)})
         _notify(
             db, template.lender_id,
             title="Standing offer expired",
@@ -460,7 +461,7 @@ def _expire_stale_applications(db, now) -> None:
     for app in stale:
         app.status = "expired"
         _audit(db, "application_expired", resource_type="loan_application", resource_id=app.id,
-               details={"valid_until": str(app.valid_until)})
+               details={"valid_until": safe_isoformat(app.valid_until)})
         _notify(
             db, app.borrower_id,
             title="Loan request expired",

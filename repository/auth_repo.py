@@ -17,8 +17,8 @@ from sqlalchemy.orm import Session
 from comms_sdk import CommsSDK
 
 from config import JWT_SECRET, EGOSMS_USERNAME, EGOSMS_APIKEY, SMTP_USERNAME, SMTP_PASSWORD, SMTP_SERVER, SMTP_PORT
-from database.tables import User, OTP, LoginAttempt, AuditLog, SignupDraft, Notification, PlatformSetting, LoginSession
-from helpers import generateUniqueId, normalizePhoneNumber, generateReferralCode
+from database.tables import User, OTP, LoginAttempt, AuditLog, SignupDraft, Notification, PlatformSetting, LoginSession, WebPushSubscription
+from helpers import generateUniqueId, normalizePhoneNumber, generateReferralCode, safe_isoformat
 from logging_module import logger
 from repository.models import AuthUser
 
@@ -242,6 +242,23 @@ def _notify(db: Session, user_id: str, title: str, message: str,
             send_expo_push(user.push_token, title, message, data, urgent=type in URGENT_NOTIFICATION_TYPES)
     except Exception as e:
         logger.error(f"Push notify failed: {e}")
+
+    try:
+        from pywebpush import WebPushException
+        from utils.webpush import send_web_push
+        subs = db.query(WebPushSubscription).filter(WebPushSubscription.user_id == user_id).all()
+        for sub in subs:
+            try:
+                send_web_push(
+                    sub.endpoint, sub.p256dh, sub.auth, title, message, data,
+                    urgent=type in URGENT_NOTIFICATION_TYPES,
+                )
+            except WebPushException:
+                # 404/410 from the push service — the browser revoked or
+                # expired this subscription, so stop targeting it.
+                db.delete(sub)
+    except Exception as e:
+        logger.error(f"Web push notify failed: {e}")
 
 
 def _setting_enabled(db: Session, key: str, default: bool = True) -> bool:
@@ -1777,5 +1794,5 @@ def _user_response(user: User) -> dict:
         "profile_pic": user.profile_pic,
         "credit_score": user.credit_score,
         "bio": user.bio,
-        "created_at": str(user.created_at),
+        "created_at": safe_isoformat(user.created_at),
     }
