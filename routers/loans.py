@@ -45,7 +45,7 @@ def _platform_setting(db: Session, key: str, default: float) -> float:
 
 def _loan_amount_bounds(db: Session) -> tuple[float, float]:
     return (
-        _platform_setting(db, "min_loan_amount", 100000),
+        _platform_setting(db, "min_loan_amount", 1000),
         _platform_setting(db, "max_loan_amount", 50000000),
     )
 
@@ -864,6 +864,20 @@ async def update_offer_template(
         raise HTTPException(status_code=400, detail="Only templates pending review can be edited")
 
     update_dict = data.model_dump(exclude_unset=True)
+
+    # LenderOfferTemplateUpdate's own validator only catches min/max being
+    # invalid relative to EACH OTHER when both are sent together in this
+    # request — it can't see the template's existing persisted value when
+    # only one of the two is being changed. Merge against the current row
+    # here so a partial edit can never leave a stored min >= max.
+    effective_max = update_dict.get("max_amount", template.max_amount)
+    effective_min = update_dict.get("min_amount", template.min_amount)
+    if effective_min >= effective_max:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Min loan amount ({effective_min:,.0f}) must be less than max loan amount ({effective_max:,.0f})",
+        )
+
     for key, val in update_dict.items():
         if key in ("accepted_loan_types", "required_documents"):
             setattr(template, key, json.dumps(val))

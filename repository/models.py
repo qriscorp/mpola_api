@@ -5,7 +5,7 @@ Pydantic request/response models for Mpola API.
 import re
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ─── Auth ──────────────────────────────────────
@@ -211,7 +211,7 @@ class VerifyPhoneOTPModel(BaseModel):
 # ─── Loan Application ─────────────────────────
 
 class LoanApplicationCreate(BaseModel):
-    amount: float = Field(..., ge=100000, le=50000000)
+    amount: float = Field(..., ge=1000, le=50000000)
     duration: int = Field(..., ge=3, le=24)
     loan_type: str  # personal, business, education, agricultural, emergency
     purpose: Optional[str] = None
@@ -222,7 +222,7 @@ class LoanApplicationCreate(BaseModel):
 class LoanApplicationUpdate(BaseModel):
     """Borrower edits their own application — only while it's still
     awaiting_guarantors/pending (see PUT /loans/applications/{id})."""
-    amount: Optional[float] = Field(None, ge=100000, le=50000000)
+    amount: Optional[float] = Field(None, ge=1000, le=50000000)
     duration: Optional[int] = Field(None, ge=3, le=24)
     loan_type: Optional[str] = None
     purpose: Optional[str] = None
@@ -252,7 +252,7 @@ class DocumentUpload(BaseModel):
 
 class LoanOfferCreate(BaseModel):
     application_id: str
-    amount: float = Field(..., ge=100000)
+    amount: float = Field(..., ge=1000)
     interest_rate: float = Field(..., ge=0.1, le=25)
     duration: int = Field(..., ge=1, le=36)
 
@@ -262,7 +262,7 @@ class LoanOfferUpdate(BaseModel):
 
 
 class LenderOfferTemplateCreate(BaseModel):
-    max_amount: float = Field(..., ge=100000)
+    max_amount: float = Field(..., ge=1000)
     min_amount: float = Field(..., ge=0)
     interest_rate: float = Field(..., ge=0.1, le=25)
     max_duration: int = Field(..., ge=1, le=36)
@@ -273,9 +273,18 @@ class LenderOfferTemplateCreate(BaseModel):
     max_concurrent_loans: Optional[int] = None
     is_draft: bool = False
 
+    @model_validator(mode="after")
+    def check_amount_range(self):
+        # Both fields are always present on create (neither is Optional),
+        # so this alone is authoritative here — no template row to merge
+        # against yet, unlike the Update model below.
+        if self.min_amount >= self.max_amount:
+            raise ValueError("Min loan amount must be less than max loan amount")
+        return self
+
 
 class LenderOfferTemplateUpdate(BaseModel):
-    max_amount: Optional[float] = Field(None, ge=100000)
+    max_amount: Optional[float] = Field(None, ge=1000)
     min_amount: Optional[float] = Field(None, ge=0)
     interest_rate: Optional[float] = Field(None, ge=0.1, le=25)
     max_duration: Optional[int] = Field(None, ge=1, le=36)
@@ -284,6 +293,17 @@ class LenderOfferTemplateUpdate(BaseModel):
     description: Optional[str] = None
     valid_until: Optional[datetime] = None
     max_concurrent_loans: Optional[int] = None
+
+    @model_validator(mode="after")
+    def check_amount_range(self):
+        # Only catches the case where both are changed in the same request —
+        # this is a partial update, so if just one of the two is being
+        # edited, only the router (which has the existing template row to
+        # merge against) can know whether the resulting range is still
+        # valid. See update_offer_template in routers/loans.py.
+        if self.min_amount is not None and self.max_amount is not None and self.min_amount >= self.max_amount:
+            raise ValueError("Min loan amount must be less than max loan amount")
+        return self
 
 
 class LenderOfferTemplateExpiryUpdate(BaseModel):
