@@ -244,6 +244,82 @@ async def list_transactions(
     }
 
 
+@router.get("/transactions/{transaction_id}")
+async def get_transaction_detail(
+    transaction_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Everything about a single transaction — platform/provider fee
+    breakdown (from PlatformFeeTransaction, one row per fee-charging
+    transaction) and, for a repayment/disbursement, the linked loan's own
+    terms (via WalletTransaction.loan_id) — for the transaction detail
+    modal. Deposits legitimately have no fee row (no fee on deposits, see
+    utils/fee.py); that's the correct, expected shape, not missing data.
+    """
+    from database.tables import Loan, Repayment
+
+    wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+
+    tx = db.query(WalletTransaction).filter(
+        WalletTransaction.id == transaction_id,
+        WalletTransaction.wallet_id == wallet.id,
+    ).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    fee = db.query(PlatformFeeTransaction).filter(
+        PlatformFeeTransaction.wallet_transaction_id == tx.id
+    ).first()
+
+    loan_info = None
+    if tx.loan_id:
+        loan = db.query(Loan).filter(Loan.id == tx.loan_id).first()
+        if loan:
+            loan_info = {
+                "id": loan.id,
+                "amount": loan.amount,
+                "interest_rate": loan.interest_rate,
+                "duration": loan.duration,
+                "duration_days": loan.duration_days,
+                "status": loan.status,
+                "borrower_name": loan.borrower.full_name if loan.borrower else None,
+                "lender_name": loan.lender_user.full_name if loan.lender_user else None,
+                "total_repayable": loan.total_repayable,
+                "total_paid": loan.total_paid,
+                "paid_instalments": loan.paid_instalments,
+                "total_instalments": loan.total_instalments,
+            }
+
+    repayment_info = None
+    if tx.type == "repayment":
+        rep = db.query(Repayment).filter(Repayment.transaction_id == tx.id).first()
+        if rep:
+            repayment_info = {
+                "instalment_number": rep.instalment_number,
+                "payment_method": rep.payment_method,
+            }
+
+    return {
+        "id": tx.id,
+        "amount": tx.amount,
+        "type": tx.type,
+        "status": tx.status,
+        "description": tx.description,
+        "reference": tx.reference,
+        "counterparty": tx.counterparty,
+        "created_at": safe_isoformat(tx.created_at),
+        "platform_fee": fee.platform_fee if fee else None,
+        "provider_fee": fee.provider_fee if fee else None,
+        "total_fee": fee.total_fee if fee else None,
+        "fee_category": fee.category if fee else None,
+        "loan": loan_info,
+        "repayment": repayment_info,
+    }
+
+
 def _finalize_card_deposit(db: Session, tx: WalletTransaction, wallet: Wallet, user: User) -> None:
     """UPG confirmed this card deposit succeeded — credit the wallet, audit,
     and notify. Shared by the client-poll endpoint below and the scheduler's

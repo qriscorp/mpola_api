@@ -200,6 +200,11 @@ class WalletTransaction(Base, TimestampMixin):
     description = Column(Text, nullable=True)
     reference = Column(String(100), nullable=True)
     counterparty = Column(String(100), nullable=True)
+    # Set for repayment/disbursement transactions so the detail view can show
+    # the loan's own terms alongside the money movement — see GET
+    # /wallet/transactions/{id}. Not a real FK (no ondelete behavior wanted;
+    # a transaction record should outlive the loan row conceptually).
+    loan_id = Column(String(50), nullable=True)
 
     wallet = relationship("Wallet", back_populates="transactions")
 

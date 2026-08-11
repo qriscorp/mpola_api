@@ -1388,6 +1388,7 @@ async def approve_disbursement(
         status="completed",
         description=f"Loan disbursed to {borrower.full_name or borrower.username}",
         counterparty=borrower.username,
+        loan_id=loan.id,
     )
     db.add(lender_tx)
     db.flush()
@@ -1407,6 +1408,7 @@ async def approve_disbursement(
         status="completed",
         description=f"Loan received from {user.full_name or user.username}",
         counterparty=user.username,
+        loan_id=loan.id,
     ))
 
     loan.status = "active"
@@ -1525,6 +1527,7 @@ async def make_repayment(
             status="completed",
             description=f"Loan repayment — instalment #{loan.paid_instalments + 1}",
             counterparty=loan.id,
+            loan_id=loan.id,
         )
         db.add(wallet_tx)
 
@@ -1538,6 +1541,7 @@ async def make_repayment(
             status="completed",
             description=lender_tx_description,
             counterparty=loan.id,
+            loan_id=loan.id,
         )
         db.add(lender_tx)
         db.flush()  # populate tx ids before using them as references below
