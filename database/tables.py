@@ -404,7 +404,10 @@ class LenderOfferTemplate(Base, TimestampMixin):
     max_amount = Column(Float, nullable=False)
     min_amount = Column(Float, nullable=False)
     interest_rate = Column(Float, nullable=False)
-    max_duration = Column(Integer, nullable=False)  # months
+    max_duration = Column(Integer, nullable=True)  # months
+    # Day-based standing offer for "emergency" applications — exactly one of
+    # max_duration/max_duration_days is ever set. See _template_matches.
+    max_duration_days = Column(Integer, nullable=True)
     accepted_loan_types = Column(Text, nullable=True)  # JSON list
     required_documents = Column(Text, nullable=True)  # JSON list
     description = Column(Text, nullable=True)

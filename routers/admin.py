@@ -1282,6 +1282,7 @@ def list_offer_templates(
                 "min_amount": t.min_amount,
                 "interest_rate": t.interest_rate,
                 "max_duration": t.max_duration,
+                "max_duration_days": t.max_duration_days,
                 "accepted_loan_types": json.loads(t.accepted_loan_types) if t.accepted_loan_types else [],
                 "required_documents": json.loads(t.required_documents) if t.required_documents else [],
                 "description": t.description,

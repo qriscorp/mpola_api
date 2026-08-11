@@ -817,6 +817,7 @@ def _offer_template_response(t: LenderOfferTemplate) -> dict:
         "min_amount": t.min_amount,
         "interest_rate": t.interest_rate,
         "max_duration": t.max_duration,
+        "max_duration_days": t.max_duration_days,
         "accepted_loan_types": json.loads(t.accepted_loan_types) if t.accepted_loan_types else [],
         "required_documents": json.loads(t.required_documents) if t.required_documents else [],
         "description": t.description,
@@ -846,6 +847,7 @@ async def create_offer_template(
         min_amount=data.min_amount,
         interest_rate=data.interest_rate,
         max_duration=data.max_duration,
+        max_duration_days=data.max_duration_days,
         accepted_loan_types=json.dumps(data.accepted_loan_types),
         required_documents=json.dumps(data.required_documents),
         description=data.description,
@@ -1043,12 +1045,17 @@ def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanAppli
         return False
     if app.is_frozen:
         return False
-    # Standing templates are configured in months (max_duration) with no
-    # concept of a prorated short-term rate — an emergency (duration_days)
-    # request only ever gets manual offers via POST /loans/offers, never
-    # auto-matched against a template.
+    # A standing offer is either month-based (max_duration) or a day-based
+    # "emergency" offer (max_duration_days) — exactly one is ever set, same
+    # split as LoanApplication/LoanOffer. Only match within the same term
+    # shape; a month-based template never matches an emergency application
+    # and vice versa.
     if app.duration_days is not None:
-        return False
+        if template.max_duration_days is None or app.duration_days > template.max_duration_days:
+            return False
+    else:
+        if template.max_duration is None or app.duration > template.max_duration:
+            return False
     # template.valid_until round-trips through MySQL as a naive datetime even
     # though it's always written as UTC — compare naive-to-naive rather than
     # against an aware `now` (mixing the two raises TypeError).
@@ -1061,8 +1068,6 @@ def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanAppli
     if app.valid_until and app.valid_until < datetime.now(timezone.utc).replace(tzinfo=None):
         return False
     if not (template.min_amount <= app.amount <= template.max_amount):
-        return False
-    if app.duration > template.max_duration:
         return False
     if app.max_interest_rate is not None and template.interest_rate > app.max_interest_rate:
         return False
@@ -1090,9 +1095,9 @@ def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanAppli
 
 
 def _create_offer_from_template(db: Session, app: LoanApplication, template: LenderOfferTemplate) -> LoanOffer:
-    total_interest = app.amount * (template.interest_rate / 100) * app.duration
+    total_interest = _calc_interest(app.amount, template.interest_rate, app.duration, app.duration_days)
     total_repayable = app.amount + total_interest
-    monthly_payment = total_repayable / app.duration
+    monthly_payment = total_repayable if app.duration_days is not None else total_repayable / app.duration
 
     offer = LoanOffer(
         application_id=app.id,
@@ -1100,6 +1105,7 @@ def _create_offer_from_template(db: Session, app: LoanApplication, template: Len
         amount=app.amount,
         interest_rate=template.interest_rate,
         duration=app.duration,
+        duration_days=app.duration_days,
         total_repayable=round(total_repayable, 2),
         monthly_payment=round(monthly_payment, 2),
         required_documents=template.required_documents,
@@ -1113,7 +1119,8 @@ def _create_offer_from_template(db: Session, app: LoanApplication, template: Len
         title="New offer received",
         message=(
             f"{lender.full_name if lender else 'A lender'} auto-offered UGX {app.amount:,.0f} "
-            f"at {template.interest_rate}%/month for {app.duration} months, matching your loan request."
+            f"at {template.interest_rate}%/month for {_duration_label(app.duration, app.duration_days)}, "
+            "matching your loan request."
         ),
         type="loan_offer",
         data={"application_id": app.id},

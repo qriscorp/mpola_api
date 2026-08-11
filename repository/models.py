@@ -297,7 +297,11 @@ class LenderOfferTemplateCreate(BaseModel):
     max_amount: float = Field(..., ge=1000)
     min_amount: float = Field(..., ge=0)
     interest_rate: float = Field(..., ge=0.1, le=25)
-    max_duration: int = Field(..., ge=1, le=36)
+    max_duration: Optional[int] = Field(None, ge=1, le=36)
+    # A day-based standing offer, matched against "emergency" (duration_days)
+    # applications the same way max_duration matches month-based ones —
+    # exactly one of the two term shapes is ever set. See _template_matches.
+    max_duration_days: Optional[int] = Field(None, ge=1, le=29)
     accepted_loan_types: list[str] = Field(default_factory=list)
     required_documents: list[str] = Field(default_factory=list)
     description: Optional[str] = None
@@ -314,17 +318,34 @@ class LenderOfferTemplateCreate(BaseModel):
             raise ValueError("Min loan amount must be less than max loan amount")
         return self
 
+    @model_validator(mode="after")
+    def check_duration(self):
+        if (self.max_duration is None) == (self.max_duration_days is None):
+            raise ValueError("Set exactly one of max_duration (months) or max_duration_days (1-29 days)")
+        return self
+
 
 class LenderOfferTemplateUpdate(BaseModel):
     max_amount: Optional[float] = Field(None, ge=1000)
     min_amount: Optional[float] = Field(None, ge=0)
     interest_rate: Optional[float] = Field(None, ge=0.1, le=25)
     max_duration: Optional[int] = Field(None, ge=1, le=36)
+    max_duration_days: Optional[int] = Field(None, ge=1, le=29)
     accepted_loan_types: Optional[list[str]] = None
     required_documents: Optional[list[str]] = None
     description: Optional[str] = None
     valid_until: Optional[datetime] = None
     max_concurrent_loans: Optional[int] = None
+
+    @model_validator(mode="after")
+    def check_duration_switch(self):
+        # Partial-update friendly, like LoanApplicationUpdate — only rejects
+        # when BOTH are sent non-None in the same request. Switching term
+        # shape requires the caller to explicitly null out the other one
+        # (the frontend always sends both together when switching modes).
+        if self.max_duration is not None and self.max_duration_days is not None:
+            raise ValueError("Set at most one of max_duration or max_duration_days in a single update")
+        return self
 
     @model_validator(mode="after")
     def check_amount_range(self):
