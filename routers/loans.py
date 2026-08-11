@@ -1673,6 +1673,15 @@ def _app_response(app: LoanApplication, db: Session = None, include_offers: bool
         } if app.borrower else None,
         "offers_count": len(app.offers),
         "pending_offers_count": sum(1 for o in app.offers if o.status == "pending"),
+        # Once status is "funded", that alone doesn't say whether the lender
+        # has actually released the money yet — check the real Loan row:
+        # "pending_disbursement" means accepted but not yet disbursed,
+        # anything past that (active, completed, ...) means it really did
+        # get funded. Lets the frontend show "Awaiting Disbursement" vs the
+        # real "Funded" instead of treating acceptance itself as funding.
+        "loan_id": app.loan.id if app.loan else None,
+        "loan_status": app.loan.status if app.loan else None,
+        "loan_disbursed_at": safe_isoformat(app.loan.disbursed_at) if app.loan else None,
         "guarantors": [
             {
                 "id": g.id,
