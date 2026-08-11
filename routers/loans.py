@@ -1385,6 +1385,7 @@ async def approve_disbursement(
         wallet_id=lender_wallet.id,
         amount=loan.amount,
         type="disbursement",
+        direction="debit",
         status="completed",
         description=f"Loan disbursed to {borrower.full_name or borrower.username}",
         counterparty=borrower.username,
@@ -1405,6 +1406,7 @@ async def approve_disbursement(
         wallet_id=borrower_wallet.id,
         amount=loan.amount,
         type="disbursement",
+        direction="credit",
         status="completed",
         description=f"Loan received from {user.full_name or user.username}",
         counterparty=user.username,
@@ -1524,6 +1526,7 @@ async def make_repayment(
             wallet_id=wallet.id,
             amount=data.amount,
             type="repayment",
+            direction="debit",
             status="completed",
             description=f"Loan repayment — instalment #{loan.paid_instalments + 1}",
             counterparty=loan.id,
@@ -1538,6 +1541,7 @@ async def make_repayment(
             wallet_id=lender_wallet.id,
             amount=lender_credit,
             type="repayment",
+            direction="credit",
             status="completed",
             description=lender_tx_description,
             counterparty=loan.id,
@@ -1546,6 +1550,7 @@ async def make_repayment(
         db.add(lender_tx)
         db.flush()  # populate tx ids before using them as references below
         repayment.transaction_id = wallet_tx.id
+        repayment.lender_transaction_id = lender_tx.id
 
         db.add(PlatformFeeTransaction(
             user_id=user.id,
@@ -1680,6 +1685,38 @@ async def get_repayment_receipt(
         content=pdf_bytes,
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="mpola-receipt-{repayment.id}.pdf"'},
+    )
+
+
+@router.get("/{loan_id}/disbursement-receipt")
+async def get_disbursement_receipt(
+    loan_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Real PDF receipt for a loan's disbursement — borrower or lender on the loan only."""
+    loan = db.query(Loan).filter(Loan.id == loan_id).first()
+    if not loan or user.id not in (loan.borrower_id, loan.lender_id):
+        raise HTTPException(status_code=404, detail="Loan not found")
+    if not loan.disbursed_at:
+        raise HTTPException(status_code=400, detail="This loan hasn't been disbursed yet")
+
+    from utils.receipts import build_disbursement_receipt_pdf
+
+    pdf_bytes = build_disbursement_receipt_pdf(
+        receipt_id=loan.id,
+        borrower_name=loan.borrower.full_name or loan.borrower.username,
+        lender_name=loan.lender_user.full_name or loan.lender_user.username,
+        loan_reference=loan.application.reference_number if loan.application else loan.id[:10],
+        amount=loan.amount,
+        platform_fee=calc_platform_fee(loan.amount),
+        disbursed_at=str(loan.disbursed_at),
+    )
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="mpola-disbursement-{loan.id}.pdf"'},
     )
 
 

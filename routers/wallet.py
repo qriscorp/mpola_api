@@ -6,6 +6,7 @@ import hmac
 import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from config import BASE_URL
@@ -111,6 +112,7 @@ async def deposit(
         wallet_id=wallet.id,
         amount=data.amount,
         type="deposit",
+        direction="credit",
         status="completed",
         description=f"Mobile money deposit ({carrier}) from {phone}",
         reference=UPGClient.transaction_id(resp) or generateUniqueId(15),
@@ -172,6 +174,7 @@ async def withdraw(
         wallet_id=wallet.id,
         amount=data.amount,
         type="withdrawal",
+        direction="debit",
         status="completed",
         description=f"Withdrawal ({carrier}) to {phone}",
         reference=UPGClient.transaction_id(resp) or generateUniqueId(15),
@@ -233,6 +236,7 @@ async def list_transactions(
                 "id": tx.id,
                 "amount": tx.amount,
                 "type": tx.type,
+                "direction": tx.direction,
                 "status": tx.status,
                 "description": tx.description,
                 "reference": tx.reference,
@@ -295,9 +299,12 @@ async def get_transaction_detail(
 
     repayment_info = None
     if tx.type == "repayment":
-        rep = db.query(Repayment).filter(Repayment.transaction_id == tx.id).first()
+        rep = db.query(Repayment).filter(
+            or_(Repayment.transaction_id == tx.id, Repayment.lender_transaction_id == tx.id)
+        ).first()
         if rep:
             repayment_info = {
+                "id": rep.id,
                 "instalment_number": rep.instalment_number,
                 "payment_method": rep.payment_method,
             }
@@ -306,6 +313,7 @@ async def get_transaction_detail(
         "id": tx.id,
         "amount": tx.amount,
         "type": tx.type,
+        "direction": tx.direction,
         "status": tx.status,
         "description": tx.description,
         "reference": tx.reference,
@@ -459,6 +467,7 @@ async def initiate_card_deposit(
         wallet_id=wallet.id,
         amount=data.amount,
         type="deposit",
+        direction="credit",
         status="pending",
         description="Card deposit (Flutterwave) — pending",
     )
@@ -654,6 +663,7 @@ async def initiate_bank_withdraw(
         wallet_id=wallet.id,
         amount=data.amount,
         type="withdrawal",
+        direction="debit",
         status="pending",
         description=f"Bank transfer to {data.beneficiary_name}",
         reference=reference,

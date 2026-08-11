@@ -1218,6 +1218,7 @@ def adjust_wallet_balance(
         wallet_id=wallet.id,
         amount=abs(data.amount),
         type="admin_credit" if is_credit else "admin_debit",
+        direction="credit" if is_credit else "debit",
         status="completed",
         description=f"Balance adjustment by {admin.username}: {data.reason}",
         counterparty=admin.username,

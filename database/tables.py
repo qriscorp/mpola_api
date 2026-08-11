@@ -196,6 +196,12 @@ class WalletTransaction(Base, TimestampMixin):
     wallet_id = Column(String(50), ForeignKey("wallets.id", ondelete="CASCADE"), nullable=False)
     amount = Column(Float, nullable=False)
     type = Column(String(30), nullable=False)  # deposit, withdrawal, repayment, disbursement, top_up
+    # "repayment"/"disbursement" are wallet-to-wallet — the same `type` is
+    # used on both the sender's and receiver's row, so `type` alone can't
+    # tell a debit from a credit for those. This is the explicit signal the
+    # UI uses for the +/- sign and color, set once at creation and never
+    # inferred from `type` or `amount` (which is always stored positive).
+    direction = Column(String(10), nullable=True)  # credit or debit
     status = Column(String(20), default="completed")  # pending, completed, failed
     description = Column(Text, nullable=True)
     reference = Column(String(100), nullable=True)
@@ -476,7 +482,11 @@ class Repayment(Base, TimestampMixin):
     instalment_number = Column(Integer, nullable=False)
     status = Column(String(20), default="completed")  # completed, pending, late
     payment_method = Column(String(30), nullable=True)  # wallet, mobile_money
-    transaction_id = Column(String(100), nullable=True)
+    transaction_id = Column(String(100), nullable=True)  # the borrower's debit WalletTransaction
+    # The lender's credit WalletTransaction for this same repayment — needed
+    # so the lender's own transaction-detail view can look this repayment up
+    # too (transaction_id alone only resolves from the borrower's side).
+    lender_transaction_id = Column(String(100), nullable=True)
 
     loan = relationship("Loan", back_populates="repayments")
 
