@@ -694,12 +694,16 @@ async def respond_to_offer(
             )
 
         # Disbursement is a separate, lender-approved step (see
-        # approve_disbursement below) — only check that both parties have a
-        # wallet *set up* here; the lender's balance is checked at approval
-        # time instead, since it can change between accept and approval.
+        # approve_disbursement below), which re-checks the lender's own
+        # wallet setup and balance there — not here. Whether the lender has
+        # a wallet set up is entirely outside the borrower's control, so
+        # accepting must never block on it; the loan simply waits in
+        # pending_disbursement until the lender sets up their wallet and
+        # approves. Only the borrower's own wallet — something they can
+        # actually act on — is checked at accept time. (lender_wallet is
+        # still looked up below, read-only, to warn the lender in their
+        # notification if their balance looks short.)
         lender_wallet = db.query(Wallet).filter(Wallet.user_id == offer.lender_id).first()
-        if not lender_wallet or not lender_wallet.is_wallet_setup:
-            raise HTTPException(status_code=400, detail="Lender has not set up their wallet yet — cannot disburse this loan")
 
         borrower_wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
         if not borrower_wallet or not borrower_wallet.is_wallet_setup:
@@ -729,11 +733,15 @@ async def respond_to_offer(
 
         platform_fee = calc_platform_fee(offer.amount)
         total_needed = offer.amount + platform_fee
-        shortfall_note = (
-            f" Your wallet balance looks insufficient (need UGX {total_needed:,.0f}, "
-            f"including the platform fee) — deposit before approving."
-            if lender_wallet.balance < total_needed else ""
-        )
+        if not lender_wallet or not lender_wallet.is_wallet_setup:
+            shortfall_note = " Set up your Mpola wallet before you can approve it."
+        elif lender_wallet.balance < total_needed:
+            shortfall_note = (
+                f" Your wallet balance looks insufficient (need UGX {total_needed:,.0f}, "
+                f"including the platform fee) — deposit before approving."
+            )
+        else:
+            shortfall_note = ""
         _notify(
             db, offer.lender_id,
             title="Loan needs your approval to disburse",
