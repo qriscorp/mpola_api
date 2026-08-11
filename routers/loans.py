@@ -51,6 +51,22 @@ def _max_interest_rate(db: Session) -> float:
     return _platform_setting(db, "max_interest_rate", 10)
 
 
+def _calc_interest(amount: float, rate: float, duration: int | None, duration_days: int | None) -> float:
+    """Simple interest, rate is %/month. A standard loan multiplies by the
+    month count directly; a short-term "emergency" loan (duration_days set)
+    prorates the same monthly rate down to the actual number of days —
+    e.g. a 10%/month rate charges ~2.3% on a 7-day loan, not a full 10%."""
+    if duration_days is not None:
+        return amount * (rate / 100) * (duration_days / 30)
+    return amount * (rate / 100) * duration
+
+
+def _duration_label(duration: int | None, duration_days: int | None) -> str:
+    if duration_days is not None:
+        return f"{duration_days} day{'s' if duration_days != 1 else ''}"
+    return f"{duration} month{'s' if duration != 1 else ''}"
+
+
 # ═══════════════════════════════════════════════
 #  LOAN APPLICATIONS (Borrower)
 # ═══════════════════════════════════════════════
@@ -78,17 +94,21 @@ async def create_application(
     if valid_until and valid_until <= datetime.now(timezone.utc).replace(tzinfo=None):
         raise HTTPException(status_code=400, detail="Valid-until date must be in the future")
 
-    # Calculate estimated monthly payment (simple interest, rate is % per month)
+    # Calculate estimated payment (simple interest, rate is % per month)
     rate = 3.0  # default platform rate — a display estimate only; real lender offers set their own
-    total_interest = data.amount * (rate / 100) * data.duration
+    total_interest = _calc_interest(data.amount, rate, data.duration, data.duration_days)
     total_repayable = data.amount + total_interest
-    monthly_payment = total_repayable / data.duration
+    # For an emergency (duration_days) loan this is the single lump-sum
+    # repayment, not a monthly instalment — same field, different meaning,
+    # see Loan.monthly_payment.
+    monthly_payment = total_repayable if data.duration_days is not None else total_repayable / data.duration
 
     app = LoanApplication(
         borrower_id=user.id,
         reference_number=generateReferenceNumber(),
         amount=data.amount,
         duration=data.duration,
+        duration_days=data.duration_days,
         loan_type=data.loan_type,
         purpose=data.purpose,
         interest_rate=rate,
@@ -323,7 +343,7 @@ async def update_application(
 
     terms_changed = any(
         k in update_dict and update_dict[k] != getattr(app, k)
-        for k in ("amount", "duration", "loan_type")
+        for k in ("amount", "duration", "duration_days", "loan_type")
     )
 
     for key, val in update_dict.items():
@@ -331,10 +351,12 @@ async def update_application(
 
     if terms_changed:
         rate = app.interest_rate or 3.0
-        total_interest = app.amount * (rate / 100) * app.duration
+        total_interest = _calc_interest(app.amount, rate, app.duration, app.duration_days)
         total_repayable = app.amount + total_interest
         app.total_repayable = round(total_repayable, 2)
-        app.monthly_payment = round(total_repayable / app.duration, 2)
+        app.monthly_payment = round(
+            total_repayable if app.duration_days is not None else total_repayable / app.duration, 2
+        )
 
         # The guard above already ruled out any "accepted" guarantor, so
         # everyone left is "pending" (or "declined", who's moot either way)
@@ -347,7 +369,7 @@ async def update_application(
                     title="Loan request updated",
                     message=(
                         f"{user.full_name or user.username} updated the loan request you're being asked "
-                        f"to guarantee — it's now UGX {app.amount:,.0f} for {app.duration} months."
+                        f"to guarantee — it's now UGX {app.amount:,.0f} for {_duration_label(app.duration, app.duration_days)}."
                     ),
                     type="guarantor_invite_received",
                     data={"application_id": app.id},
@@ -524,9 +546,9 @@ async def make_offer(
     if app.max_interest_rate is not None and data.interest_rate > app.max_interest_rate:
         raise HTTPException(status_code=400, detail=f"Borrower capped this request at {app.max_interest_rate}%/month")
 
-    total_interest = data.amount * (data.interest_rate / 100) * data.duration
+    total_interest = _calc_interest(data.amount, data.interest_rate, data.duration, data.duration_days)
     total_repayable = data.amount + total_interest
-    monthly_payment = total_repayable / data.duration
+    monthly_payment = total_repayable if data.duration_days is not None else total_repayable / data.duration
 
     offer = LoanOffer(
         application_id=data.application_id,
@@ -534,6 +556,7 @@ async def make_offer(
         amount=data.amount,
         interest_rate=data.interest_rate,
         duration=data.duration,
+        duration_days=data.duration_days,
         total_repayable=round(total_repayable, 2),
         monthly_payment=round(monthly_payment, 2),
         required_documents=json.dumps(data.required_documents) if data.required_documents else None,
@@ -544,7 +567,7 @@ async def make_offer(
         title="New offer received",
         message=(
             f"{user.full_name or user.username} offered UGX {data.amount:,.0f} "
-            f"at {data.interest_rate}%/month for {data.duration} months on your loan request."
+            f"at {data.interest_rate}%/month for {_duration_label(data.duration, data.duration_days)} on your loan request."
         ),
         type="loan_offer",
         data={"application_id": app.id},
@@ -722,9 +745,13 @@ async def respond_to_offer(
             amount=offer.amount,
             interest_rate=offer.interest_rate,
             duration=offer.duration,
+            duration_days=offer.duration_days,
             monthly_payment=offer.monthly_payment,
             total_repayable=offer.total_repayable,
-            total_instalments=offer.duration,
+            # An emergency (duration_days) loan is a single bullet repayment
+            # — one instalment, due duration_days after disbursement — not a
+            # monthly instalment count.
+            total_instalments=1 if offer.duration_days is not None else offer.duration,
             status="pending_disbursement",
             required_documents=offer.required_documents,
         )
@@ -1015,6 +1042,12 @@ def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanAppli
     if template.lender_id == app.borrower_id:
         return False
     if app.is_frozen:
+        return False
+    # Standing templates are configured in months (max_duration) with no
+    # concept of a prorated short-term rate — an emergency (duration_days)
+    # request only ever gets manual offers via POST /loans/offers, never
+    # auto-matched against a template.
+    if app.duration_days is not None:
         return False
     # template.valid_until round-trips through MySQL as a naive datetime even
     # though it's always written as UTC — compare naive-to-naive rather than
@@ -1378,7 +1411,9 @@ async def approve_disbursement(
 
     loan.status = "active"
     loan.disbursed_at = datetime.now(timezone.utc)
-    loan.next_payment_date = datetime.now(timezone.utc) + timedelta(days=30)
+    loan.next_payment_date = datetime.now(timezone.utc) + timedelta(
+        days=loan.duration_days if loan.duration_days is not None else 30
+    )
     loan.next_payment_amount = loan.monthly_payment
 
     _notify(
@@ -1654,6 +1689,7 @@ def _app_response(app: LoanApplication, db: Session = None, include_offers: bool
         "reference_number": app.reference_number,
         "amount": app.amount,
         "duration": app.duration,
+        "duration_days": app.duration_days,
         "loan_type": app.loan_type,
         "purpose": app.purpose,
         "status": app.status,
@@ -1713,6 +1749,7 @@ def _offer_response(offer: LoanOffer, db: Session) -> dict:
         "amount": offer.amount,
         "interest_rate": offer.interest_rate,
         "duration": offer.duration,
+        "duration_days": offer.duration_days,
         "monthly_payment": offer.monthly_payment,
         "total_repayable": offer.total_repayable,
         "status": offer.status,
@@ -1734,6 +1771,7 @@ def _loan_response(loan: Loan, db: Session = None, include_repayments: bool = Fa
         "amount": loan.amount,
         "interest_rate": loan.interest_rate,
         "duration": loan.duration,
+        "duration_days": loan.duration_days,
         "monthly_payment": loan.monthly_payment,
         "total_repayable": loan.total_repayable,
         "total_paid": loan.total_paid,

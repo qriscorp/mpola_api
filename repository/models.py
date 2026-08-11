@@ -212,11 +212,22 @@ class VerifyPhoneOTPModel(BaseModel):
 
 class LoanApplicationCreate(BaseModel):
     amount: float = Field(..., ge=1000, le=50000000)
-    duration: int = Field(..., ge=1, le=24)
+    # Exactly one of these two — duration (months, multi-instalment) for a
+    # standard loan, duration_days (single bullet repayment, interest
+    # prorated from the monthly rate) for a short-term "emergency" loan.
+    # See check_duration below and routers/loans.py.
+    duration: Optional[int] = Field(None, ge=1, le=24)
+    duration_days: Optional[int] = Field(None, ge=1, le=29)
     loan_type: str  # personal, business, education, agricultural, emergency
     purpose: Optional[str] = None
     max_interest_rate: Optional[float] = Field(None, ge=0.1, le=25)  # borrower's optional cap, %/month
     valid_until: Optional[datetime] = None  # borrower's optional urgency cap — None means it never expires
+
+    @model_validator(mode="after")
+    def check_duration(self):
+        if (self.duration is None) == (self.duration_days is None):
+            raise ValueError("Provide exactly one of duration (months) or duration_days (1-29, emergency loan)")
+        return self
 
 
 class LoanApplicationUpdate(BaseModel):
@@ -224,10 +235,20 @@ class LoanApplicationUpdate(BaseModel):
     awaiting_guarantors/pending (see PUT /loans/applications/{id})."""
     amount: Optional[float] = Field(None, ge=1000, le=50000000)
     duration: Optional[int] = Field(None, ge=1, le=24)
+    duration_days: Optional[int] = Field(None, ge=1, le=29)
     loan_type: Optional[str] = None
     purpose: Optional[str] = None
     max_interest_rate: Optional[float] = Field(None, ge=0.1, le=25)
     valid_until: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def check_duration(self):
+        # Both are Optional here (partial update) — only reject the
+        # nonsensical case where a caller tries to set both in one request;
+        # setting neither (unchanged) or just one (switching modes) is fine.
+        if self.duration is not None and self.duration_days is not None:
+            raise ValueError("Provide at most one of duration (months) or duration_days")
+        return self
 
 
 class GuarantorAttach(BaseModel):
@@ -254,8 +275,18 @@ class LoanOfferCreate(BaseModel):
     application_id: str
     amount: float = Field(..., ge=1000)
     interest_rate: float = Field(..., ge=0.1, le=25)
-    duration: int = Field(..., ge=1, le=36)
+    # Exactly one — see LoanApplicationCreate.check_duration for why. A
+    # lender can counter an emergency (days) request with a month-based
+    # offer or vice versa; the two don't have to match the application's own.
+    duration: Optional[int] = Field(None, ge=1, le=36)
+    duration_days: Optional[int] = Field(None, ge=1, le=29)
     required_documents: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def check_duration(self):
+        if (self.duration is None) == (self.duration_days is None):
+            raise ValueError("Provide exactly one of duration (months) or duration_days (1-29)")
+        return self
 
 
 class LoanOfferUpdate(BaseModel):

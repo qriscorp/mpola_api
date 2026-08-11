@@ -233,7 +233,8 @@ class LoanApplication(Base, TimestampMixin):
     borrower_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     reference_number = Column(String(50), unique=True, nullable=False)
     amount = Column(Float, nullable=False)
-    duration = Column(Integer, nullable=False)  # months
+    duration = Column(Integer, nullable=True)  # months — exactly one of duration/duration_days is set
+    duration_days = Column(Integer, nullable=True)  # short-term "emergency" loan (1-29 days), single bullet repayment
     loan_type = Column(String(30), nullable=False)  # personal, business, education, agricultural, emergency
     purpose = Column(Text, nullable=True)
     status = Column(String(30), default="pending")  # awaiting_guarantors, pending, approved, rejected, funded, completed, defaulted, expired
@@ -347,7 +348,8 @@ class LoanOffer(Base, TimestampMixin):
     lender_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     amount = Column(Float, nullable=False)
     interest_rate = Column(Float, nullable=False)
-    duration = Column(Integer, nullable=False)  # months
+    duration = Column(Integer, nullable=True)  # months — exactly one of duration/duration_days is set
+    duration_days = Column(Integer, nullable=True)  # short-term "emergency" offer (1-29 days), single bullet repayment
     monthly_payment = Column(Float, nullable=True)
     total_repayable = Column(Float, nullable=True)
     status = Column(String(20), default="pending")  # pending, accepted, declined, expired
@@ -426,7 +428,8 @@ class Loan(Base, TimestampMixin):
     lender_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     amount = Column(Float, nullable=False)
     interest_rate = Column(Float, nullable=False)
-    duration = Column(Integer, nullable=False)
+    duration = Column(Integer, nullable=True)  # months — exactly one of duration/duration_days is set
+    duration_days = Column(Integer, nullable=True)  # short-term "emergency" loan (1-29 days), single bullet repayment
     monthly_payment = Column(Float, nullable=False)
     total_repayable = Column(Float, nullable=False)
     total_paid = Column(Float, default=0.0)

@@ -775,6 +775,7 @@ def list_applications(
                 "borrower_name": a.borrower.full_name if a.borrower else None,
                 "amount": a.amount,
                 "duration": a.duration,
+                "duration_days": a.duration_days,
                 "loan_type": a.loan_type,
                 "status": a.status,
                 "loan_status": a.loan.status if a.loan else None,
