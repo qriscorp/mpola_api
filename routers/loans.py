@@ -734,6 +734,9 @@ async def respond_to_offer(
 
         offer.status = "accepted"
         app.status = "funded"
+        app.interest_rate = offer.interest_rate
+        app.total_repayable = offer.total_repayable
+        app.monthly_payment = offer.monthly_payment
 
         # Loan starts pending_disbursement — no money moves and no
         # next_payment_date/disbursed_at until the lender approves via
