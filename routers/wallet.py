@@ -21,7 +21,7 @@ from repository.models import (
     WalletBankWithdrawInitiateModel,
 )
 from helpers import generateUniqueId, safe_isoformat
-from utils.upg_client import UPGClient, _detect_carrier
+from utils.upg_client import UPGClient, _detect_carrier, _normalize_phone
 from utils.fee import calc_mobile_money_withdrawal_charges, calc_bank_withdrawal_charges
 
 router = APIRouter(prefix="/wallet", tags=["Wallet"])
@@ -92,7 +92,7 @@ async def deposit(
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
 
-    phone = data.phone_number or user.phone_number
+    phone = _normalize_phone(data.phone_number or user.phone_number)
     if not phone:
         raise HTTPException(status_code=400, detail="Phone number required for deposit")
 
@@ -148,7 +148,8 @@ async def withdraw(
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
 
-    carrier = (data.carrier or _detect_carrier(data.phone_number)).upper()
+    phone = _normalize_phone(data.phone_number)
+    carrier = (data.carrier or _detect_carrier(phone)).upper()
     charges = calc_mobile_money_withdrawal_charges(data.amount, carrier)
     total_debit = data.amount + charges["total_fee"]
 
@@ -159,7 +160,7 @@ async def withdraw(
         )
 
     try:
-        resp = UPGClient().disburse(amount=data.amount, phone=data.phone_number, carrier=carrier)
+        resp = UPGClient().disburse(amount=data.amount, phone=phone, carrier=carrier)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Payment gateway error: {e}")
 
@@ -172,9 +173,9 @@ async def withdraw(
         amount=data.amount,
         type="withdrawal",
         status="completed",
-        description=f"Withdrawal ({carrier}) to {data.phone_number}",
+        description=f"Withdrawal ({carrier}) to {phone}",
         reference=UPGClient.transaction_id(resp) or generateUniqueId(15),
-        counterparty=data.phone_number,
+        counterparty=phone,
     )
     db.add(tx)
     db.flush()
@@ -187,11 +188,11 @@ async def withdraw(
         total_fee=charges["total_fee"],
     ))
     _audit(db, "wallet_withdrawal", username=user.username, user_id=user.id,
-           resource_type="wallet", details={"amount": data.amount, "to": data.phone_number, "carrier": carrier, "fee": charges["total_fee"]})
+           resource_type="wallet", details={"amount": data.amount, "to": phone, "carrier": carrier, "fee": charges["total_fee"]})
     _notify(
         db, user.id,
         title="Withdrawal successful",
-        message=f"UGX {data.amount:,.0f} was sent to {data.phone_number} (UGX {charges['total_fee']:,.0f} fee charged).",
+        message=f"UGX {data.amount:,.0f} was sent to {phone} (UGX {charges['total_fee']:,.0f} fee charged).",
         type="payment",
     )
     db.commit()

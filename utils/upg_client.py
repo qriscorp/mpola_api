@@ -21,6 +21,24 @@ UPG_API_KEY = os.getenv("UPG_API_KEY")
 UPG_PROJECT_ID = os.getenv("UPG_PROJECT_ID", "mpola")
 
 
+def _normalize_phone(phone: str) -> str:
+    """Normalize any reasonable Ugandan phone input (+256..., 256...,
+    07..., or a bare 9-digit 7XXXXXXXX) to local 0XXXXXXXXX form — the
+    format UPG's underlying provider actually accepts for mobile money
+    collect/disburse. Anything else comes back as "Invalid Customer
+    Number" even though the number itself is valid."""
+    if not phone:
+        return phone
+    p = phone.strip().replace(" ", "").replace("-", "")
+    if p.startswith("+"):
+        p = p[1:]
+    if p.startswith("256"):
+        p = "0" + p[3:]
+    if len(p) == 9 and p.isdigit() and p.startswith("7"):
+        p = "0" + p
+    return p
+
+
 def _detect_carrier(phone: str) -> str:
     """Auto-detect MTN or AIRTEL from Ugandan phone number prefix."""
     p = phone.strip()
