@@ -339,6 +339,15 @@ class WalletCardDepositInitiateModel(BaseModel):
     redirect_url: str
 
 
+class WalletCardDepositConfirmModel(BaseModel):
+    """Shape of UPG's server-to-server webhook payload for a card deposit —
+    see unified_payment_gateway app/api/v1/webhooks.py's _handle_charge_webhook."""
+    request_reference: str
+    amount: float
+    provider_ref: str
+    status: str  # "success" or "failed"
+
+
 class WalletBankWithdrawInitiateModel(BaseModel):
     amount: float = Field(..., ge=1000)
     account_bank: str

@@ -2,9 +2,13 @@
 Wallet router — balance, transactions, deposit, withdraw.
 """
 
+import hmac
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from config import BASE_URL
 from database.tables import User, Wallet, WalletTransaction, PlatformFeeTransaction
 from repository.auth_repo import get_password_hash, verify_password, _audit, _notify
 from repository.dependencies import get_db, current_active_user
@@ -13,6 +17,7 @@ from repository.models import (
     WalletDepositModel,
     WalletWithdrawModel,
     WalletCardDepositInitiateModel,
+    WalletCardDepositConfirmModel,
     WalletBankWithdrawInitiateModel,
 )
 from helpers import generateUniqueId, safe_isoformat
@@ -20,6 +25,10 @@ from utils.upg_client import UPGClient, _detect_carrier
 from utils.fee import calc_mobile_money_withdrawal_charges, calc_bank_withdrawal_charges
 
 router = APIRouter(prefix="/wallet", tags=["Wallet"])
+
+# Verifies inbound /deposit/card/confirm webhook calls from UPG — see that
+# route below and the CARD_CONFIRM_SECRET comment in .env.
+CARD_CONFIRM_SECRET = os.getenv("CARD_CONFIRM_SECRET", "")
 
 
 @router.get("/")
@@ -352,13 +361,36 @@ async def initiate_card_deposit(
     user: User = Depends(current_active_user),
 ):
     """Start a card deposit — returns a hosted Flutterwave checkout URL.
-    The transaction stays 'pending' until /deposit/card/status/{reference} confirms it.
+    Finalizes the instant UPG's webhook confirms it (see /deposit/card/confirm
+    below); /deposit/card/status/{reference} client-polling and the
+    scheduler's reconciliation job remain as a fallback if that webhook is
+    ever delayed or fails to deliver.
     """
     wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
     if not user.email:
         raise HTTPException(status_code=400, detail="A verified email is required for card deposits")
+
+    # Created (and its id chosen) before calling UPG so the id can double as
+    # the checkout's idempotency key — UPG echoes that back as
+    # request_reference on the confirm webhook, which is how that webhook
+    # finds this exact row (see /deposit/card/confirm below).
+    tx_id = generateUniqueId()
+    tx = WalletTransaction(
+        id=tx_id,
+        wallet_id=wallet.id,
+        amount=data.amount,
+        type="deposit",
+        status="pending",
+        description="Card deposit (Flutterwave) — pending",
+    )
+    db.add(tx)
+    db.commit()
+
+    callback_url = None
+    if BASE_URL and CARD_CONFIRM_SECRET:
+        callback_url = f"{BASE_URL}/wallet/deposit/card/confirm?secret={CARD_CONFIRM_SECRET}"
 
     try:
         resp = UPGClient().checkout(
@@ -367,29 +399,78 @@ async def initiate_card_deposit(
             customer_name=user.full_name,
             customer_phone=user.phone_number,
             redirect_url=data.redirect_url,
+            callback_url=callback_url,
+            idempotency_key=tx_id,
         )
     except Exception as e:
+        tx.status = "failed"
+        db.commit()
         raise HTTPException(status_code=502, detail=f"Payment gateway error: {e}")
 
     reference = resp.get("transaction_id")
     checkout_url = resp.get("checkout_url")
     if not reference or not checkout_url:
+        tx.status = "failed"
+        db.commit()
         raise HTTPException(status_code=502, detail="Payment gateway did not return a checkout link")
 
-    tx = WalletTransaction(
-        wallet_id=wallet.id,
-        amount=data.amount,
-        type="deposit",
-        status="pending",
-        description="Card deposit (Flutterwave)",
-        reference=reference,
-    )
-    db.add(tx)
+    tx.reference = reference
+    tx.description = "Card deposit (Flutterwave)"
     _audit(db, "wallet_card_deposit_initiated", username=user.username, user_id=user.id,
            resource_type="wallet", details={"amount": data.amount, "reference": reference})
     db.commit()
 
     return {"checkout_url": checkout_url, "reference": reference}
+
+
+@router.post("/deposit/card/confirm")
+async def confirm_card_deposit(
+    data: WalletCardDepositConfirmModel,
+    secret: str = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Server-to-server confirmation from UPG, called the instant it has
+    independently verified a Flutterwave charge — the fast path alongside
+    client polling and the reconciliation job. UPG's generic webhook
+    delivery only POSTs a JSON body (no custom headers), so the secret is
+    passed as a query param on the callback_url registered at initiate time.
+    """
+    if not CARD_CONFIRM_SECRET or not secret or not hmac.compare_digest(secret, CARD_CONFIRM_SECRET):
+        raise HTTPException(status_code=401, detail="Invalid secret")
+
+    tx = db.query(WalletTransaction).filter(
+        WalletTransaction.id == data.request_reference,
+        WalletTransaction.type == "deposit",
+    ).with_for_update().first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Unknown request_reference")
+
+    # Idempotent — a retried/duplicate webhook, or one that loses a race
+    # against the client's own poll or the reconciliation job, is a no-op.
+    if tx.status != "pending":
+        return {"status": tx.status, "message": "Already processed"}
+
+    wallet = db.query(Wallet).filter(Wallet.id == tx.wallet_id).with_for_update().first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    user = db.query(User).filter(User.id == wallet.user_id).first()
+
+    if data.status != "success":
+        tx.status = "failed"
+        db.commit()
+        return {"status": "failed"}
+
+    # Defense in depth: UPG already verified this amount against Flutterwave
+    # directly; also check it matches what this transaction was created for
+    # before crediting anything.
+    if int(data.amount) != int(tx.amount):
+        tx.status = "failed"
+        db.commit()
+        raise HTTPException(status_code=400, detail="Amount mismatch")
+
+    _finalize_card_deposit(db, tx, wallet, user)
+    db.commit()
+    return {"status": "completed"}
 
 
 @router.get("/deposit/card/status/{reference}")
