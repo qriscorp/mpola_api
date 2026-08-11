@@ -140,7 +140,17 @@ class UPGClient:
         }
         logger.info(f"UPG checkout: amount={amount}, email={customer_email}")
         response = requests.post(url, json=payload, headers=self._headers(idempotency_key), timeout=30)
-        return self._handle_response(response)
+        result = self._handle_response(response)
+        # UPG's /v1/checkout responds with camelCase keys (transactionId,
+        # checkoutUrl) — normalized to snake_case here so every caller can
+        # rely on one consistent shape instead of each guessing the casing.
+        return {
+            "transaction_id": result.get("transactionId") or result.get("transaction_id"),
+            "checkout_url": result.get("checkoutUrl") or result.get("checkout_url"),
+            "status": result.get("status"),
+            "amount": result.get("amount"),
+            "currency": result.get("currency"),
+        }
 
     def payout(
         self,
@@ -201,4 +211,5 @@ class UPGClient:
 
     @staticmethod
     def transaction_id(result: Dict[str, Any]) -> str:
-        return result.get("transaction_id", "")
+        # /v1/collect and /v1/disburse respond with camelCase (transactionId).
+        return result.get("transactionId") or result.get("transaction_id", "")
