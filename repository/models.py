@@ -212,7 +212,7 @@ class VerifyPhoneOTPModel(BaseModel):
 
 class LoanApplicationCreate(BaseModel):
     amount: float = Field(..., ge=1000, le=50000000)
-    duration: int = Field(..., ge=3, le=24)
+    duration: int = Field(..., ge=1, le=24)
     loan_type: str  # personal, business, education, agricultural, emergency
     purpose: Optional[str] = None
     max_interest_rate: Optional[float] = Field(None, ge=0.1, le=25)  # borrower's optional cap, %/month
@@ -223,7 +223,7 @@ class LoanApplicationUpdate(BaseModel):
     """Borrower edits their own application — only while it's still
     awaiting_guarantors/pending (see PUT /loans/applications/{id})."""
     amount: Optional[float] = Field(None, ge=1000, le=50000000)
-    duration: Optional[int] = Field(None, ge=3, le=24)
+    duration: Optional[int] = Field(None, ge=1, le=24)
     loan_type: Optional[str] = None
     purpose: Optional[str] = None
     max_interest_rate: Optional[float] = Field(None, ge=0.1, le=25)
