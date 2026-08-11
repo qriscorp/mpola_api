@@ -777,6 +777,7 @@ def list_applications(
                 "duration": a.duration,
                 "loan_type": a.loan_type,
                 "status": a.status,
+                "loan_status": a.loan.status if a.loan else None,
                 "interest_rate": a.interest_rate,
                 "offer_count": len(a.offers) if a.offers else 0,
                 "is_frozen": a.is_frozen,
