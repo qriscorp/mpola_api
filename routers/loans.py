@@ -908,7 +908,25 @@ async def respond_to_offer(
     return {"status": 200, "message": f"Offer {data.status}"}
 
 
-def _offer_template_response(t: LenderOfferTemplate) -> dict:
+def _offer_template_response(t: LenderOfferTemplate, db: Session = None) -> dict:
+    # Matched-request counts so a lender can tell at a glance whether their
+    # standing offer is actually generating activity, without an extra
+    # click — full detail (who, which application) is fetched lazily via
+    # GET /offer-templates/{id}/matches only once the lender expands it.
+    matched_count = pending_count = accepted_count = 0
+    if db is not None:
+        rows = (
+            db.query(LoanOffer.status, func.count(LoanOffer.id))
+            .filter(LoanOffer.template_id == t.id)
+            .group_by(LoanOffer.status)
+            .all()
+        )
+        for status_val, count in rows:
+            matched_count += count
+            if status_val == "pending":
+                pending_count += count
+            elif status_val == "accepted":
+                accepted_count += count
     return {
         "id": t.id,
         "lender_id": t.lender_id,
@@ -926,6 +944,9 @@ def _offer_template_response(t: LenderOfferTemplate) -> dict:
         "is_frozen": t.is_frozen,
         "frozen_by": t.frozen_by,
         "created_at": safe_isoformat(t.created_at),
+        "matched_count": matched_count,
+        "pending_count": pending_count,
+        "accepted_count": accepted_count,
     }
 
 
@@ -963,7 +984,7 @@ async def create_offer_template(
     return {
         "status": 200,
         "message": "Saved as draft" if data.is_draft else "Submitted for review",
-        "template": _offer_template_response(template),
+        "template": _offer_template_response(template, db),
     }
 
 
@@ -979,7 +1000,7 @@ async def my_offer_templates(
         .order_by(LenderOfferTemplate.created_at.desc())
         .all()
     )
-    return {"templates": [_offer_template_response(t) for t in templates]}
+    return {"templates": [_offer_template_response(t, db) for t in templates]}
 
 
 def _get_own_template(db: Session, template_id: str, user: User) -> LenderOfferTemplate:
@@ -1029,7 +1050,7 @@ async def update_offer_template(
            resource_type="lender_offer_template", resource_id=template.id)
     db.commit()
     db.refresh(template)
-    return {"status": 200, "message": "Updated", "template": _offer_template_response(template)}
+    return {"status": 200, "message": "Updated", "template": _offer_template_response(template, db)}
 
 
 @router.delete("/offer-templates/{template_id}")
@@ -1072,7 +1093,7 @@ async def freeze_own_offer_template(
            resource_type="lender_offer_template", resource_id=template.id)
     db.commit()
     db.refresh(template)
-    return {"status": 200, "message": "Frozen", "template": _offer_template_response(template)}
+    return {"status": 200, "message": "Frozen", "template": _offer_template_response(template, db)}
 
 
 @router.post("/offer-templates/{template_id}/unfreeze")
@@ -1095,7 +1116,7 @@ async def unfreeze_own_offer_template(
            resource_type="lender_offer_template", resource_id=template.id)
     db.commit()
     db.refresh(template)
-    return {"status": 200, "message": "Unfrozen", "template": _offer_template_response(template)}
+    return {"status": 200, "message": "Unfrozen", "template": _offer_template_response(template, db)}
 
 
 @router.put("/offer-templates/{template_id}/expiry")
@@ -1121,7 +1142,27 @@ async def extend_offer_template_expiry(
            details={"valid_until": safe_isoformat(data.valid_until)})
     db.commit()
     db.refresh(template)
-    return {"status": 200, "message": "Expiry updated", "template": _offer_template_response(template)}
+    return {"status": 200, "message": "Expiry updated", "template": _offer_template_response(template, db)}
+
+
+@router.get("/offer-templates/{template_id}/matches")
+async def offer_template_matches(
+    template_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Every loan offer this standing offer has auto-generated, most recent
+    first — lets a lender see who matched their criteria and whether each
+    one has been accepted yet, without digging through their full offers
+    list."""
+    _get_own_template(db, template_id, user)
+    offers = (
+        db.query(LoanOffer)
+        .filter(LoanOffer.template_id == template_id)
+        .order_by(LoanOffer.created_at.desc())
+        .all()
+    )
+    return {"offers": [_offer_response(o, db) for o in offers]}
 
 
 # ═══════════════════════════════════════════════
@@ -1208,6 +1249,7 @@ def _create_offer_from_template(db: Session, app: LoanApplication, template: Len
         total_repayable=round(total_repayable, 2),
         monthly_payment=round(monthly_payment, 2),
         required_documents=template.required_documents,
+        template_id=template.id,
     )
     db.add(offer)
     db.flush()
@@ -1900,6 +1942,7 @@ def _offer_response(offer: LoanOffer, db: Session) -> dict:
         "monthly_payment": offer.monthly_payment,
         "total_repayable": offer.total_repayable,
         "status": offer.status,
+        "template_id": offer.template_id,
         "required_documents": json.loads(offer.required_documents) if offer.required_documents else [],
         "required_documents_status": (
             _required_documents_status(db, app.borrower_id, offer.required_documents, app.id) if app else []
