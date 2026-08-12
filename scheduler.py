@@ -22,7 +22,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func
 
 from database import SessionLocal
-from database.tables import User, Loan, LoanApplication, LenderOfferTemplate, Guarantor, Wallet, PlatformFeeTransaction, PlatformSetting, AuditLog
+from database.tables import User, Loan, LoanApplication, LoanOffer, LenderOfferTemplate, Guarantor, Wallet, PlatformFeeTransaction, PlatformSetting, AuditLog
 from helpers import safe_isoformat
 from logging_module import logger
 from repository.auth_repo import _audit, _notify, _send_email, _setting_enabled
@@ -55,6 +55,7 @@ def run_collections_job() -> None:
         _recompute_borrower_credit_scores(db)
         _remind_pending_guarantors(db, now)
         _expire_stale_applications(db, now)
+        _handle_stale_matched_offers(db, now)
 
         db.commit()
     except Exception as e:
@@ -184,6 +185,87 @@ def _flag_expired_offers(db, now) -> None:
                     f"borrowers. Extend its expiry date to bring it back.",
             type="offer_template_expired",
             data={"template_id": template.id},
+        )
+
+
+def _handle_stale_matched_offers(db, now) -> None:
+    """Auto-matched (template-originated) offers that just sit "pending"
+    forever aren't great for either side — the borrower may not realize
+    it's waiting, and the lender has no way to know they can step in. Two
+    thresholds, both scoped to template_id-is-not-null offers only (a
+    lender's own manual offer never gets either treatment):
+
+      - AUTO_MATCH_MANUAL_OFFER_COOLDOWN (2 days, see routers/loans.py) —
+        the same moment the lender becomes allowed to make a competing
+        manual offer, nudge the borrower to respond and tell the lender
+        they can now act. One-time per offer (LoanOffer.stale_notified).
+      - matched_offer_expiry_days (admin-configurable, default 14) — give
+        up on it: auto-expire so it doesn't sit "pending" indefinitely,
+        and tell both sides.
+    """
+    from routers.loans import AUTO_MATCH_MANUAL_OFFER_COOLDOWN
+
+    reminder_cutoff = now - AUTO_MATCH_MANUAL_OFFER_COOLDOWN
+    due_for_reminder = db.query(LoanOffer).filter(
+        LoanOffer.status == "pending",
+        LoanOffer.template_id.isnot(None),
+        LoanOffer.created_at <= reminder_cutoff,
+        LoanOffer.stale_notified.is_(False),
+    ).all()
+    for offer in due_for_reminder:
+        offer.stale_notified = True
+        app = offer.application
+        if not app:
+            continue
+        cooldown_days = AUTO_MATCH_MANUAL_OFFER_COOLDOWN.days
+        _notify(
+            db, app.borrower_id,
+            title="You have a pending offer",
+            message=f"A lender auto-matched your UGX {offer.amount:,.0f} loan request "
+                    f"{cooldown_days} days ago and is still waiting on your response — "
+                    f"review it before they consider offering someone else.",
+            type="offer_awaiting_response",
+            data={"application_id": app.id, "offer_id": offer.id},
+        )
+        _notify(
+            db, offer.lender_id,
+            title="Still awaiting borrower response",
+            message=f"Your standing offer to {app.borrower.full_name if app.borrower else 'a borrower'} "
+                    f"(UGX {offer.amount:,.0f}) is still pending after {cooldown_days} days — "
+                    f"you can now make a manual offer on this request if you'd like.",
+            type="auto_match_cooldown_lifted",
+            data={"application_id": app.id, "offer_id": offer.id},
+        )
+
+    expiry_days = _setting(db, "matched_offer_expiry_days", 14)
+    expiry_cutoff = now - timedelta(days=expiry_days)
+    expired = db.query(LoanOffer).filter(
+        LoanOffer.status == "pending",
+        LoanOffer.template_id.isnot(None),
+        LoanOffer.created_at <= expiry_cutoff,
+    ).all()
+    for offer in expired:
+        offer.status = "expired"
+        app = offer.application
+        _audit(db, "offer_auto_expired", resource_type="loan_offer", resource_id=offer.id,
+               details={"application_id": offer.application_id, "days_pending": expiry_days})
+        if app:
+            _notify(
+                db, app.borrower_id,
+                title="Offer expired",
+                message=f"A lender's UGX {offer.amount:,.0f} auto-matched offer on your loan request "
+                        f"expired after {expiry_days} days without a response. You can still be "
+                        f"matched to other lenders.",
+                type="offer_expired",
+                data={"application_id": app.id, "offer_id": offer.id},
+            )
+        _notify(
+            db, offer.lender_id,
+            title="Your auto-matched offer expired",
+            message=f"Your standing offer to {app.borrower.full_name if app and app.borrower else 'a borrower'} "
+                    f"(UGX {offer.amount:,.0f}) expired unaccepted after {expiry_days} days.",
+            type="offer_expired",
+            data={"application_id": offer.application_id, "offer_id": offer.id},
         )
 
 

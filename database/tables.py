@@ -406,6 +406,13 @@ class LoanOffer(Base, TimestampMixin):
     # survive (it may already be accepted/a real Loan), only the traceback
     # to its origin is lost.
     template_id = Column(String(50), ForeignKey("lender_offer_templates.id", ondelete="SET NULL"), nullable=True)
+    # One-time flag for scheduler._handle_stale_matched_offers' day-2 nudge
+    # (auto-matched offer still pending — reminds the borrower to respond
+    # and tells the lender they can now manually counter-offer) — set True
+    # right after that nudge fires so it doesn't repeat every day. Only
+    # meaningful for template-originated offers; a manual offer never gets
+    # this reminder at all.
+    stale_notified = Column(Boolean, default=False, nullable=False)
 
     application = relationship("LoanApplication", back_populates="offers")
     lender = relationship("User", back_populates="offers_made", foreign_keys=[lender_id])
