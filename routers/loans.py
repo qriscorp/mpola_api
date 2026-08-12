@@ -26,6 +26,15 @@ from utils.fee import calc_platform_fee, calc_late_fee_platform_cut
 # offer-accept time is now a defensive second gate, not the primary one.
 REQUIRED_ACCEPTED_GUARANTORS = 2
 
+# A lender whose standing offer just auto-matched a request shouldn't also
+# be able to immediately hand-craft a competing manual offer on the same
+# application — the borrower hasn't even had a chance to see the first one
+# yet. Only once this much time has passed with no response can the lender
+# step in manually (see make_offer's cooldown check below). Only applies to
+# auto-matched (template-originated) offers — a lender can always freely
+# make additional manual offers of their own, no cooldown there.
+AUTO_MATCH_MANUAL_OFFER_COOLDOWN = timedelta(days=2)
+
 router = APIRouter(prefix="/loans", tags=["Loans"])
 
 
@@ -542,6 +551,35 @@ async def make_offer(
         raise HTTPException(status_code=400, detail="Application no longer accepting offers")
     if app.borrower_id == user.id:
         raise HTTPException(status_code=400, detail="Cannot make an offer on your own application")
+
+    # If this lender's own standing offer already auto-matched this request
+    # and is still awaiting the borrower's response, don't let them also
+    # hand-craft a competing manual offer until the borrower's had a fair
+    # chance to see the first one. A manual offer they made themselves
+    # never triggers this — only a template-originated (auto-matched) one.
+    existing_auto_offer = (
+        db.query(LoanOffer)
+        .filter(
+            LoanOffer.application_id == data.application_id,
+            LoanOffer.lender_id == user.id,
+            LoanOffer.status == "pending",
+            LoanOffer.template_id.isnot(None),
+        )
+        .order_by(LoanOffer.created_at.desc())
+        .first()
+    )
+    if existing_auto_offer:
+        cooldown_ends = existing_auto_offer.created_at + AUTO_MATCH_MANUAL_OFFER_COOLDOWN
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        if now < cooldown_ends:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Your standing offer already matched this request — the borrower hasn't "
+                    f"responded yet. You can make a manual offer once they've had 2 days to "
+                    f"respond (available {safe_isoformat(cooldown_ends)})."
+                ),
+            )
 
     max_rate = _max_interest_rate(db)
     if data.interest_rate > max_rate:
@@ -1943,6 +1981,13 @@ def _offer_response(offer: LoanOffer, db: Session) -> dict:
         "total_repayable": offer.total_repayable,
         "status": offer.status,
         "template_id": offer.template_id,
+        # Only meaningful while status == "pending" and template_id is set —
+        # see AUTO_MATCH_MANUAL_OFFER_COOLDOWN / make_offer. Null otherwise
+        # (a manual offer has no cooldown concept at all).
+        "auto_match_cooldown_ends_at": (
+            safe_isoformat(offer.created_at + AUTO_MATCH_MANUAL_OFFER_COOLDOWN)
+            if offer.template_id else None
+        ),
         "required_documents": json.loads(offer.required_documents) if offer.required_documents else [],
         "required_documents_status": (
             _required_documents_status(db, app.borrower_id, offer.required_documents, app.id) if app else []
