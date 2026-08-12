@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from sqlalchemy import (
     Column, String, Integer, Float, Boolean, Text, DateTime,
-    ForeignKey, Enum, UniqueConstraint, func,
+    ForeignKey, Enum, UniqueConstraint, Index, func,
 )
 from sqlalchemy.orm import declarative_base, relationship
 from helpers import generateUniqueId
@@ -338,6 +338,16 @@ class CustomDocumentResponse(Base, TimestampMixin):
     file_name = Column(String(255), nullable=True)
 
     application = relationship("LoanApplication")
+
+    __table_args__ = (
+        # MySQL/InnoDB requires an index on a foreign key's leading column,
+        # and reuses a compatible composite one instead of adding a second,
+        # redundant single-column index — this composite index is that one.
+        # Must be declared here (not just in the migration file) or
+        # `alembic revision --autogenerate` sees it as an unmanaged index and
+        # tries to drop it, which MySQL then refuses since the FK needs it.
+        Index("ix_cdr_application_label", "application_id", "label"),
+    )
 
 
 class Guarantor(Base, TimestampMixin):
