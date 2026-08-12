@@ -321,6 +321,25 @@ class BorrowerDocument(Base, TimestampMixin):
     user = relationship("User")
 
 
+class CustomDocumentResponse(Base, TimestampMixin):
+    """A borrower's fulfillment of a lender-specified custom ("Other: ...")
+    document requirement that doesn't resolve to a known KYCDocument/
+    BorrowerDocument type — either an uploaded file or a free-text
+    explanation (at least one required). Scoped per-application (not
+    account-level like BorrowerDocument) since the label is free text the
+    lender typed for this specific request, not a stable document type."""
+    __tablename__ = "custom_document_responses"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    application_id = Column(String(50), ForeignKey("loan_applications.id", ondelete="CASCADE"), nullable=False)
+    label = Column(String(255), nullable=False)
+    text_response = Column(Text, nullable=True)
+    file_url = Column(String(500), nullable=True)
+    file_name = Column(String(255), nullable=True)
+
+    application = relationship("LoanApplication")
+
+
 class Guarantor(Base, TimestampMixin):
     """A guarantor is a real Mpola user (any role) vouching for one specific
     loan application — not a standing relationship and not a freeform
@@ -465,6 +484,10 @@ class Loan(Base, TimestampMixin):
     # exactly what was required next to what the borrower actually has on
     # file, right before releasing funds.
     required_documents = Column(Text, nullable=True)  # JSON list of labels
+    # Optional free-text note the borrower can leave for the lender when
+    # accepting the offer — e.g. context on a custom document requirement,
+    # or anything else worth flagging before the lender approves disbursement.
+    borrower_note = Column(Text, nullable=True)
 
     application = relationship("LoanApplication", back_populates="loan")
     borrower = relationship("User", foreign_keys=[borrower_id])

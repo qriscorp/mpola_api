@@ -7,6 +7,25 @@ from datetime import datetime
 from typing import Optional, List
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+# CustomDocumentResponse.label (database/tables.py) is a VARCHAR(255) —
+# a required_documents label longer than that would get truncated (or
+# rejected, depending on SQL mode) when the borrower's fulfillment tries to
+# key off the exact same string, permanently mismatching and leaving a
+# real submission stuck "unsatisfied" forever. Reject it here instead,
+# where every caller (not just the frontends that happen to add a
+# maxLength) is covered.
+MAX_DOCUMENT_LABEL_LENGTH = 255
+
+
+def _validate_document_labels(labels: list[str]) -> list[str]:
+    for label in labels:
+        if len(label) > MAX_DOCUMENT_LABEL_LENGTH:
+            raise ValueError(
+                f"Document label too long (max {MAX_DOCUMENT_LABEL_LENGTH} characters): "
+                f"{label[:50]}..."
+            )
+    return labels
+
 
 # ─── Auth ──────────────────────────────────────
 
@@ -282,6 +301,11 @@ class LoanOfferCreate(BaseModel):
     duration_days: Optional[int] = Field(None, ge=1, le=29)
     required_documents: list[str] = Field(default_factory=list)
 
+    @field_validator("required_documents")
+    @classmethod
+    def check_document_labels(cls, v):
+        return _validate_document_labels(v)
+
     @model_validator(mode="after")
     def check_duration(self):
         if (self.duration is None) == (self.duration_days is None):
@@ -291,6 +315,10 @@ class LoanOfferCreate(BaseModel):
 
 class LoanOfferUpdate(BaseModel):
     status: str  # accepted, declined
+    # Optional note the borrower can leave for the lender when accepting —
+    # e.g. context on a custom document, or anything worth flagging before
+    # the lender approves disbursement. Only meaningful when status=accepted.
+    note: Optional[str] = None
 
 
 class LenderOfferTemplateCreate(BaseModel):
@@ -308,6 +336,11 @@ class LenderOfferTemplateCreate(BaseModel):
     valid_until: Optional[datetime] = None
     max_concurrent_loans: Optional[int] = None
     is_draft: bool = False
+
+    @field_validator("required_documents")
+    @classmethod
+    def check_document_labels(cls, v):
+        return _validate_document_labels(v)
 
     @model_validator(mode="after")
     def check_amount_range(self):
@@ -336,6 +369,11 @@ class LenderOfferTemplateUpdate(BaseModel):
     description: Optional[str] = None
     valid_until: Optional[datetime] = None
     max_concurrent_loans: Optional[int] = None
+
+    @field_validator("required_documents")
+    @classmethod
+    def check_document_labels(cls, v):
+        return v if v is None else _validate_document_labels(v)
 
     @model_validator(mode="after")
     def check_duration_switch(self):

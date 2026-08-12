@@ -3,17 +3,20 @@ Loans router — applications, offers, active loans, repayments.
 """
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, KYCDocument, BorrowerDocument, Wallet, WalletTransaction, PlatformFeeTransaction, LenderApplicationSkip
+from config import BASE_URL
+from database.tables import User, LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment, Guarantor, KYCDocument, BorrowerDocument, CustomDocumentResponse, Wallet, WalletTransaction, PlatformFeeTransaction, LenderApplicationSkip
 from helpers import generateReferenceNumber, generateUniqueId, DOCUMENT_LABEL_MAP, safe_isoformat
 from repository.auth_repo import _audit, _notify, _notify_admins
 from repository.dependencies import get_db, current_active_user
 from repository.models import LoanApplicationCreate, LoanApplicationUpdate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, LenderOfferTemplateExpiryUpdate, RepaymentCreate, GuarantorAttach
 from repository.security import require_roles
+from routers.users import ALLOWED_BORROWER_DOCUMENT_EXTENSIONS, MAX_BORROWER_DOCUMENT_SIZE_BYTES
 from utils.upg_client import UPGClient, _detect_carrier
 from utils.fee import calc_platform_fee, calc_late_fee_platform_cut
 
@@ -616,14 +619,18 @@ async def offers_received(
     return {"total": total, "offers": [_offer_response(o, db) for o in offers]}
 
 
-def _required_documents_status(db: Session, borrower_id: str, required_documents) -> list[dict]:
+def _required_documents_status(
+    db: Session, borrower_id: str, required_documents, application_id: str = None,
+) -> list[dict]:
     """Resolves an offer's required_documents (JSON list of labels, e.g.
     "National ID", "Bank Statement (3mo)") against what the borrower
     actually has on file — KYCDocument for identity labels, BorrowerDocument
-    (account-wide, reusable — see database/tables.py) for everything else.
-    See DOCUMENT_LABEL_MAP (helpers.py). Includes the file itself (not just
-    a satisfied flag) so a lender reviewing before disbursement can
-    actually open what was provided, not just see a checkmark."""
+    (account-wide, reusable — see database/tables.py) for everything else,
+    CustomDocumentResponse (per-application) for a lender's free-typed
+    "Other: ..." requirement. See DOCUMENT_LABEL_MAP (helpers.py). Includes
+    the file itself (not just a satisfied flag) so a lender reviewing before
+    disbursement can actually open what was provided, not just see a
+    checkmark."""
     labels = json.loads(required_documents) if required_documents else []
     if not labels:
         return []
@@ -634,22 +641,37 @@ def _required_documents_status(db: Session, borrower_id: str, required_documents
     borrower_docs = {
         d.document_type: d for d in db.query(BorrowerDocument).filter(BorrowerDocument.user_id == borrower_id).all()
     }
+    custom_responses = {}
+    if application_id:
+        custom_responses = {
+            r.label: r
+            for r in db.query(CustomDocumentResponse)
+            .filter(CustomDocumentResponse.application_id == application_id)
+            .all()
+        }
 
     result = []
     for label in labels:
         source, type_key = DOCUMENT_LABEL_MAP.get(label, (None, None))
-        doc = None
-        if source == "kyc":
-            doc = kyc_docs.get(type_key)
-        elif source == "borrower_doc":
-            doc = borrower_docs.get(type_key)
-        satisfied = doc is not None
         if source not in ("kyc", "borrower_doc"):
-            # Unknown label (e.g. a template saved before a checklist
-            # change) can't be resolved to anything uploadable — treat as
-            # satisfied rather than permanently blocking acceptance on a
-            # requirement nobody can ever fulfil.
-            satisfied = True
+            # A lender-specified custom requirement — not a fixed document
+            # type, so it's fulfilled by either an uploaded file or a
+            # free-text explanation (at least one), tracked per-application.
+            custom = custom_responses.get(label)
+            result.append({
+                "label": label,
+                "type": None,
+                "source": "custom",
+                "satisfied": bool(custom and (custom.text_response or custom.file_url)),
+                "file_url": custom.file_url if custom else None,
+                "file_name": custom.file_name if custom else None,
+                "verified": False,
+                "text_response": custom.text_response if custom else None,
+            })
+            continue
+
+        doc = kyc_docs.get(type_key) if source == "kyc" else borrower_docs.get(type_key)
+        satisfied = doc is not None
         result.append({
             "label": label,
             "type": type_key,
@@ -658,8 +680,81 @@ def _required_documents_status(db: Session, borrower_id: str, required_documents
             "file_url": doc.file_url if doc else None,
             "file_name": doc.file_name if doc else None,
             "verified": doc.verified if doc else False,
+            "text_response": None,
         })
     return result
+
+
+@router.post("/applications/{app_id}/custom-document-response")
+async def submit_custom_document_response(
+    app_id: str,
+    label: str = Form(...),
+    text_response: str = Form(None),
+    file: UploadFile = File(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Borrower fulfils a lender's custom ("Other: ...") document requirement
+    — either a file, a text explanation, or both. Upserts on (application,
+    label) so re-submitting (e.g. replacing a wrong file) overwrites rather
+    than piling up duplicates, same convention as KYC/BorrowerDocument."""
+    app = db.query(LoanApplication).filter(
+        LoanApplication.id == app_id, LoanApplication.borrower_id == user.id,
+    ).first()
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if not text_response and not file:
+        raise HTTPException(status_code=400, detail="Provide a file, a text response, or both")
+
+    existing = db.query(CustomDocumentResponse).filter(
+        CustomDocumentResponse.application_id == app_id,
+        CustomDocumentResponse.label == label,
+    ).first()
+
+    file_url = existing.file_url if existing else None
+    file_name = existing.file_name if existing else None
+    if file:
+        ext = os.path.splitext(file.filename or "")[1].lower()
+        if ext not in ALLOWED_BORROWER_DOCUMENT_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext or 'unknown'}")
+        contents = await file.read()
+        if len(contents) > MAX_BORROWER_DOCUMENT_SIZE_BYTES:
+            raise HTTPException(status_code=400, detail="File exceeds 10MB limit")
+        os.makedirs("uploads", exist_ok=True)
+        stored_name = f"{generateUniqueId(20)}{ext}"
+        with open(os.path.join("uploads", stored_name), "wb") as f:
+            f.write(contents)
+        file_url = f"{BASE_URL}/uploads/{stored_name}"
+        file_name = file.filename
+
+    if existing:
+        if text_response is not None:
+            existing.text_response = text_response
+        existing.file_url = file_url
+        existing.file_name = file_name
+        resp = existing
+    else:
+        resp = CustomDocumentResponse(
+            application_id=app_id, label=label,
+            text_response=text_response, file_url=file_url, file_name=file_name,
+        )
+        db.add(resp)
+
+    _audit(db, "custom_document_response_submitted", username=user.username, user_id=user.id,
+           resource_type="loan_application", resource_id=app_id, details={"label": label})
+    db.commit()
+    db.refresh(resp)
+
+    return {
+        "status": 200,
+        "message": "Saved",
+        "response": {
+            "label": resp.label,
+            "text_response": resp.text_response,
+            "file_url": resp.file_url,
+            "file_name": resp.file_name,
+        },
+    }
 
 
 @router.put("/offers/{offer_id}")
@@ -707,7 +802,7 @@ async def respond_to_offer(
             )
 
         missing_docs = [
-            d["label"] for d in _required_documents_status(db, app.borrower_id, offer.required_documents)
+            d["label"] for d in _required_documents_status(db, app.borrower_id, offer.required_documents, app.id)
             if not d["satisfied"]
         ]
         if missing_docs:
@@ -757,6 +852,7 @@ async def respond_to_offer(
             total_instalments=1 if offer.duration_days is not None else offer.duration,
             status="pending_disbursement",
             required_documents=offer.required_documents,
+            borrower_note=data.note,
         )
         db.add(loan)
         db.flush()
@@ -1806,7 +1902,7 @@ def _offer_response(offer: LoanOffer, db: Session) -> dict:
         "status": offer.status,
         "required_documents": json.loads(offer.required_documents) if offer.required_documents else [],
         "required_documents_status": (
-            _required_documents_status(db, app.borrower_id, offer.required_documents) if app else []
+            _required_documents_status(db, app.borrower_id, offer.required_documents, app.id) if app else []
         ),
         "created_at": safe_isoformat(offer.created_at),
     }
@@ -1815,9 +1911,16 @@ def _offer_response(offer: LoanOffer, db: Session) -> dict:
 def _loan_response(loan: Loan, db: Session = None, include_repayments: bool = False) -> dict:
     result = {
         "id": loan.id,
+        "application_id": loan.application_id,
         "borrower_id": loan.borrower_id,
         "lender_id": loan.lender_id,
         "borrower_name": loan.borrower.full_name if loan.borrower else None,
+        # Only the borrower/lender/admin on this loan can reach this
+        # response at all (see GET /active/{loan_id}'s auth check), so it's
+        # safe to include contact details here — the lender needs a real
+        # way to reach the borrower before releasing funds.
+        "borrower_phone": loan.borrower.phone_number if loan.borrower else None,
+        "borrower_email": loan.borrower.email if loan.borrower else None,
         "lender_name": loan.lender_user.full_name if loan.lender_user else None,
         "amount": loan.amount,
         "interest_rate": loan.interest_rate,
@@ -1835,6 +1938,7 @@ def _loan_response(loan: Loan, db: Session = None, include_repayments: bool = Fa
         "status": loan.status,
         "disbursed_at": safe_isoformat(loan.disbursed_at),
         "created_at": safe_isoformat(loan.created_at),
+        "borrower_note": loan.borrower_note,
         "required_documents": json.loads(loan.required_documents) if loan.required_documents else [],
         # Lets the lender's disbursement-approval screen show exactly what
         # was required next to what the borrower actually has on file,
@@ -1842,8 +1946,22 @@ def _loan_response(loan: Loan, db: Session = None, include_repayments: bool = Fa
         # passed (every route handler has one; kept optional so this
         # function still works from any db-less context).
         "required_documents_status": (
-            _required_documents_status(db, loan.borrower_id, loan.required_documents) if db is not None else []
+            _required_documents_status(db, loan.borrower_id, loan.required_documents, loan.application_id)
+            if db is not None else []
         ),
+        # Same guarantors who backed the original application — lets the
+        # lender see who's vouching for this loan before approving
+        # disbursement, not just the borrower's own say-so.
+        "guarantors": [
+            {
+                "id": g.id,
+                "full_name": g.guarantor_user.full_name if g.guarantor_user else None,
+                "username": g.guarantor_user.username if g.guarantor_user else None,
+                "relationship_type": g.relationship_type,
+                "status": g.status,
+            }
+            for g in loan.application.guarantors
+        ] if loan.application else [],
     }
     if include_repayments:
         result["repayments"] = [
