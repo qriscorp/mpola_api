@@ -506,6 +506,10 @@ class WalletAdjustmentModel(BaseModel):
         return v
 
 
+class WalletFreezeUpdate(BaseModel):
+    reason: Optional[str] = None
+
+
 # ─── Support tickets ───────────────────────────
 
 class SupportTicketCreate(BaseModel):

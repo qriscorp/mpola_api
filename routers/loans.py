@@ -17,6 +17,7 @@ from repository.dependencies import get_db, current_active_user
 from repository.models import LoanApplicationCreate, LoanApplicationUpdate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, LenderOfferTemplateExpiryUpdate, RepaymentCreate, GuarantorAttach
 from repository.security import require_roles
 from routers.users import ALLOWED_BORROWER_DOCUMENT_EXTENSIONS, MAX_BORROWER_DOCUMENT_SIZE_BYTES
+from routers.wallet import _ensure_wallet_not_frozen
 from utils.upg_client import UPGClient, _detect_carrier
 from utils.fee import calc_platform_fee, calc_late_fee_platform_cut
 
@@ -1390,11 +1391,19 @@ async def my_earnings(
     """Aggregate lender earnings, computed from real loan/repayment data.
 
     Interest earned is approximated per-repayment as
-    repayment_amount * (total_repayable - amount) / total_repayable —
+    net_amount * (total_repayable - amount) / total_repayable —
     i.e. every repayment carries the same interest/principal split as the
     loan overall. This matches the flat/add-on interest model used when
     offers are priced (see make_offer/create_application), since no
     amortization schedule is tracked to split payments more precisely.
+
+    net_amount, not the raw repayment amount, is what's used: when part of a
+    repayment covers an outstanding late fee, Mpola takes a 5% cut of just
+    that slice (LATE_FEE_PLATFORM_CUT_RATE, see make_repayment) before the
+    rest reaches the lender's wallet. That cut is Mpola's own revenue, shown
+    on the admin side (PlatformFeeTransaction), and must never be counted
+    here too — a lender's earnings should only ever reflect what actually
+    landed in their wallet, not gross repayment volume.
     """
     # Excludes pending_disbursement — that money hasn't actually left the
     # lender's wallet yet, so it isn't "deployed"/earning anything.
@@ -1411,7 +1420,6 @@ async def my_earnings(
     total_deployed = sum(l.amount for l in loans)
     active_loans = len(active_loan_list)
     total_repaid = sum(l.total_paid for l in loans)
-    total_earned = sum(l.total_paid * interest_ratio(l) for l in loans)
     avg_yield = (
         sum(l.interest_rate for l in active_loan_list) / len(active_loan_list)
         if active_loan_list else 0.0
@@ -1427,8 +1435,10 @@ async def my_earnings(
         by_borrower: dict = {}
         by_type: dict = {}
         for l in active_loan_list:
+            # loan_type lives on LoanApplication, not Loan itself.
+            loan_type = l.application.loan_type if l.application else "unknown"
             by_borrower[l.borrower_id] = by_borrower.get(l.borrower_id, 0.0) + l.amount
-            by_type[l.loan_type] = by_type.get(l.loan_type, 0.0) + l.amount
+            by_type[loan_type] = by_type.get(loan_type, 0.0) + l.amount
 
         worst_borrower_id = max(by_borrower, key=by_borrower.get)
         worst_borrower_pct = by_borrower[worst_borrower_id] / active_deployed * 100
@@ -1452,17 +1462,36 @@ async def my_earnings(
     loan_by_id = {l.id: l for l in loans}
     monthly_totals = {}
     this_month_earned = 0.0
+    total_earned = 0.0
     now = datetime.now(timezone.utc)
 
     if loans:
         repayments = db.query(Repayment).filter(
             Repayment.loan_id.in_(list(loan_by_id.keys())),
         ).all()
+
+        # Late-fee platform cut per repayment, looked up via the repayment's
+        # own credit-side WalletTransaction (Repayment.lender_transaction_id)
+        # — the only fee ever taken out of what the lender actually receives.
+        lender_tx_ids = [r.lender_transaction_id for r in repayments if r.lender_transaction_id]
+        late_fee_cut_by_tx_id = {}
+        if lender_tx_ids:
+            late_fee_cut_by_tx_id = {
+                row[0]: row[1] for row in db.query(
+                    PlatformFeeTransaction.wallet_transaction_id, PlatformFeeTransaction.platform_fee,
+                ).filter(
+                    PlatformFeeTransaction.wallet_transaction_id.in_(lender_tx_ids),
+                    PlatformFeeTransaction.category == "late_fee_platform_cut",
+                ).all()
+            }
+
         for r in repayments:
             loan = loan_by_id.get(r.loan_id)
             if not loan:
                 continue
-            earned_portion = r.amount * interest_ratio(loan)
+            net_amount = r.amount - late_fee_cut_by_tx_id.get(r.lender_transaction_id, 0.0)
+            earned_portion = net_amount * interest_ratio(loan)
+            total_earned += earned_portion
             month_key = r.created_at.strftime("%Y-%m")
             monthly_totals[month_key] = monthly_totals.get(month_key, 0.0) + earned_portion
             if r.created_at.year == now.year and r.created_at.month == now.month:
@@ -1550,6 +1579,8 @@ async def approve_disbursement(
         raise HTTPException(status_code=400, detail="Set up your wallet before approving disbursement")
     if not borrower_wallet or not borrower_wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Borrower's wallet is no longer set up — cannot disburse")
+    _ensure_wallet_not_frozen(lender_wallet)
+    _ensure_wallet_not_frozen(borrower_wallet, label="The borrower's")
 
     platform_fee = calc_platform_fee(loan.amount)
     total_debit = loan.amount + platform_fee
@@ -1642,6 +1673,14 @@ async def make_repayment(
         raise HTTPException(status_code=404, detail="Loan not found")
     if loan.status not in ("active", "overdue"):
         raise HTTPException(status_code=400, detail="Loan is not active")
+
+    # Checked regardless of payment method — a frozen wallet blocks the
+    # holder's money movement platform-wide, not just direct wallet-ledger
+    # transfers (mobile money repayments bypass the wallet entirely below).
+    _ensure_wallet_not_frozen(db.query(Wallet).filter(Wallet.user_id == user.id).first())
+    _ensure_wallet_not_frozen(
+        db.query(Wallet).filter(Wallet.user_id == loan.lender_id).first(), label="The lender's",
+    )
 
     repayment = Repayment(
         loan_id=loan.id,

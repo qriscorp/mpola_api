@@ -18,7 +18,7 @@ from repository.dependencies import get_db
 from repository.models import (
     AuthUser, AdminRoleUpdate, AdminAccessUpdate, PlatformSettingUpdate,
     DisputeResolve, SupportMessageCreate, SupportTicketStatusUpdate,
-    KYCReviewUpdate, DocumentVerifyUpdate, WalletAdjustmentModel,
+    KYCReviewUpdate, DocumentVerifyUpdate, WalletAdjustmentModel, WalletFreezeUpdate,
 )
 from repository.security import require_admin, require_super_admin
 from repository.user_repo import UserRepo
@@ -496,6 +496,10 @@ def get_user_detail(
         "wallet": {
             "balance": wallet.balance if wallet else 0,
             "is_wallet_setup": wallet.is_wallet_setup if wallet else False,
+            "is_frozen": wallet.is_frozen if wallet else False,
+            "frozen_reason": wallet.frozen_reason if wallet else None,
+            "frozen_at": safe_isoformat(wallet.frozen_at) if wallet and wallet.frozen_at else None,
+            "frozen_by": wallet.frozen_by if wallet else None,
         },
         "transactions": [
             {
@@ -726,6 +730,62 @@ def suspend_user(
         "success": True,
         "username": username,
         "is_active": user.is_active,
+        "action": action,
+    }
+
+
+@router.put("/wallets/{username}/freeze")
+def toggle_wallet_freeze(
+    username: str,
+    data: WalletFreezeUpdate,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Toggle freeze/unfreeze on a user's wallet — blocks every money-moving
+    action (deposit, withdraw, repayment, disbursement) on it, enforced by
+    _ensure_wallet_not_frozen (routers/wallet.py) at every entry point that
+    touches a balance. Deliberately separate from suspend_user above: a
+    frozen wallet still lets the user log in and use the rest of the app —
+    only transactions are blocked — whereas suspension locks the whole
+    account out."""
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+    if not wallet:
+        raise HTTPException(status_code=404, detail="User has no wallet")
+
+    wallet.is_frozen = not wallet.is_frozen
+    if wallet.is_frozen:
+        wallet.frozen_reason = data.reason
+        wallet.frozen_at = datetime.utcnow()
+        wallet.frozen_by = admin.username
+    else:
+        wallet.frozen_reason = None
+        wallet.frozen_at = None
+        wallet.frozen_by = None
+
+    action = "frozen" if wallet.is_frozen else "unfrozen"
+    _audit(db, f"wallet_{action}", username=admin.username, user_id=user.id,
+           resource_type="wallet", resource_id=wallet.id,
+           details={"target_user": username, "reason": data.reason})
+    _notify(
+        db, user.id,
+        title="Wallet frozen" if wallet.is_frozen else "Wallet unfrozen",
+        message=(
+            f"Your wallet has been frozen by Mpola support.{f' Reason: {data.reason}' if data.reason else ''} "
+            "You won't be able to deposit, withdraw, repay, or receive funds until it's unfrozen."
+            if wallet.is_frozen
+            else "Your wallet has been unfrozen — you can resume transactions normally."
+        ),
+        type="wallet_frozen" if wallet.is_frozen else "wallet_unfrozen",
+    )
+    db.commit()
+
+    return {
+        "success": True,
+        "username": username,
+        "is_frozen": wallet.is_frozen,
         "action": action,
     }
 
@@ -1324,6 +1384,82 @@ def get_reconciliation_report(
         "checked_count": len(wallets) + len(recent_txs),
         "generated_at": safe_isoformat(datetime.now(timezone.utc)),
     }
+
+
+@router.post("/reconciliation/recheck/{transaction_id}")
+def recheck_gateway_transaction(
+    transaction_id: str,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Forces an immediate live re-check of one deposit/withdrawal flagged by
+    GET /admin/reconciliation, instead of waiting on the scheduler's next
+    pass (still-pending case) or leaving a finished-but-disagreeing one
+    unresolved forever (e.g. the 48h-expiry job already marked it "failed"
+    locally, but the gateway's own hosted checkout session for an abandoned
+    payment just sits at "pending" indefinitely on their side — see
+    scheduler.py's _reconcile_pending_payments).
+
+    Only ever auto-applies a correction in the SAFE direction: if the
+    gateway now says the payment actually succeeded and we never credited
+    it, we credit it now (money the user is genuinely owed). It deliberately
+    does NOT auto-reverse a wallet we already credited just because the
+    gateway now disagrees — that's a rare, higher-stakes case (would mean
+    debiting money already in play) left for a human to review and correct
+    via the wallet adjustment tool instead of an automatic reversal.
+    """
+    from routers.wallet import (
+        _recheck_card_deposit, _recheck_bank_withdrawal,
+        _finalize_card_deposit, _finalize_bank_withdrawal,
+    )
+    from utils.upg_client import UPGClient
+
+    tx = db.query(WalletTransaction).filter(WalletTransaction.id == transaction_id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    if tx.type not in ("deposit", "withdrawal") or not tx.reference:
+        raise HTTPException(status_code=400, detail="Only referenced deposit/withdrawal transactions can be re-checked")
+
+    if tx.status == "pending":
+        # Still genuinely open on our side — the normal finalize path applies.
+        result_tx = _recheck_card_deposit(db, transaction_id) if tx.type == "deposit" \
+            else _recheck_bank_withdrawal(db, transaction_id)
+        db.commit()
+        return {
+            "our_status": result_tx.status if result_tx else tx.status,
+            "gateway_status": None,
+            "corrected": bool(result_tx and result_tx.status != "pending"),
+        }
+
+    client = UPGClient()
+    try:
+        if tx.type == "deposit":
+            resp = client.get_transaction(tx.reference)
+            gateway_status = (resp.get("status") or "").upper()
+            gateway_says_success = gateway_status == "SUCCESS"
+        else:
+            resp = client.get_payout_status(tx.reference)
+            gateway_status = (resp.get("status") or "").lower()
+            gateway_says_success = gateway_status == "success"
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gateway error: {e}")
+
+    corrected = False
+    if gateway_says_success and tx.status == "failed":
+        wallet = db.query(Wallet).filter(Wallet.id == tx.wallet_id).with_for_update().first()
+        user = db.query(User).filter(User.id == wallet.user_id).first() if wallet else None
+        if wallet and user:
+            if tx.type == "deposit":
+                _finalize_card_deposit(db, tx, wallet, user)
+            else:
+                _finalize_bank_withdrawal(db, tx, wallet, user)
+            _audit(db, "wallet_tx_recheck_corrected", username=admin.username, user_id=user.id,
+                   resource_type="wallet_transaction", resource_id=tx.id,
+                   details={"reference": tx.reference, "gateway_status": gateway_status})
+            db.commit()
+            corrected = True
+
+    return {"our_status": tx.status, "gateway_status": gateway_status, "corrected": corrected}
 
 
 @router.post("/wallets/{username}/adjust")

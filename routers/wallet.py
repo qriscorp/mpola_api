@@ -32,6 +32,22 @@ router = APIRouter(prefix="/wallet", tags=["Wallet"])
 CARD_CONFIRM_SECRET = os.getenv("CARD_CONFIRM_SECRET", "")
 
 
+def _ensure_wallet_not_frozen(wallet: Wallet | None, label: str = "Your") -> None:
+    """Single choke point every money-moving endpoint calls before touching
+    a balance — raises if an admin has frozen this wallet (see PUT
+    /admin/wallets/{username}/freeze). Distinct from account suspension
+    (User.is_active): a frozen wallet still lets the user log in and use
+    the rest of the app, only transactions are blocked. `label` lets a
+    cross-wallet check (the OTHER party in a repayment/disbursement)
+    produce a clearer message than always saying "Your"."""
+    if wallet and wallet.is_frozen:
+        reason = f" Reason: {wallet.frozen_reason}" if wallet.frozen_reason else ""
+        raise HTTPException(
+            status_code=403,
+            detail=f"{label} wallet is frozen and can't be used for transactions right now.{reason}",
+        )
+
+
 @router.get("/")
 async def get_wallet(db: Session = Depends(get_db), user: User = Depends(current_active_user)):
     """Get current user's wallet balance."""
@@ -41,12 +57,16 @@ async def get_wallet(db: Session = Depends(get_db), user: User = Depends(current
             "balance": 0,
             "currency": "UGX",
             "is_wallet_setup": False,
+            "is_frozen": False,
+            "frozen_reason": None,
         }
     return {
         "id": wallet.id,
         "balance": wallet.balance,
         "currency": wallet.currency,
         "is_wallet_setup": wallet.is_wallet_setup,
+        "is_frozen": wallet.is_frozen,
+        "frozen_reason": wallet.frozen_reason,
         "created_at": safe_isoformat(wallet.created_at),
     }
 
@@ -92,6 +112,7 @@ async def deposit(
     wallet = db.query(Wallet).filter(Wallet.user_id == user.id).with_for_update().first()
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
+    _ensure_wallet_not_frozen(wallet)
 
     phone = _normalize_phone(data.phone_number or user.phone_number)
     if not phone:
@@ -149,6 +170,7 @@ async def withdraw(
     wallet = db.query(Wallet).filter(Wallet.user_id == user.id).with_for_update().first()
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
+    _ensure_wallet_not_frozen(wallet)
 
     phone = _normalize_phone(data.phone_number)
     carrier = (data.carrier or _detect_carrier(phone)).upper()
@@ -454,6 +476,7 @@ async def initiate_card_deposit(
     wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
+    _ensure_wallet_not_frozen(wallet)
     if not user.email:
         raise HTTPException(status_code=400, detail="A verified email is required for card deposits")
 
@@ -621,6 +644,7 @@ async def initiate_bank_withdraw(
     wallet = db.query(Wallet).filter(Wallet.user_id == user.id).with_for_update().first()
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
+    _ensure_wallet_not_frozen(wallet)
 
     charges = calc_bank_withdrawal_charges(data.amount)
     total_debit = data.amount + charges["total_fee"]

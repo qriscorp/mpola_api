@@ -199,6 +199,15 @@ class Wallet(Base, TimestampMixin):
     # cleared the moment balance recovers above threshold — re-arms a fresh dip
     # to notify immediately rather than waiting out a stale cooldown.
     low_balance_notified_at = Column(DateTime, nullable=True)
+    # Admin-only freeze — blocks every money-moving action on this wallet
+    # (deposit, withdraw, repayment, disbursement) without suspending the
+    # account itself (see User.is_active for that). See
+    # _ensure_wallet_not_frozen in routers/wallet.py, the single choke point
+    # every wallet-touching endpoint calls before moving any money.
+    is_frozen = Column(Boolean, default=False)
+    frozen_reason = Column(String(500), nullable=True)
+    frozen_at = Column(DateTime, nullable=True)
+    frozen_by = Column(String(100), nullable=True)  # admin username
 
     user = relationship("User", back_populates="wallets")
     transactions = relationship("WalletTransaction", back_populates="wallet", cascade="all, delete-orphan")
