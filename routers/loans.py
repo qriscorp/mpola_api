@@ -1973,6 +1973,10 @@ def _offer_response(offer: LoanOffer, db: Session) -> dict:
         "application_status": app.status if app else None,
         "lender_id": offer.lender_id,
         "lender_name": offer.lender.full_name if offer.lender else None,
+        # So the borrower can see whether this lender is KYC-verified before
+        # accepting — same trust signal shown in reverse on the marketplace
+        # (lender viewing borrower's KYC status).
+        "lender_kyc_status": offer.lender.kyc_status if offer.lender else None,
         "amount": offer.amount,
         "interest_rate": offer.interest_rate,
         "duration": offer.duration,

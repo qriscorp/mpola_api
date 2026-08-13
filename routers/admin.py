@@ -488,6 +488,44 @@ def get_user_detail(
     }
 
 
+@router.get("/users/{username}/transactions")
+def get_user_transactions(
+    username: str,
+    skip: int = 0,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Full, paginated wallet transaction history for a user — backs the
+    "See All" link on the user detail page, which only shows the most
+    recent 50 inline."""
+    profile = UserRepo.get_user_by_username(db, username)
+    user_id = profile["id"]
+
+    wallet = db.query(Wallet).filter(Wallet.user_id == user_id).first()
+    if not wallet:
+        return {"total": 0, "transactions": []}
+
+    query = db.query(WalletTransaction).filter(WalletTransaction.wallet_id == wallet.id)
+    total = query.count()
+    transactions = query.order_by(WalletTransaction.created_at.desc()).offset(skip).limit(limit).all()
+
+    return {
+        "total": total,
+        "transactions": [
+            {
+                "id": tx.id,
+                "amount": tx.amount,
+                "type": tx.type,
+                "status": tx.status,
+                "description": tx.description,
+                "created_at": safe_isoformat(tx.created_at),
+            }
+            for tx in transactions
+        ],
+    }
+
+
 @router.put("/users/{username}/kyc")
 def review_kyc(
     username: str,
