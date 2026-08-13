@@ -4,7 +4,6 @@ Core dependencies used throughout the API — follows kumpi_api pattern.
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 from database import SessionLocal
 from database.tables import User
@@ -18,23 +17,14 @@ http_bearer = HTTPBearer(auto_error=False)
 def get_db():
     """Yield a database session; close when request finishes.
 
-    Also marks this connection as coming from the application — see the DB
-    triggers on wallets/wallet_transactions/platform_fee_transactions
-    (migration c9f4a2e7b6d1_wallets_balance_guard_trigger.py and its
-    follow-up), which reject direct edits to sensitive financial fields
-    (wallet balance, freeze status, transaction core facts, revenue
-    records) unless this session variable is set. Every request that comes
-    through the app sets it here, so legitimate code
-    (deposit/withdraw/make_repayment/approve_disbursement/
-    adjust_wallet_balance/toggle_wallet_freeze) is unaffected; a raw DB
-    client (a leaked credential, phpMyAdmin, an ad-hoc script) that never
-    runs this line gets rejected by the database itself, not just caught
-    after the fact by the drift check. audit_logs has no bypass at all,
-    for anyone — the app itself never updates or deletes an existing entry.
+    Connections opened here are automatically authorized for the DB guard
+    triggers on wallets/wallet_transactions/platform_fee_transactions (see
+    the connect-event listener in database/__init__.py) — nothing to do
+    here for that, it's handled once per physical connection at the pool
+    level, not per request.
     """
     db = SessionLocal()
     try:
-        db.execute(text("SET @app_authorized = 1"))
         yield db
     finally:
         db.close()

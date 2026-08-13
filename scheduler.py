@@ -22,7 +22,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func
 
 from database import SessionLocal
-from database.tables import User, Loan, LoanApplication, LoanOffer, LenderOfferTemplate, Guarantor, Wallet, PlatformFeeTransaction, PlatformSetting, AuditLog
+from database.tables import User, Loan, LoanApplication, LoanOffer, LenderOfferTemplate, Guarantor, Wallet, WalletTransaction, PlatformFeeTransaction, PlatformSetting, AuditLog
 from helpers import safe_isoformat
 from logging_module import logger
 from repository.auth_repo import _audit, _notify, _notify_admins, _send_email, _setting_enabled
@@ -352,8 +352,24 @@ def _reconcile_pending_payments() -> None:
         db.close()
 
 
+WALLET_DRIFT_FULL_SWEEP_INTERVAL = timedelta(hours=24)
+
+
+def _get_setting_str(db, key: str) -> str | None:
+    row = db.query(PlatformSetting).filter(PlatformSetting.key == key).first()
+    return row.value if row else None
+
+
+def _set_setting_str(db, key: str, value: str) -> None:
+    row = db.query(PlatformSetting).filter(PlatformSetting.key == key).first()
+    if row:
+        row.value = value
+    else:
+        db.add(PlatformSetting(key=key, value=value))
+
+
 def _check_wallet_drift() -> None:
-    """Runs every ~15 min. A wallet's stored balance should always exactly
+    """Runs every ~2 min. A wallet's stored balance should always exactly
     equal the running sum of its own completed WalletTransaction rows (see
     compute_wallet_drift in routers/admin.py, the same check GET
     /admin/reconciliation displays on demand) — any mismatch means a bug or
@@ -366,12 +382,42 @@ def _check_wallet_drift() -> None:
     that endpoint is the ONLY way to lift a freeze, auto or manual, so this
     can never resolve itself silently. Both the wallet owner and every admin
     are notified so it can't go unnoticed either.
+
+    Stays cheap as the platform grows: most runs only fully recompute
+    wallets with WalletTransaction activity (new rows, or a status change
+    like pending -> completed) since the last run — tracked via the
+    last_wallet_drift_check_at PlatformSetting — instead of every wallet's
+    entire history every 2 minutes. Every legitimate balance change writes
+    or updates a WalletTransaction in the same commit (see
+    _ensure_wallet_not_frozen / the wallets_guard DB trigger), so a wallet
+    with no new activity can't have newly drifted through the app. As a
+    safety net against anything that slips through that assumption (e.g.
+    a direct DB edit crafted to also satisfy the trigger), a full
+    all-wallets sweep still runs at least once every
+    WALLET_DRIFT_FULL_SWEEP_INTERVAL regardless of activity.
     """
     from routers.admin import compute_wallet_drift
 
     db = SessionLocal()
     try:
-        drifted = compute_wallet_drift(db)
+        now = datetime.now(timezone.utc)
+        last_check_str = _get_setting_str(db, "last_wallet_drift_check_at")
+        last_full_sweep_str = _get_setting_str(db, "last_wallet_drift_full_sweep_at")
+        last_full_sweep = datetime.fromisoformat(last_full_sweep_str) if last_full_sweep_str else None
+        do_full_sweep = last_full_sweep is None or (now - last_full_sweep) >= WALLET_DRIFT_FULL_SWEEP_INTERVAL
+
+        if do_full_sweep or not last_check_str:
+            drifted = compute_wallet_drift(db)
+        else:
+            last_check = datetime.fromisoformat(last_check_str)
+            active_wallet_ids = [
+                row[0] for row in db.query(WalletTransaction.wallet_id)
+                .filter(WalletTransaction.updated_at > last_check)
+                .distinct()
+                .all()
+            ]
+            drifted = compute_wallet_drift(db, wallet_ids=active_wallet_ids) if active_wallet_ids else []
+
         for d in drifted:
             wallet = db.query(Wallet).filter(Wallet.id == d["wallet_id"]).with_for_update().first()
             if not wallet or wallet.is_frozen:
@@ -409,6 +455,14 @@ def _check_wallet_drift() -> None:
                 type="wallet_drift_alert",
             )
             db.commit()
+
+        # Only advance the cursor after a fully successful run — if
+        # anything above raised, next run should re-check the same window
+        # rather than silently skip it.
+        _set_setting_str(db, "last_wallet_drift_check_at", now.isoformat())
+        if do_full_sweep:
+            _set_setting_str(db, "last_wallet_drift_full_sweep_at", now.isoformat())
+        db.commit()
     except Exception as e:
         logger.error(f"Wallet drift check failed: {e}")
         db.rollback()
@@ -708,13 +762,15 @@ def start_scheduler() -> None:
     )
     # Financial integrity — catches a wrong wallet balance fast and freezes
     # it before more money can move through it, rather than waiting for an
-    # admin to happen to open the Reconciliation page.
+    # admin to happen to open the Reconciliation page. 2min is safe to run
+    # this often because _check_wallet_drift only fully rescans wallets
+    # with recent activity, not the whole platform's history every time.
     _scheduler.add_job(
-        _check_wallet_drift, "interval", minutes=15, id="wallet_drift_check_job",
+        _check_wallet_drift, "interval", minutes=2, id="wallet_drift_check_job",
         next_run_time=datetime.now(timezone.utc),
     )
     _scheduler.start()
-    logger.info("Collections scheduler started (runs every 24h, digest weekly, payment reconciliation every 2min, wallet drift check every 15min)")
+    logger.info("Collections scheduler started (runs every 24h, digest weekly, payment reconciliation every 2min, wallet drift check every 2min)")
 
 
 def stop_scheduler() -> None:

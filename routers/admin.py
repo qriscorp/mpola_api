@@ -1257,14 +1257,18 @@ def get_revenue(
     }
 
 
-def compute_wallet_drift(db: Session) -> list[dict]:
+def compute_wallet_drift(db: Session, wallet_ids: list[str] | None = None) -> list[dict]:
     """Every wallet's stored balance reconstructed from the running sum of
     its own completed WalletTransaction rows — should always match exactly.
     Any mismatch means a bug or an out-of-band DB edit happened. Shared by
-    GET /admin/reconciliation (the on-demand admin view) and the
-    scheduler's _check_wallet_drift job (scheduler.py), which auto-freezes
-    every wallet this returns — so this is the single source of truth both
-    places agree on.
+    GET /admin/reconciliation (the on-demand admin view, always a full
+    check — pass wallet_ids=None) and the scheduler's _check_wallet_drift
+    job (scheduler.py), which auto-freezes every wallet this returns and
+    normally passes a narrow wallet_ids (only wallets with activity since
+    its last run) so routine checks stay cheap regardless of how large the
+    platform's total transaction history grows — cost scales with recent
+    activity, not everything that ever happened. Always exactly two batched
+    queries total (transactions, fee lookups), never one query per wallet.
     """
     # deposit is always a credit, withdrawal always a debit (both are pure
     # external<->wallet movement, unambiguous). repayment/disbursement are
@@ -1302,12 +1306,26 @@ def compute_wallet_drift(db: Session) -> list[dict]:
         if row[0]
     }
 
+    wallet_query = db.query(Wallet)
+    if wallet_ids is not None:
+        wallet_query = wallet_query.filter(Wallet.id.in_(wallet_ids))
+    wallets = wallet_query.all()
+    if not wallets:
+        return []
+
+    # One batched query for every relevant wallet's transactions, grouped
+    # in Python below — not one query per wallet (N+1), which is what made
+    # the original version scale with total history size instead of with
+    # however many wallets are actually being checked this run.
+    all_wallet_ids = [w.id for w in wallets]
+    txs_by_wallet: dict[str, list] = {}
+    for tx in db.query(WalletTransaction).filter(WalletTransaction.wallet_id.in_(all_wallet_ids)).all():
+        txs_by_wallet.setdefault(tx.wallet_id, []).append(tx)
+
     wallet_drift = []
-    wallets = db.query(Wallet).all()
     for wallet in wallets:
-        txs = db.query(WalletTransaction).filter(WalletTransaction.wallet_id == wallet.id).all()
         ledger_balance = 0.0
-        for tx in txs:
+        for tx in txs_by_wallet.get(wallet.id, []):
             if tx.status != "completed":
                 continue
             if tx.type in ("withdrawal", "admin_debit"):
