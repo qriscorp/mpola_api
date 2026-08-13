@@ -25,7 +25,7 @@ from database import SessionLocal
 from database.tables import User, Loan, LoanApplication, LoanOffer, LenderOfferTemplate, Guarantor, Wallet, PlatformFeeTransaction, PlatformSetting, AuditLog
 from helpers import safe_isoformat
 from logging_module import logger
-from repository.auth_repo import _audit, _notify, _send_email, _setting_enabled
+from repository.auth_repo import _audit, _notify, _notify_admins, _send_email, _setting_enabled
 
 
 def _setting(db, key: str, default: float) -> float:
@@ -352,6 +352,70 @@ def _reconcile_pending_payments() -> None:
         db.close()
 
 
+def _check_wallet_drift() -> None:
+    """Runs every ~15 min. A wallet's stored balance should always exactly
+    equal the running sum of its own completed WalletTransaction rows (see
+    compute_wallet_drift in routers/admin.py, the same check GET
+    /admin/reconciliation displays on demand) — any mismatch means a bug or
+    an out-of-band DB edit happened, which is serious enough on a platform
+    holding real money that it isn't left for an admin to notice next time
+    they happen to open that page. Any wallet found drifted is frozen
+    immediately (blocking every money-moving action on it — see
+    _ensure_wallet_not_frozen in routers/wallet.py) until an admin reviews
+    and manually unfreezes it via PUT /admin/wallets/{username}/freeze —
+    that endpoint is the ONLY way to lift a freeze, auto or manual, so this
+    can never resolve itself silently. Both the wallet owner and every admin
+    are notified so it can't go unnoticed either.
+    """
+    from routers.admin import compute_wallet_drift
+
+    db = SessionLocal()
+    try:
+        drifted = compute_wallet_drift(db)
+        for d in drifted:
+            wallet = db.query(Wallet).filter(Wallet.id == d["wallet_id"]).with_for_update().first()
+            if not wallet or wallet.is_frozen:
+                continue  # already frozen (this job earlier, or an admin) — don't re-freeze/re-notify every run
+            user = db.query(User).filter(User.id == wallet.user_id).first()
+            if not user:
+                continue
+
+            reason = (
+                f"Automatic freeze — ledger drift detected. Stored balance "
+                f"UGX {d['stored_balance']:,.0f} vs transaction ledger UGX "
+                f"{d['ledger_balance']:,.0f} (delta UGX {d['delta']:,.0f})."
+            )
+            wallet.is_frozen = True
+            wallet.frozen_reason = reason
+            wallet.frozen_at = datetime.now(timezone.utc)
+            wallet.frozen_by = "system"
+
+            _audit(db, "wallet_auto_frozen", username="system", user_id=user.id,
+                   resource_type="wallet", resource_id=wallet.id,
+                   details={"stored_balance": d["stored_balance"], "ledger_balance": d["ledger_balance"], "delta": d["delta"]})
+            _notify(
+                db, user.id,
+                title="Wallet frozen",
+                message=(
+                    f"Your wallet was automatically frozen — {reason} "
+                    "Our team is reviewing; contact support if you have questions."
+                ),
+                type="wallet_frozen",
+            )
+            _notify_admins(
+                db,
+                title="Wallet auto-frozen — drift detected",
+                message=f"{user.username}'s wallet was automatically frozen: {reason} Review via Reconciliation and unfreeze once resolved.",
+                type="wallet_drift_alert",
+            )
+            db.commit()
+    except Exception as e:
+        logger.error(f"Wallet drift check failed: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
 def _notify_low_balance_lenders(db, now) -> None:
     """Nudge actively-lending lenders whose balance can't cover another
     disbursement at their own recent pace. Re-arms (re-notifies) only after
@@ -642,8 +706,15 @@ def start_scheduler() -> None:
         _reconcile_pending_payments, "interval", minutes=2, id="payment_reconciliation_job",
         next_run_time=datetime.now(timezone.utc),
     )
+    # Financial integrity — catches a wrong wallet balance fast and freezes
+    # it before more money can move through it, rather than waiting for an
+    # admin to happen to open the Reconciliation page.
+    _scheduler.add_job(
+        _check_wallet_drift, "interval", minutes=15, id="wallet_drift_check_job",
+        next_run_time=datetime.now(timezone.utc),
+    )
     _scheduler.start()
-    logger.info("Collections scheduler started (runs every 24h, digest weekly, payment reconciliation every 2min)")
+    logger.info("Collections scheduler started (runs every 24h, digest weekly, payment reconciliation every 2min, wallet drift check every 15min)")
 
 
 def stop_scheduler() -> None:

@@ -1257,28 +1257,15 @@ def get_revenue(
     }
 
 
-@router.get("/reconciliation")
-def get_reconciliation_report(
-    lookback_days: int = Query(7, description="How far back to cross-check completed/failed transactions against UPG"),
-    db: Session = Depends(get_db),
-    admin: AuthUser = Depends(require_admin),
-):
-    """Financial integrity report, computed on demand (not stored/scheduled —
-    this is an occasionally-viewed admin report, not a live/push feature).
-    Two independent checks:
-
-    1. Wallet drift — every wallet's stored balance should exactly equal the
-       running sum of its own WalletTransaction rows. Any mismatch means a
-       bug or an out-of-band DB edit happened; this should always come back
-       empty on a healthy system.
-    2. Gateway cross-check — for deposit/withdrawal transactions in the
-       lookback window, re-ask UPG what it thinks the status is and flag any
-       disagreement with what we have stored. Best-effort: UPG errors for an
-       individual reference are skipped, not fatal to the whole report.
+def compute_wallet_drift(db: Session) -> list[dict]:
+    """Every wallet's stored balance reconstructed from the running sum of
+    its own completed WalletTransaction rows — should always match exactly.
+    Any mismatch means a bug or an out-of-band DB edit happened. Shared by
+    GET /admin/reconciliation (the on-demand admin view) and the
+    scheduler's _check_wallet_drift job (scheduler.py), which auto-freezes
+    every wallet this returns — so this is the single source of truth both
+    places agree on.
     """
-    from utils.upg_client import UPGClient
-
-    # ── 1. Wallet ledger drift ──────────────────────────────────────────
     # deposit is always a credit, withdrawal always a debit (both are pure
     # external<->wallet movement, unambiguous). repayment/disbursement are
     # each written as TWO WalletTransaction rows sharing the same `type` —
@@ -1337,14 +1324,39 @@ def get_reconciliation_report(
         if abs(delta) > 0.01:
             user = db.query(User).filter(User.id == wallet.user_id).first()
             wallet_drift.append({
+                "wallet_id": wallet.id,
                 "user_id": wallet.user_id,
                 "username": user.username if user else None,
                 "stored_balance": round(wallet.balance, 2),
                 "ledger_balance": round(ledger_balance, 2),
                 "delta": delta,
             })
+    return wallet_drift
 
-    # ── 2. Gateway cross-check ──────────────────────────────────────────
+
+@router.get("/reconciliation")
+def get_reconciliation_report(
+    lookback_days: int = Query(7, description="How far back to cross-check completed/failed transactions against UPG"),
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Financial integrity report — the on-demand admin view of the same two
+    checks the scheduler's _check_wallet_drift job runs continuously in the
+    background (scheduler.py; that job is the one that actually auto-freezes
+    a drifted wallet, this endpoint just displays the current state):
+
+    1. Wallet drift — see compute_wallet_drift above. Should always come
+       back empty on a healthy system.
+    2. Gateway cross-check — for deposit/withdrawal transactions in the
+       lookback window, re-ask UPG what it thinks the status is and flag any
+       disagreement with what we have stored. Best-effort: UPG errors for an
+       individual reference are skipped, not fatal to the whole report.
+    """
+    from utils.upg_client import UPGClient
+
+    wallet_drift = compute_wallet_drift(db)
+
+    # ── Gateway cross-check ──────────────────────────────────────────
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     recent_txs = db.query(WalletTransaction).filter(
         WalletTransaction.type.in_(["deposit", "withdrawal"]),
