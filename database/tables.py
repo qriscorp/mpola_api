@@ -651,10 +651,20 @@ class LoginSession(Base, TimestampMixin):
 # ═══════════════════════════════════════
 
 class Dispute(Base, TimestampMixin):
+    """Filed by one party (user_id) against the other side of a specific
+    loan (respondent_id, auto-derived from loan_id — whichever of
+    loan.borrower_id/lender_id isn't the filer). The two parties are meant
+    to try to work it out directly first — via DisputeMessage and the
+    propose/respond-to-proposal flow below — before either one escalates to
+    admin (status="investigating"). Admin can also step in and resolve
+    directly at any point. Disputes not tied to a loan (respondent_id null)
+    skip straight to admin, since there's no counterparty to negotiate
+    with."""
     __tablename__ = "disputes"
 
     id = Column(String(50), primary_key=True, default=generateUniqueId)
     user_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    respondent_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     loan_id = Column(String(50), ForeignKey("loans.id", ondelete="SET NULL"), nullable=True)
     category = Column(String(50), nullable=False)  # payment, loan_terms, fraud, disbursement, other
     description = Column(Text, nullable=False)
@@ -663,8 +673,36 @@ class Dispute(Base, TimestampMixin):
     resolved_by = Column(String(100), nullable=True)
     resolved_at = Column(DateTime, nullable=True)
 
+    # Single active settlement proposal (either party can propose; the
+    # other accepts or declines — accepting executes the actual wallet-to-
+    # wallet transfer and resolves the dispute). A fresh proposal overwrites
+    # whatever was here before, so this only ever tracks the current one,
+    # not a full negotiation history (DisputeMessage carries that instead).
+    proposed_by_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    proposal_note = Column(Text, nullable=True)
+    settlement_amount = Column(Float, nullable=True)
+    settlement_payer_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    proposal_status = Column(String(20), nullable=True)  # null (no active proposal), pending, declined
+
     user = relationship("User", foreign_keys=[user_id])
+    respondent = relationship("User", foreign_keys=[respondent_id])
+    proposed_by = relationship("User", foreign_keys=[proposed_by_id])
+    settlement_payer = relationship("User", foreign_keys=[settlement_payer_id])
     loan = relationship("Loan")
+    messages = relationship("DisputeMessage", back_populates="dispute", cascade="all, delete-orphan", order_by="DisputeMessage.created_at")
+
+
+class DisputeMessage(Base, TimestampMixin):
+    __tablename__ = "dispute_messages"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    dispute_id = Column(String(50), ForeignKey("disputes.id", ondelete="CASCADE"), nullable=False)
+    sender_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    is_admin = Column(Boolean, default=False)
+    message = Column(Text, nullable=False)
+
+    dispute = relationship("Dispute", back_populates="messages")
+    sender = relationship("User")
 
 
 # ═══════════════════════════════════════

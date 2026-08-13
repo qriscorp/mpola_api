@@ -22,6 +22,7 @@ from repository.models import (
 )
 from repository.security import require_admin, require_super_admin
 from repository.user_repo import UserRepo
+from routers.disputes import _dispute_response, _execute_dispute_settlement
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -91,6 +92,11 @@ def get_dashboard_stats(
     pending_offer_templates = db.query(func.count(LenderOfferTemplate.id)).filter(
         LenderOfferTemplate.status == "pending_review"
     ).scalar()
+    # "open" is a fresh, unescalated dispute the two parties are (or should
+    # be) still working out between themselves; "investigating" is one
+    # either party has escalated — that's the one that actually needs an
+    # admin's attention, so it's what drives the sidebar badge.
+    open_disputes = db.query(func.count(Dispute.id)).filter(Dispute.status == "investigating").scalar()
 
     # Real platform revenue — the 0.5% fee only (see utils/fee.py). Excludes
     # Interswitch/Flutterwave provider surcharges: those are collected from
@@ -210,6 +216,7 @@ def get_dashboard_stats(
             "default_rate": default_rate,
             "kyc_completion_rate": kyc_completion_rate,
             "pending_offer_templates": pending_offer_templates,
+            "open_disputes": open_disputes,
         },
         "loan_type_mix": loan_type_mix,
         "application_status_breakdown": application_status_breakdown,
@@ -1270,27 +1277,19 @@ def compute_wallet_drift(db: Session, wallet_ids: list[str] | None = None) -> li
     activity, not everything that ever happened. Always exactly two batched
     queries total (transactions, fee lookups), never one query per wallet.
     """
-    # deposit is always a credit, withdrawal always a debit (both are pure
-    # external<->wallet movement, unambiguous). repayment/disbursement are
-    # each written as TWO WalletTransaction rows sharing the same `type` —
-    # one debit (payer), one credit (payee) — with no direction column, so
-    # direction has to be inferred: the 0.5% TX_FEE_RATE platform fee is
-    # only ever attached (via PlatformFeeTransaction.wallet_transaction_id)
-    # to the PAYING side's own transaction (category "loan_repayment" for
-    # the borrower's repayment row, "loan_disbursement" for the lender's
-    # disbursement row — see routers/loans.py's make_repayment and
-    # approve_disbursement). The "late_fee_platform_cut" category is
-    # deliberately excluded here — it attaches to the *credit*-side
-    # (lender's) repayment row, not the debit side, so including it would
-    # misclassify that row as a debit.
-    debit_marker_categories = ("loan_repayment", "loan_disbursement")
-    debit_marked_tx_ids = {
-        row[0] for row in db.query(PlatformFeeTransaction.wallet_transaction_id)
-        .filter(PlatformFeeTransaction.category.in_(debit_marker_categories))
-        .all()
-        if row[0]
-    }
-    # A withdrawal/repayment/disbursement's WalletTransaction.amount only ever
+    # WalletTransaction.direction is set on every row this app has ever
+    # written (deposit/withdraw/repayment/disbursement/admin adjustment/
+    # dispute settlement/...) — it's the one authoritative signal for which
+    # way money moved, so it's trusted directly below rather than inferring
+    # direction from `type` with a hardcoded per-type whitelist that has to
+    # be remembered and kept in sync every time a new transaction type is
+    # added (this function used to do exactly that, and a repayment/
+    # disbursement fee-lookup query stood in for direction on those two
+    # types specifically — fragile, and a new type without an entry there
+    # would have silently gone the wrong way).
+    #
+    # The one thing that lookup is still needed for: a fee-bearing debit's
+    # WalletTransaction.amount only ever
     # records the "headline" amount (what the borrower owed on this
     # instalment, what the lender funded the loan with, what the user asked
     # to withdraw) — the platform/provider fee that ALSO left the same
@@ -1328,13 +1327,7 @@ def compute_wallet_drift(db: Session, wallet_ids: list[str] | None = None) -> li
         for tx in txs_by_wallet.get(wallet.id, []):
             if tx.status != "completed":
                 continue
-            if tx.type in ("withdrawal", "admin_debit"):
-                is_debit = True
-            elif tx.type in ("deposit", "admin_credit"):
-                is_debit = False
-            else:  # repayment or disbursement — direction inferred above
-                is_debit = tx.id in debit_marked_tx_ids
-            if is_debit:
+            if tx.direction == "debit":
                 ledger_balance -= tx.amount + total_fee_by_tx_id.get(tx.id, 0.0)
             else:
                 ledger_balance += tx.amount
@@ -1823,23 +1816,20 @@ def list_disputes(
 
     return {
         "total": total,
-        "disputes": [
-            {
-                "id": d.id,
-                "user_id": d.user_id,
-                "username": d.user.full_name or d.user.username if d.user else None,
-                "loan_id": d.loan_id,
-                "category": d.category,
-                "description": d.description,
-                "status": d.status,
-                "resolution_note": d.resolution_note,
-                "resolved_by": d.resolved_by,
-                "resolved_at": safe_isoformat(d.resolved_at),
-                "created_at": safe_isoformat(d.created_at),
-            }
-            for d in disputes
-        ],
+        "disputes": [_dispute_response(d) for d in disputes],
     }
+
+
+@router.get("/disputes/{dispute_id}")
+def get_dispute_detail(
+    dispute_id: str,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    dispute = db.query(Dispute).filter(Dispute.id == dispute_id).first()
+    if not dispute:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+    return {"dispute": _dispute_response(dispute, include_messages=True)}
 
 
 @router.put("/disputes/{dispute_id}")
@@ -1849,27 +1839,48 @@ def resolve_dispute(
     db: Session = Depends(get_db),
     admin: AuthUser = Depends(require_admin),
 ):
-    dispute = db.query(Dispute).filter(Dispute.id == dispute_id).first()
+    """Admin's final say — can resolve directly at any point, independent
+    of whether the two parties tried (or are still trying) to work it out
+    themselves. Unlike the party-to-party propose/accept flow, a settlement
+    here doesn't need the counterparty's consent — admin is the arbiter."""
+    dispute = db.query(Dispute).filter(Dispute.id == dispute_id).with_for_update().first()
     if not dispute:
         raise HTTPException(status_code=404, detail="Dispute not found")
     if data.status not in ("investigating", "resolved", "rejected"):
         raise HTTPException(status_code=400, detail="Invalid status")
+    if data.status in ("resolved", "rejected") and not (data.resolution_note or "").strip():
+        raise HTTPException(status_code=400, detail="A resolution note is required when resolving or rejecting a dispute")
+
+    if data.settlement_amount:
+        if data.status != "resolved":
+            raise HTTPException(status_code=400, detail="A settlement can only be applied when resolving the dispute")
+        if not dispute.respondent_id:
+            raise HTTPException(status_code=400, detail="This dispute has no counterparty — nothing to settle between")
+        if data.settlement_payer not in ("filer", "respondent"):
+            raise HTTPException(status_code=400, detail="settlement_payer must be 'filer' or 'respondent'")
+        payer_id = dispute.user_id if data.settlement_payer == "filer" else dispute.respondent_id
+        payee_id = dispute.respondent_id if data.settlement_payer == "filer" else dispute.user_id
+        _execute_dispute_settlement(db, dispute, payer_id, payee_id, data.settlement_amount, data.resolution_note or "Admin-resolved settlement")
 
     dispute.status = data.status
     dispute.resolution_note = data.resolution_note
     if data.status in ("resolved", "rejected"):
         dispute.resolved_by = admin.username
         dispute.resolved_at = datetime.now(timezone.utc)
+        dispute.proposal_status = None
 
     _audit(db, "dispute_resolved", username=admin.username,
-           resource_type="dispute", resource_id=dispute.id, details={"status": data.status})
-    _notify(
-        db, dispute.user_id,
-        title="Update on your dispute",
-        message=f"Your dispute has been marked as {data.status}." + (f" {data.resolution_note}" if data.resolution_note else ""),
-        type="dispute_update",
-        data={"dispute_id": dispute.id},
-    )
+           resource_type="dispute", resource_id=dispute.id,
+           details={"status": data.status, "settlement_amount": data.settlement_amount})
+
+    message = f"Your dispute has been marked as {data.status}." + (f" {data.resolution_note}" if data.resolution_note else "")
+    if data.settlement_amount:
+        message += f" A settlement of UGX {data.settlement_amount:,.0f} was processed."
+    for uid in (dispute.user_id, dispute.respondent_id):
+        if uid:
+            _notify(db, uid, title="Update on your dispute", message=message,
+                    type="dispute_update", data={"dispute_id": dispute.id})
+
     db.commit()
     return {"status": 200, "message": "Dispute updated"}
 

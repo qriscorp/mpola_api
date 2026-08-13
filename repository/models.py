@@ -485,6 +485,27 @@ class DisputeCreate(BaseModel):
 class DisputeResolve(BaseModel):
     status: str  # investigating, resolved, rejected
     resolution_note: Optional[str] = None
+    # Admin can settle money as part of resolving, same mechanism as the
+    # party-to-party propose/accept flow but under admin authority — no
+    # counterparty consent needed. payer must be "filer" or "respondent".
+    settlement_amount: Optional[float] = Field(None, gt=0)
+    settlement_payer: Optional[str] = None
+
+
+class DisputeMessageCreate(BaseModel):
+    message: str = Field(..., min_length=1, max_length=4000)
+
+
+class DisputeProposalCreate(BaseModel):
+    note: str = Field(..., min_length=1, max_length=2000)
+    settlement_amount: Optional[float] = Field(None, gt=0)
+    # Who would pay if this proposal is accepted — "self" (the proposer) or
+    # "other" (the counterparty). Irrelevant if settlement_amount is unset.
+    payer: str = "self"
+
+
+class DisputeProposalRespond(BaseModel):
+    accept: bool
 
 
 class WalletAdjustmentModel(BaseModel):
