@@ -1233,6 +1233,21 @@ def get_reconciliation_report(
         .all()
         if row[0]
     }
+    # A withdrawal/repayment/disbursement's WalletTransaction.amount only ever
+    # records the "headline" amount (what the borrower owed on this
+    # instalment, what the lender funded the loan with, what the user asked
+    # to withdraw) — the platform/provider fee that ALSO left the same
+    # wallet in that same operation is tracked separately here, keyed by the
+    # debit side's own wallet_transaction_id. Without adding it back in, the
+    # ledger reconstruction below undercounts every fee-bearing debit by
+    # exactly its fee and reports phantom "drift" that isn't real (the
+    # stored balance is correct; this reconstruction was missing a term).
+    total_fee_by_tx_id = {
+        row[0]: row[1] for row in db.query(
+            PlatformFeeTransaction.wallet_transaction_id, PlatformFeeTransaction.total_fee,
+        ).all()
+        if row[0]
+    }
 
     wallet_drift = []
     wallets = db.query(Wallet).all()
@@ -1248,7 +1263,10 @@ def get_reconciliation_report(
                 is_debit = False
             else:  # repayment or disbursement — direction inferred above
                 is_debit = tx.id in debit_marked_tx_ids
-            ledger_balance += -tx.amount if is_debit else tx.amount
+            if is_debit:
+                ledger_balance -= tx.amount + total_fee_by_tx_id.get(tx.id, 0.0)
+            else:
+                ledger_balance += tx.amount
         delta = round(wallet.balance - ledger_balance, 2)
         if abs(delta) > 0.01:
             user = db.query(User).filter(User.id == wallet.user_id).first()
