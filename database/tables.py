@@ -418,6 +418,15 @@ class LoanOffer(Base, TimestampMixin):
     lender = relationship("User", back_populates="offers_made", foreign_keys=[lender_id])
     template = relationship("LenderOfferTemplate")
 
+    __table_args__ = (
+        # Mirrors the live index created alongside the template_id FK (see
+        # migration b3f6a2d9c714) — must be declared here or `alembic
+        # revision --autogenerate` sees it as unmanaged and tries to DROP
+        # it, which MySQL then refuses since the FK constraint depends on
+        # it (same class of bug as CustomDocumentResponse above).
+        Index("ix_loan_offers_template_id", "template_id"),
+    )
+
 
 class LenderApplicationSkip(Base, TimestampMixin):
     """A lender explicitly declining to offer on a marketplace application.
