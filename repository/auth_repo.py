@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from comms_sdk import CommsSDK
 
 from config import JWT_SECRET, EGOSMS_USERNAME, EGOSMS_APIKEY, SMTP_USERNAME, SMTP_PASSWORD, SMTP_SERVER, SMTP_PORT
-from database.tables import User, OTP, LoginAttempt, AuditLog, SignupDraft, Notification, PlatformSetting, LoginSession, WebPushSubscription
+from database.tables import User, OTP, LoginAttempt, AuditLog, SignupDraft, Notification, PlatformSetting, LoginSession, WebPushSubscription, Wallet, WalletTransaction
 from helpers import generateUniqueId, normalizePhoneNumber, generateReferralCode, safe_isoformat
 from logging_module import logger
 from repository.models import AuthUser
@@ -33,6 +33,8 @@ PASSWORD_MIN_LENGTH = 8
 ALLOWED_REGISTRATION_ROLES = {"borrower", "lender"}  # Users CANNOT register as admin
 ALLOWED_LOGIN_PORTALS = {"borrower", "lender"}
 SIGNUP_DRAFT_EXPIRE_HOURS = 24
+REFERRAL_BONUS_AMOUNT = 20.0  # UGX credited to the referrer's wallet each time someone signs up via their link/code
+REFERRAL_DAILY_CAP = 10  # max bonus-paying referrals per referrer per rolling 24h — bounds farming damage without blocking real viral growth
 
 
 
@@ -176,6 +178,63 @@ def _audit(db: Session, action: str, username: str | None = None, user_id: str |
         # poison the active transaction if one of them fails.
     except Exception as e:
         logger.error(f"Audit log write failed: {e}")
+
+
+def _credit_referral_bonus(db: Session, referrer_id: str, new_user: User) -> None:
+    """Pays REFERRAL_BONUS_AMOUNT into the referrer's wallet the moment
+    someone signs up using their referral code/link, and notifies them.
+    Creates the wallet if the referrer hasn't set one up yet — they just
+    can't withdraw it until they set a PIN, same as any other credit.
+
+    Capped at REFERRAL_DAILY_CAP paid referrals per rolling 24h per
+    referrer — bounds the damage from someone farming throwaway accounts
+    (each of which still needs its own real phone number to clear OTP
+    verification before this even runs) without throttling genuine
+    high-volume referrers. Past the cap, the signup and the attribution
+    (referred_by_id, so they still show up in "people you've referred")
+    still go through — only the payout is skipped.
+
+    Never raises: a bonus-crediting failure must not block the new
+    account from being created.
+    """
+    try:
+        wallet = db.query(Wallet).filter(Wallet.user_id == referrer_id).with_for_update().first()
+        if wallet:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+            recent_bonus_count = db.query(func.count(WalletTransaction.id)).filter(
+                WalletTransaction.wallet_id == wallet.id,
+                WalletTransaction.type == "referral_bonus",
+                WalletTransaction.created_at >= cutoff,
+            ).scalar() or 0
+            if recent_bonus_count >= REFERRAL_DAILY_CAP:
+                logger.info(f"Referral bonus skipped for {referrer_id}: daily cap of {REFERRAL_DAILY_CAP} reached")
+                return
+            wallet.balance += REFERRAL_BONUS_AMOUNT
+        else:
+            wallet = Wallet(user_id=referrer_id, balance=REFERRAL_BONUS_AMOUNT)
+            db.add(wallet)
+
+        db.add(WalletTransaction(
+            wallet=wallet,
+            amount=REFERRAL_BONUS_AMOUNT,
+            type="referral_bonus",
+            direction="credit",
+            status="completed",
+            description=f"Referral bonus — {new_user.full_name or new_user.username} joined using your link",
+            counterparty=new_user.username,
+        ))
+
+        _notify(
+            db, referrer_id,
+            title="You earned a referral bonus!",
+            message=(
+                f"UGX {REFERRAL_BONUS_AMOUNT:,.0f} was added to your wallet — "
+                f"{new_user.full_name or new_user.username} just joined Mpola using your referral link."
+            ),
+            type="referral",
+        )
+    except Exception as e:
+        logger.error(f"Referral bonus credit failed for referrer {referrer_id}: {e}")
 
 
 
@@ -882,12 +941,7 @@ class AuthRepo:
         draft.created_user_id = user.id
 
         if referred_by_id:
-            _notify(
-                db, referred_by_id,
-                title="Your referral joined Mpola",
-                message=f"{user.full_name or user.username} just signed up using your referral link.",
-                type="referral",
-            )
+            _credit_referral_bonus(db, referred_by_id, user)
 
         _audit(
             db,
@@ -1040,6 +1094,9 @@ class AuthRepo:
 
         db.add(user)
         db.flush()
+
+        if referred_by_id:
+            _credit_referral_bonus(db, referred_by_id, user)
 
         # Generate tokens
         token = create_access_token(_auth_claims(user))
