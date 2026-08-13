@@ -154,8 +154,11 @@ class SignupDraftVerifyPhoneRequest(BaseModel):
 
 
 class UserUpdate(BaseModel):
+    # phone_number and email are deliberately absent — both are the
+    # channels OTP verification during registration/login relies on, so
+    # neither is ever user-editable after signup (see the KYC/Account page
+    # on both platforms, which now shows them as read-only).
     full_name: Optional[str] = None
-    phone_number: Optional[str] = None
     bio: Optional[str] = None
     profile_pic: Optional[str] = None
     nin: Optional[str] = None
@@ -545,6 +548,24 @@ class SupportMessageCreate(BaseModel):
 
 class SupportTicketStatusUpdate(BaseModel):
     status: str  # open, in_progress, resolved, closed
+
+
+class FaqCreate(BaseModel):
+    category: str = Field("general", max_length=50)
+    role: str = Field("all", max_length=20)  # all, borrower, lender
+    question: str = Field(..., min_length=3, max_length=500)
+    answer: str = Field(..., min_length=3, max_length=4000)
+    sort_order: int = 0
+    is_active: bool = True
+
+
+class FaqUpdate(BaseModel):
+    category: Optional[str] = Field(None, max_length=50)
+    role: Optional[str] = Field(None, max_length=20)
+    question: Optional[str] = Field(None, min_length=3, max_length=500)
+    answer: Optional[str] = Field(None, min_length=3, max_length=4000)
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
 
 
 # ─── Admin ────────────────────────────────────

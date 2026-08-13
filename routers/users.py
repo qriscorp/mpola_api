@@ -27,10 +27,13 @@ KYC_DOCUMENT_TYPES = {"national_id", "passport", "profile_photo", "proof_of_addr
 MAX_KYC_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
 ALLOWED_KYC_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
 
-# Once KYC is verified, documents are locked against re-upload for this long
-# — prevents a verified identity from being quietly swapped out — after
-# which the holder can refresh an aging document (e.g. an expiring ID) on
-# their own without needing to fail/rejoin KYC first.
+# Once a specific document is individually verified by admin, THAT document
+# is locked against re-upload for this long — prevents a verified identity
+# document from being quietly swapped out — after which the holder can
+# refresh an aging document (e.g. an expiring ID) on their own without
+# needing to fail/rejoin KYC first. Applies per-document: an already-
+# verified document is locked immediately even while the rest of the
+# account is still pending review (see _kyc_doc_response/upload_kyc_document).
 KYC_REVERIFICATION_LOCK_DAYS = 730
 
 # The non-identity half of DOCUMENT_LABEL_MAP (helpers.py) — supporting
@@ -43,6 +46,23 @@ BORROWER_DOCUMENT_TYPES = {
 }
 MAX_BORROWER_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
 ALLOWED_BORROWER_DOCUMENT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
+
+
+def _kyc_doc_response(d: KYCDocument) -> dict:
+    locked_until = None
+    if d.verified and d.verified_at:
+        until = d.verified_at + timedelta(days=KYC_REVERIFICATION_LOCK_DAYS)
+        if datetime.utcnow() < until:
+            locked_until = until.date().isoformat()
+    return {
+        "id": d.id,
+        "document_type": d.document_type,
+        "file_url": d.file_url,
+        "file_name": d.file_name,
+        "verified": d.verified,
+        "rejection_reason": d.rejection_reason,
+        "locked_until": locked_until,
+    }
 
 
 @router.get("/me")
@@ -108,13 +128,21 @@ async def upload_kyc_document(
     if document_type not in KYC_DOCUMENT_TYPES:
         raise HTTPException(status_code=400, detail=f"document_type must be one of {sorted(KYC_DOCUMENT_TYPES)}")
 
-    if user.kyc_status == "verified" and user.kyc_verified_at:
-        locked_until = user.kyc_verified_at + timedelta(days=KYC_REVERIFICATION_LOCK_DAYS)
+    # Locked per-document, not per-account — a document an admin already
+    # verified is locked from the moment it's verified, even while the rest
+    # of the account is still pending (kyc_status only reaches "verified"
+    # once every required document is). Anything not yet individually
+    # verified (pending review, or rejected) can always be replaced.
+    existing_doc = db.query(KYCDocument).filter(
+        KYCDocument.user_id == user.id, KYCDocument.document_type == document_type
+    ).first()
+    if existing_doc and existing_doc.verified and existing_doc.verified_at:
+        locked_until = existing_doc.verified_at + timedelta(days=KYC_REVERIFICATION_LOCK_DAYS)
         if datetime.utcnow() < locked_until:
             raise HTTPException(
                 status_code=400,
-                detail=f"Your KYC is verified — documents are locked until {locked_until.date().isoformat()}. "
-                       "Contact support if you need to update one sooner.",
+                detail=f"This document is verified — locked until {locked_until.date().isoformat()}. "
+                       "Contact support if you need to update it sooner.",
             )
 
     ext = os.path.splitext(file.filename or "")[1].lower()
@@ -133,15 +161,13 @@ async def upload_kyc_document(
     # Replace any existing upload of the same type rather than piling up —
     # re-uploading also resets it to unverified so a stale approval can't
     # silently carry over to a new file.
-    existing = db.query(KYCDocument).filter(
-        KYCDocument.user_id == user.id, KYCDocument.document_type == document_type
-    ).first()
-    if existing:
-        existing.file_url = f"{BASE_URL}/uploads/{stored_name}"
-        existing.file_name = file.filename
-        existing.verified = False
-        existing.rejection_reason = None
-        doc = existing
+    if existing_doc:
+        existing_doc.file_url = f"{BASE_URL}/uploads/{stored_name}"
+        existing_doc.file_name = file.filename
+        existing_doc.verified = False
+        existing_doc.verified_at = None
+        existing_doc.rejection_reason = None
+        doc = existing_doc
     else:
         doc = KYCDocument(
             user_id=user.id,
@@ -159,14 +185,7 @@ async def upload_kyc_document(
     return {
         "status": 200,
         "message": "Document uploaded",
-        "document": {
-            "id": doc.id,
-            "document_type": doc.document_type,
-            "file_url": doc.file_url,
-            "file_name": doc.file_name,
-            "verified": doc.verified,
-            "rejection_reason": doc.rejection_reason,
-        },
+        "document": _kyc_doc_response(doc),
     }
 
 
@@ -176,19 +195,7 @@ async def list_my_kyc_documents(
     user: User = Depends(current_active_user),
 ):
     docs = db.query(KYCDocument).filter(KYCDocument.user_id == user.id).all()
-    return {
-        "documents": [
-            {
-                "id": d.id,
-                "document_type": d.document_type,
-                "file_url": d.file_url,
-                "file_name": d.file_name,
-                "verified": d.verified,
-                "rejection_reason": d.rejection_reason,
-            }
-            for d in docs
-        ]
-    }
+    return {"documents": [_kyc_doc_response(d) for d in docs]}
 
 
 @router.post("/me/documents")

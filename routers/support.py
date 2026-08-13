@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from database.tables import User, SupportTicket, SupportMessage
 from helpers import safe_isoformat
-from repository.auth_repo import _audit
+from repository.auth_repo import _audit, _notify_admins
 from repository.dependencies import get_db, current_active_user
 from repository.models import SupportTicketCreate, SupportMessageCreate
 
@@ -52,6 +52,13 @@ def create_ticket(
     db.add(SupportMessage(ticket_id=ticket.id, sender_id=user.id, is_admin=False, message=data.message))
     _audit(db, "support_ticket_opened", username=user.username, user_id=user.id,
            resource_type="support_ticket", resource_id=ticket.id, details={"category": data.category})
+    _notify_admins(
+        db,
+        title=f"New support ticket: {ticket.subject}",
+        message=f"{user.full_name or user.username} ({data.category}): {data.message[:150]}",
+        type="support_ticket",
+        data={"ticket_id": ticket.id},
+    )
     db.commit()
     db.refresh(ticket)
     return {"status": 200, "message": "Ticket submitted", "ticket": _ticket_response(ticket, include_messages=True)}
@@ -103,6 +110,13 @@ def reply_to_ticket(
     db.add(SupportMessage(ticket_id=ticket.id, sender_id=user.id, is_admin=False, message=data.message))
     if ticket.status == "resolved":
         ticket.status = "open"  # user replying to a "resolved" ticket reopens it
+    _notify_admins(
+        db,
+        title=f"New reply on: {ticket.subject}",
+        message=f"{user.full_name or user.username}: {data.message[:150]}",
+        type="support_ticket_update",
+        data={"ticket_id": ticket.id},
+    )
     db.commit()
     db.refresh(ticket)
     return {"status": 200, "ticket": _ticket_response(ticket, include_messages=True)}

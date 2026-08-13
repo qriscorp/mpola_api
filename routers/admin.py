@@ -98,6 +98,11 @@ def get_dashboard_stats(
     # admin's attention, so it's what drives the sidebar badge.
     open_disputes = db.query(func.count(Dispute.id)).filter(Dispute.status == "investigating").scalar()
 
+    # Tickets nobody's looked at or acted on yet — "in_progress" means an
+    # admin already replied and is on it, so it doesn't need the badge's
+    # attention the way a fresh, untouched "open" ticket does.
+    open_support_tickets = db.query(func.count(SupportTicket.id)).filter(SupportTicket.status == "open").scalar()
+
     # Real platform revenue — the 0.5% fee only (see utils/fee.py). Excludes
     # Interswitch/Flutterwave provider surcharges: those are collected from
     # withdrawing users but passed straight through to the provider, so
@@ -217,6 +222,7 @@ def get_dashboard_stats(
             "kyc_completion_rate": kyc_completion_rate,
             "pending_offer_templates": pending_offer_templates,
             "open_disputes": open_disputes,
+            "open_support_tickets": open_support_tickets,
         },
         "loan_type_mix": loan_type_mix,
         "application_status_breakdown": application_status_breakdown,
@@ -668,6 +674,7 @@ def verify_kyc_document(
 
     document.verified = data.verified
     document.rejection_reason = None if data.verified else (data.reason or "Please re-upload a clearer copy.")
+    document.verified_at = datetime.utcnow() if data.verified else None
 
     _audit(db, "kyc_document_verified" if data.verified else "kyc_document_rejected",
            username=admin.username, resource_type="kyc_document", resource_id=document.id,

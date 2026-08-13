@@ -323,6 +323,12 @@ class KYCDocument(Base, TimestampMixin):
     # fresh upload or on verification. Presence of a reason (not `verified`
     # alone) is what distinguishes "rejected" from "still pending review".
     rejection_reason = Column(String(500), nullable=True)
+    # When THIS document was individually verified — drives its own
+    # re-upload lock (see KYC_REVERIFICATION_LOCK_DAYS in routers/users.py),
+    # independent of the other documents on the same account or of whether
+    # the account's overall kyc_status has reached "verified" yet. Cleared
+    # on a fresh upload or rejection, same as `verified` itself.
+    verified_at = Column(DateTime, nullable=True)
 
     user = relationship("User")
 
@@ -733,3 +739,23 @@ class SupportMessage(Base, TimestampMixin):
 
     ticket = relationship("SupportTicket", back_populates="messages")
     sender = relationship("User")
+
+
+# ═══════════════════════════════════════
+#  FAQ
+# ═══════════════════════════════════════
+
+class Faq(Base, TimestampMixin):
+    """Single source of truth for Help & Support FAQ content — replaces
+    what used to be hardcoded, independently-drifting arrays duplicated in
+    both the website and the app. `role` scopes a question to borrower,
+    lender, or both ("all")."""
+    __tablename__ = "faqs"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    category = Column(String(50), default="general")  # general, wallet, loan, kyc, bug, other
+    role = Column(String(20), default="all")  # all, borrower, lender
+    question = Column(String(500), nullable=False)
+    answer = Column(Text, nullable=False)
+    sort_order = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
