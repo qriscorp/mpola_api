@@ -25,6 +25,13 @@ from repository.user_repo import UserRepo
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
+KYC_DOCUMENT_LABELS = {
+    "national_id": "National ID",
+    "passport": "Passport",
+    "profile_photo": "Profile Photo",
+    "proof_of_address": "Proof of Address",
+}
+
 
 # ═══════════════════════════════════════════════
 #  DASHBOARD STATS
@@ -42,6 +49,15 @@ def get_dashboard_stats(
     active_users = db.query(func.count(User.id)).filter(User.is_active == True).scalar()
     suspended_users = db.query(func.count(User.id)).filter(User.is_active == False).scalar()
     verified_users = db.query(func.count(User.id)).filter(User.is_kyc_verified == True).scalar()
+    # Genuinely awaiting admin review — has actually uploaded at least one
+    # KYC document, as opposed to every not-yet-verified account (most of
+    # which haven't touched the KYC page at all and have nothing to review).
+    awaiting_review_users = (
+        db.query(func.count(func.distinct(User.id)))
+        .join(KYCDocument, KYCDocument.user_id == User.id)
+        .filter(User.is_kyc_verified == False)
+        .scalar()
+    )
 
     total_applications = db.query(func.count(LoanApplication.id)).scalar()
     pending_applications = db.query(func.count(LoanApplication.id)).filter(
@@ -172,6 +188,7 @@ def get_dashboard_stats(
             "active": active_users,
             "suspended": suspended_users,
             "verified": verified_users,
+            "awaiting_review": awaiting_review_users,
         },
         "applications": {
             "total": total_applications,
@@ -320,7 +337,12 @@ def get_users(
         elif status == "verified":
             query = query.filter(User.is_kyc_verified == True)
         elif status == "unverified":
-            query = query.filter(User.is_kyc_verified == False)
+            # Genuinely awaiting review — must have uploaded at least one KYC
+            # document. Without this, everyone who simply hasn't touched the
+            # KYC page yet (i.e. has nothing to review) shows up in the queue.
+            query = query.filter(User.is_kyc_verified == False).filter(
+                User.id.in_(db.query(KYCDocument.user_id).distinct())
+            )
 
     total = query.count()
     users = query.order_by(User.created_at.desc()).offset(skip).limit(limit).all()
@@ -466,6 +488,7 @@ def get_user_detail(
                 "file_url": d.file_url,
                 "file_name": d.file_name,
                 "verified": d.verified,
+                "rejection_reason": d.rejection_reason,
                 "created_at": safe_isoformat(d.created_at),
             }
             for d in kyc_documents
@@ -534,7 +557,8 @@ def review_kyc(
     admin: AuthUser = Depends(require_admin),
 ):
     """Admin approves or rejects a user's KYC — the only place in the codebase
-    that ever changes is_kyc_verified/kyc_status away from their defaults."""
+    that ever changes is_kyc_verified/kyc_status away from their defaults
+    (the other is the auto-reject cascade in verify_kyc_document below)."""
     if data.status not in ("verified", "rejected"):
         raise HTTPException(status_code=400, detail="status must be 'verified' or 'rejected'")
 
@@ -542,8 +566,30 @@ def review_kyc(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    if data.status == "verified":
+        # No loophole for approving an account with nothing (or unreviewed
+        # evidence) on file — require the same documents the borrower/
+        # lender KYC page presents as required to already be individually
+        # verified by an admin (see verify_kyc_document).
+        docs = {d.document_type: d for d in db.query(KYCDocument).filter(KYCDocument.user_id == user.id).all()}
+        has_photo = docs.get("profile_photo") is not None and docs["profile_photo"].verified
+        has_id = (docs.get("national_id") is not None and docs["national_id"].verified) or \
+                 (docs.get("passport") is not None and docs["passport"].verified)
+        if not (has_photo and has_id):
+            missing = []
+            if not has_id:
+                missing.append("a verified National ID or Passport")
+            if not has_photo:
+                missing.append("a verified Profile Photo")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Can't approve KYC — still missing {' and '.join(missing)}. "
+                       "Verify the individual documents first.",
+            )
+
     user.kyc_status = data.status
     user.is_kyc_verified = data.status == "verified"
+    user.kyc_verified_at = datetime.utcnow() if data.status == "verified" else None
 
     _audit(db, f"kyc_{data.status}", username=admin.username,
            resource_type="user", resource_id=user.id,
@@ -597,17 +643,56 @@ def verify_kyc_document(
     db: Session = Depends(get_db),
     admin: AuthUser = Depends(require_admin),
 ):
-    """Marks one of a user's account-level KYC documents as verified/unverified."""
+    """Marks one of a user's account-level KYC documents as verified or
+    rejected, and tells the document's owner either way. Rejecting a single
+    document automatically rejects the account's overall KYC too — an admin
+    who has already found one bad document doesn't need to separately reject
+    the whole application a second time via PUT /users/{username}/kyc."""
     document = db.query(KYCDocument).filter(KYCDocument.id == document_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
 
+    label = KYC_DOCUMENT_LABELS.get(document.document_type, document.document_type)
+    owner = document.user or db.query(User).filter(User.id == document.user_id).first()
+
     document.verified = data.verified
-    _audit(db, "kyc_document_verified" if data.verified else "kyc_document_unverified",
-           username=admin.username, resource_type="kyc_document", resource_id=document.id)
+    document.rejection_reason = None if data.verified else (data.reason or "Please re-upload a clearer copy.")
+
+    _audit(db, "kyc_document_verified" if data.verified else "kyc_document_rejected",
+           username=admin.username, resource_type="kyc_document", resource_id=document.id,
+           details={"document_type": document.document_type, "reason": document.rejection_reason})
+
+    if data.verified:
+        _notify(
+            db, document.user_id,
+            title="Document verified",
+            message=f"Your {label} was verified.",
+            type="kyc_update",
+        )
+    else:
+        # Cascade — same effect as an admin calling review_kyc(status="rejected").
+        if owner:
+            owner.kyc_status = "rejected"
+            owner.is_kyc_verified = False
+            owner.kyc_verified_at = None
+            _audit(db, "kyc_rejected", username=admin.username,
+                   resource_type="user", resource_id=owner.id,
+                   details={"target_user": owner.username, "note": f"Auto-rejected: {label} — {document.rejection_reason}"})
+        _notify(
+            db, document.user_id,
+            title="KYC document rejected",
+            message=f"Your {label} was rejected: {document.rejection_reason} "
+                    f"Please re-upload a corrected {label} to continue — your KYC is now marked as rejected.",
+            type="kyc_update",
+        )
     db.commit()
 
-    return {"success": True, "document_id": document.id, "verified": document.verified}
+    return {
+        "success": True,
+        "document_id": document.id,
+        "verified": document.verified,
+        "rejection_reason": document.rejection_reason,
+    }
 
 
 @router.put("/users/{username}/suspend")

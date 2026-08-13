@@ -50,6 +50,10 @@ class User(Base, TimestampMixin):
     is_phone_verified = Column(Boolean, default=False)
     is_kyc_verified = Column(Boolean, default=False)
     kyc_status = Column(String(20), default="pending")  # pending, verified, rejected
+    # When kyc_status last became "verified" — starts the 2-year re-upload
+    # lock (KYC_REVERIFICATION_LOCK_DAYS in routers/users.py) and is cleared
+    # whenever KYC is rejected, so a lock never survives a rejection.
+    kyc_verified_at = Column(DateTime, nullable=True)
     credit_score = Column(Integer, default=0)
     push_token = Column(Text, nullable=True)  # Expo push token
     # JWT refresh tokens can exceed 255 chars once claims/signature are included.
@@ -306,6 +310,10 @@ class KYCDocument(Base, TimestampMixin):
     file_url = Column(String(500), nullable=False)
     file_name = Column(String(255), nullable=True)
     verified = Column(Boolean, default=False)
+    # Set only when an admin rejects this specific document; cleared on a
+    # fresh upload or on verification. Presence of a reason (not `verified`
+    # alone) is what distinguishes "rejected" from "still pending review".
+    rejection_reason = Column(String(500), nullable=True)
 
     user = relationship("User")
 

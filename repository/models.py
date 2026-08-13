@@ -539,6 +539,7 @@ class KYCReviewUpdate(BaseModel):
 
 class DocumentVerifyUpdate(BaseModel):
     verified: bool
+    reason: Optional[str] = None  # required in practice when verified=False
 
 
 class AdminAccessUpdate(BaseModel):

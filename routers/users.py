@@ -3,7 +3,7 @@ Users router — profile management.
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -26,6 +26,12 @@ router = APIRouter(prefix="/users", tags=["Users"])
 KYC_DOCUMENT_TYPES = {"national_id", "passport", "profile_photo", "proof_of_address"}
 MAX_KYC_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
 ALLOWED_KYC_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
+
+# Once KYC is verified, documents are locked against re-upload for this long
+# — prevents a verified identity from being quietly swapped out — after
+# which the holder can refresh an aging document (e.g. an expiring ID) on
+# their own without needing to fail/rejoin KYC first.
+KYC_REVERIFICATION_LOCK_DAYS = 730
 
 # The non-identity half of DOCUMENT_LABEL_MAP (helpers.py) — supporting
 # financial/business documents a lender's standing offer might ask for.
@@ -102,6 +108,15 @@ async def upload_kyc_document(
     if document_type not in KYC_DOCUMENT_TYPES:
         raise HTTPException(status_code=400, detail=f"document_type must be one of {sorted(KYC_DOCUMENT_TYPES)}")
 
+    if user.kyc_status == "verified" and user.kyc_verified_at:
+        locked_until = user.kyc_verified_at + timedelta(days=KYC_REVERIFICATION_LOCK_DAYS)
+        if datetime.utcnow() < locked_until:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Your KYC is verified — documents are locked until {locked_until.date().isoformat()}. "
+                       "Contact support if you need to update one sooner.",
+            )
+
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in ALLOWED_KYC_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext or 'unknown'}")
@@ -125,6 +140,7 @@ async def upload_kyc_document(
         existing.file_url = f"{BASE_URL}/uploads/{stored_name}"
         existing.file_name = file.filename
         existing.verified = False
+        existing.rejection_reason = None
         doc = existing
     else:
         doc = KYCDocument(
@@ -149,6 +165,7 @@ async def upload_kyc_document(
             "file_url": doc.file_url,
             "file_name": doc.file_name,
             "verified": doc.verified,
+            "rejection_reason": doc.rejection_reason,
         },
     }
 
@@ -167,6 +184,7 @@ async def list_my_kyc_documents(
                 "file_url": d.file_url,
                 "file_name": d.file_name,
                 "verified": d.verified,
+                "rejection_reason": d.rejection_reason,
             }
             for d in docs
         ]
