@@ -67,6 +67,13 @@ class User(Base, TimestampMixin):
     notif_login_alerts = Column(Boolean, default=True)
     referral_code = Column(String(20), unique=True, nullable=True, index=True)
     referred_by_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # Click-wrap acceptance of the Platform Terms, Privacy Policy, and
+    # role-specific Code of Conduct at signup (RegisterStart.agree_to_terms,
+    # required and validated true) — copied from SignupDraft.terms_accepted_at
+    # at account-creation time. Null only for accounts created before this
+    # field existed. Surfaced to admins on the user detail page as part of
+    # KYC review.
+    terms_accepted_at = Column(DateTime, nullable=True)
 
     # Relationships
     wallets = relationship("Wallet", back_populates="user", cascade="all, delete-orphan")
@@ -125,6 +132,10 @@ class SignupDraft(Base, TimestampMixin):
     created_user_id = Column(String(50), nullable=True)
     referred_by_code = Column(String(20), nullable=True)
     expires_at = Column(DateTime, nullable=False)
+    # Stamped at register_start (RegisterStart.agree_to_terms is required and
+    # validated true) — copied onto the created User at draft-completion
+    # time so it survives past the draft's own lifetime.
+    terms_accepted_at = Column(DateTime, nullable=True)
 
 
 # ═══════════════════════════════════════

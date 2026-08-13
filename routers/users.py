@@ -3,6 +3,7 @@ Users router — profile management.
 """
 
 import os
+from datetime import datetime
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -50,6 +51,30 @@ async def update_profile(
     user: User = Depends(current_active_user),
 ):
     return UserRepo.update_user(db, user.username, data)
+
+
+@router.post("/me/sign-lender-agreement")
+async def sign_lender_agreement(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """A lender (re-)accepting the Platform Terms/Privacy Policy/Lender Code
+    of Conduct after registration — this is what issues their Mpola Licence
+    the first time (for accounts verified before this field existed) and
+    what "renewing" means afterwards (see LENDER_LICENCE_VALIDITY_DAYS in
+    repository/user_repo.py — the licence's 2-year clock IS this
+    timestamp). Requires KYC to already be verified; signing alone doesn't
+    grant a licence, admin approval does."""
+    if user.role != "lender":
+        raise HTTPException(status_code=400, detail="Only lenders have a Mpola Licence")
+    if user.kyc_status != "verified":
+        raise HTTPException(status_code=400, detail="Complete KYC verification before signing the lender agreement")
+
+    user.terms_accepted_at = datetime.utcnow()
+    _audit(db, "lender_agreement_signed", username=user.username, user_id=user.id,
+           resource_type="user", resource_id=user.id)
+    db.commit()
+    return UserRepo.get_user_by_username(db, user.username)
 
 
 @router.put("/me/push-token")

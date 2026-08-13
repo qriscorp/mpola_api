@@ -14,6 +14,35 @@ from helpers import safe_isoformat
 from logging_module import logger
 from repository.auth_repo import get_password_hash, _generate_unique_referral_code
 
+# A lender's Mpola Licence is valid for 2 years from whenever they last
+# accepted the Platform Terms/Privacy Policy/Lender Code of Conduct
+# (User.terms_accepted_at — set at signup, refreshable via
+# POST /users/me/sign-lender-agreement). Re-signing pushes this out another
+# 2 years, which is how a lender "renews" — no separate expiry column, the
+# licence clock IS the terms-acceptance clock.
+LENDER_LICENCE_VALIDITY_DAYS = 730
+
+
+def _lender_licence_info(user: User) -> dict:
+    """Not a lender → no licence concept at all. A lender who isn't yet
+    KYC-verified or hasn't accepted the agreement has a licence number
+    (deterministic from their id, so it's stable/predictable) but no real
+    issuance — 'not_issued' until both conditions are met."""
+    if user.role != "lender":
+        return {"licence_number": None, "licence_status": None, "licence_valid_until": None}
+
+    licence_number = f"LND-{user.id[:8].upper()}"
+    if user.kyc_status != "verified" or not user.terms_accepted_at:
+        return {"licence_number": licence_number, "licence_status": "not_issued", "licence_valid_until": None}
+
+    valid_until = user.terms_accepted_at + timedelta(days=LENDER_LICENCE_VALIDITY_DAYS)
+    status = "active" if valid_until > datetime.utcnow() else "expired"
+    return {
+        "licence_number": licence_number,
+        "licence_status": status,
+        "licence_valid_until": safe_isoformat(valid_until),
+    }
+
 
 class UserRepo:
 
@@ -49,6 +78,8 @@ class UserRepo:
             "notif_portfolio_digest": user.notif_portfolio_digest,
             "notif_login_alerts": user.notif_login_alerts,
             "created_at": safe_isoformat(user.created_at),
+            "terms_accepted_at": safe_isoformat(user.terms_accepted_at),
+            **_lender_licence_info(user),
         }
 
     @staticmethod

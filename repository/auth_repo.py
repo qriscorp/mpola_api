@@ -608,6 +608,11 @@ class AuthRepo:
             db.delete(draft)
             draft = None
 
+        # RegisterStart.agree_to_terms is a required, validated-true field —
+        # by the time we get here it's already guaranteed True, so this is
+        # just stamping when, not re-checking whether.
+        terms_accepted_at = datetime.utcnow()
+
         if not draft:
             draft = SignupDraft(
                 id=generateUniqueId(),
@@ -623,6 +628,7 @@ class AuthRepo:
                 phone_verified=False,
                 referred_by_code=(data.referred_by_code or None),
                 expires_at=datetime.utcnow() + timedelta(hours=SIGNUP_DRAFT_EXPIRE_HOURS),
+                terms_accepted_at=terms_accepted_at,
             )
             db.add(draft)
         else:
@@ -637,6 +643,7 @@ class AuthRepo:
             draft.phone_verified = False
             draft.referred_by_code = data.referred_by_code or draft.referred_by_code
             draft.expires_at = datetime.utcnow() + timedelta(hours=SIGNUP_DRAFT_EXPIRE_HOURS)
+            draft.terms_accepted_at = terms_accepted_at
             db.query(OTP).filter(OTP.username == draft.id).delete(synchronize_session=False)
 
         # Try email first; only fall back to SMS if the email genuinely fails
@@ -866,6 +873,7 @@ class AuthRepo:
             is_phone_verified=True,
             referral_code=_generate_unique_referral_code(db),
             referred_by_id=referred_by_id,
+            terms_accepted_at=draft.terms_accepted_at,
         )
         db.add(user)
         db.flush()

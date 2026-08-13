@@ -102,6 +102,12 @@ class RegisterStart(BaseModel):
     account_type: Optional[str] = "individual"
     role: Optional[str] = "borrower"  # borrower or lender
     referred_by_code: Optional[str] = Field(None, max_length=20)
+    # Required click-wrap acceptance of the Platform Terms, Privacy Policy,
+    # and role-specific Code of Conduct (the "agreement") shown right above
+    # the submit button on both frontends — stamped onto SignupDraft/User as
+    # terms_accepted_at so admins can see it during KYC review, not just a
+    # client-side UI gate.
+    agree_to_terms: bool = Field(...)
 
     @field_validator('email')
     @classmethod
@@ -118,6 +124,13 @@ class RegisterStart(BaseModel):
         if v and v.lower() not in allowed:
             return 'borrower'
         return v.lower() if v else 'borrower'
+
+    @field_validator('agree_to_terms')
+    @classmethod
+    def validate_agree_to_terms(cls, v: bool) -> bool:
+        if not v:
+            raise ValueError('You must agree to the Terms of Service, Privacy Policy, and Code of Conduct to register')
+        return v
 
 
 class SignupDraftRequest(BaseModel):
