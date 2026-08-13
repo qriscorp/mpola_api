@@ -664,7 +664,7 @@ class Dispute(Base, TimestampMixin):
 
     id = Column(String(50), primary_key=True, default=generateUniqueId)
     user_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    respondent_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    respondent_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     loan_id = Column(String(50), ForeignKey("loans.id", ondelete="SET NULL"), nullable=True)
     category = Column(String(50), nullable=False)  # payment, loan_terms, fraud, disbursement, other
     description = Column(Text, nullable=False)
@@ -696,7 +696,7 @@ class DisputeMessage(Base, TimestampMixin):
     __tablename__ = "dispute_messages"
 
     id = Column(String(50), primary_key=True, default=generateUniqueId)
-    dispute_id = Column(String(50), ForeignKey("disputes.id", ondelete="CASCADE"), nullable=False)
+    dispute_id = Column(String(50), ForeignKey("disputes.id", ondelete="CASCADE"), nullable=False, index=True)
     sender_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     is_admin = Column(Boolean, default=False)
     message = Column(Text, nullable=False)
