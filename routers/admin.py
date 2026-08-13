@@ -1146,13 +1146,18 @@ def list_all_payments(
         WalletTransaction.created_at.desc()
     ).offset(skip).limit(limit).all()
 
-    inflow_types = ("deposit", "repayment", "top_up")
-    outflow_types = ("withdrawal", "disbursement")
+    # Direction (credit/collect side vs debit/pay side), not type, is what
+    # actually says whether money is flowing in or out — repayment and
+    # disbursement each write TWO rows sharing the same `type` (one per
+    # wallet touched: payer's debit, payee's credit), so summing by type
+    # alone double-counts every repayment/disbursement's volume on both
+    # sides. direction is set on every WalletTransaction ever created (see
+    # deposit/withdraw/make_repayment/approve_disbursement/adjust_wallet_balance).
     total_in = db.query(func.sum(WalletTransaction.amount)).filter(
-        WalletTransaction.type.in_(inflow_types), WalletTransaction.status == "completed"
+        WalletTransaction.direction == "credit", WalletTransaction.status == "completed"
     ).scalar() or 0
     total_out = db.query(func.sum(WalletTransaction.amount)).filter(
-        WalletTransaction.type.in_(outflow_types), WalletTransaction.status == "completed"
+        WalletTransaction.direction == "debit", WalletTransaction.status == "completed"
     ).scalar() or 0
 
     return {
@@ -1165,6 +1170,7 @@ def list_all_payments(
                 "username": tx.wallet.user.full_name if tx.wallet and tx.wallet.user else None,
                 "amount": tx.amount,
                 "type": tx.type,
+                "direction": tx.direction,
                 "status": tx.status,
                 "description": tx.description,
                 "reference": tx.reference,
