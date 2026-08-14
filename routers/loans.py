@@ -58,6 +58,23 @@ def _loan_amount_bounds(db: Session) -> tuple[float, float]:
     )
 
 
+@router.get("/limits")
+async def get_lending_limits(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """The live, admin-configured bounds every lending form (borrower apply
+    wizard, lender manual offer, lender standing offer template) needs to
+    validate against — shared here so no client-side form drifts from a
+    hardcoded guess the moment an admin changes Settings."""
+    min_amount, max_amount = _loan_amount_bounds(db)
+    return {
+        "min_amount": min_amount,
+        "max_amount": max_amount,
+        "max_interest_rate": _max_interest_rate(db),
+    }
+
+
 def _max_interest_rate(db: Session) -> float:
     """Admin-configurable ceiling on a lender's interest_rate, expressed as
     %/month (see Admin Settings > Max Interest Rate)."""
@@ -176,10 +193,15 @@ async def check_application_eligibility(
 ):
     """Upfront check the Apply wizard calls before letting a borrower start
     — same rule create_application enforces server-side, exposed here so
-    the UI can show a clear reason instead of a rejected multi-step wizard."""
+    the UI can show a clear reason instead of a rejected multi-step wizard.
+    Also carries the current admin-configured loan amount bounds so the
+    wizard's client-side validation always matches what the server will
+    actually accept, instead of a hardcoded guess that drifts the moment
+    an admin changes Min/Max Loan Amount in Settings."""
+    min_amount, max_amount = _loan_amount_bounds(db)
     loan = _get_outstanding_loan(db, user.id)
     if not loan:
-        return {"can_apply": True, "blocking_loan": None}
+        return {"can_apply": True, "blocking_loan": None, "min_amount": min_amount, "max_amount": max_amount}
 
     remaining = round((loan.total_repayable or 0) - (loan.total_paid or 0), 2)
     return {
@@ -194,6 +216,8 @@ async def check_application_eligibility(
             "next_payment_date": safe_isoformat(loan.next_payment_date),
             "next_payment_amount": loan.next_payment_amount,
         },
+        "min_amount": min_amount,
+        "max_amount": max_amount,
     }
 
 
