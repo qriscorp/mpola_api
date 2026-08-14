@@ -636,6 +636,17 @@ async def make_offer(
     if app.max_interest_rate is not None and data.interest_rate > app.max_interest_rate:
         raise HTTPException(status_code=400, detail=f"Borrower capped this request at {app.max_interest_rate}%/month")
 
+    # A manual counter-offer can name its own amount (unlike a template-
+    # sourced offer, which always reuses app.amount — already bounded at
+    # application-creation time) so it needs the same platform bounds check
+    # here that create_application already enforces.
+    min_amount, max_amount = _loan_amount_bounds(db)
+    if data.amount < min_amount or data.amount > max_amount:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Offer amount must be between {min_amount:,.0f} and {max_amount:,.0f}",
+        )
+
     total_interest = _calc_interest(data.amount, data.interest_rate, data.duration, data.duration_days)
     total_repayable = data.amount + total_interest
     monthly_payment = total_repayable if data.duration_days is not None else total_repayable / data.duration
@@ -1049,6 +1060,10 @@ async def create_offer_template(
     matched against every pending application (and every new one going
     forward) and auto-generate real offers. See auto_match_offers_for_*.
     """
+    max_rate = _max_interest_rate(db)
+    if data.interest_rate > max_rate:
+        raise HTTPException(status_code=400, detail=f"Interest rate cannot exceed {max_rate}%/month")
+
     template = LenderOfferTemplate(
         lender_id=user.id,
         max_amount=data.max_amount,
@@ -1127,6 +1142,11 @@ async def update_offer_template(
             status_code=400,
             detail=f"Min loan amount ({effective_min:,.0f}) must be less than max loan amount ({effective_max:,.0f})",
         )
+
+    if "interest_rate" in update_dict:
+        max_rate = _max_interest_rate(db)
+        if update_dict["interest_rate"] > max_rate:
+            raise HTTPException(status_code=400, detail=f"Interest rate cannot exceed {max_rate}%/month")
 
     for key, val in update_dict.items():
         if key in ("accepted_loan_types", "required_documents"):
@@ -1298,6 +1318,12 @@ def _template_matches(db: Session, template: LenderOfferTemplate, app: LoanAppli
     if not (template.min_amount <= app.amount <= template.max_amount):
         return False
     if app.max_interest_rate is not None and template.interest_rate > app.max_interest_rate:
+        return False
+    # Re-checked here (not just at template creation/approval) so a template
+    # approved before the admin later lowered the platform cap doesn't keep
+    # silently auto-matching above it — it just stops matching new
+    # applications until the lender lowers the rate or the cap goes back up.
+    if template.interest_rate > _max_interest_rate(db):
         return False
 
     accepted_types = json.loads(template.accepted_loan_types) if template.accepted_loan_types else []

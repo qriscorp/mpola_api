@@ -1628,6 +1628,21 @@ def review_offer_template(
         raise HTTPException(status_code=404, detail="Offer template not found")
 
     if action == "approve":
+        # The submission-time check (create/update in routers/loans.py) can't
+        # catch a cap the admin lowered afterward, while this template sat in
+        # pending_review — check again here so nothing above the CURRENT
+        # platform cap can get approved.
+        from routers.loans import _max_interest_rate
+        max_rate = _max_interest_rate(db)
+        if template.interest_rate > max_rate:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"This template's rate ({template.interest_rate}%/month) exceeds the current "
+                    f"platform maximum of {max_rate}%/month — reject it or ask the lender to lower "
+                    f"the rate before it can be approved."
+                ),
+            )
         template.status = "approved"
     elif action == "reject":
         template.status = "rejected"
