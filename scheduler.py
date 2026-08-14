@@ -95,7 +95,12 @@ def _flag_overdue(db, now, grace_days: float, late_fee_rate: float) -> None:
         Loan.next_payment_date < cutoff,
     ).all()
     for loan in loans:
-        late_fee = round((loan.monthly_payment or 0) * late_fee_rate, 2)
+        # Charged on what's actually still owed for the overdue instalment
+        # — if a partial payment already chipped away at it (see
+        # make_repayment), next_payment_amount reflects the real shortfall,
+        # not the original full instalment.
+        outstanding = loan.next_payment_amount if loan.next_payment_amount is not None else loan.monthly_payment
+        late_fee = round((outstanding or 0) * late_fee_rate, 2)
         loan.status = "overdue"
         if late_fee > 0:
             loan.total_repayable = (loan.total_repayable or 0) + late_fee

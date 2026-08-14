@@ -64,6 +64,20 @@ def _max_interest_rate(db: Session) -> float:
     return _platform_setting(db, "max_interest_rate", 10)
 
 
+# Any loan status except "completed" still represents real money the
+# borrower owes — including "defaulted" (collection failing doesn't erase
+# the debt) and "pending_disbursement" (funds are already committed even
+# though they haven't landed yet). One outstanding loan at a time keeps a
+# borrower from stacking debt they're already behind on.
+OUTSTANDING_LOAN_STATUSES = ("pending_disbursement", "active", "overdue", "defaulted")
+
+
+def _get_outstanding_loan(db: Session, borrower_id: str) -> Loan | None:
+    return db.query(Loan).filter(
+        Loan.borrower_id == borrower_id, Loan.status.in_(OUTSTANDING_LOAN_STATUSES)
+    ).first()
+
+
 def _calc_interest(amount: float, rate: float, duration: int | None, duration_days: int | None) -> float:
     """Simple interest, rate is %/month. A standard loan multiplies by the
     month count directly; a short-term "emergency" loan (duration_days set)
@@ -91,6 +105,12 @@ async def create_application(
     user: User = Depends(current_active_user),
 ):
     """Create a new loan application. Borrowers only."""
+    if _get_outstanding_loan(db, user.id):
+        raise HTTPException(
+            status_code=400,
+            detail="You have an outstanding loan balance — settle it before applying for a new one.",
+        )
+
     min_amount, max_amount = _loan_amount_bounds(db)
     if data.amount < min_amount or data.amount > max_amount:
         raise HTTPException(
@@ -146,6 +166,34 @@ async def create_application(
         "status": 200,
         "message": "Loan application submitted",
         "application": _app_response(app),
+    }
+
+
+@router.get("/applications/eligibility")
+async def check_application_eligibility(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Upfront check the Apply wizard calls before letting a borrower start
+    — same rule create_application enforces server-side, exposed here so
+    the UI can show a clear reason instead of a rejected multi-step wizard."""
+    loan = _get_outstanding_loan(db, user.id)
+    if not loan:
+        return {"can_apply": True, "blocking_loan": None}
+
+    remaining = round((loan.total_repayable or 0) - (loan.total_paid or 0), 2)
+    return {
+        "can_apply": False,
+        "blocking_loan": {
+            "id": loan.id,
+            "amount": loan.amount,
+            "status": loan.status,
+            "total_repayable": loan.total_repayable,
+            "total_paid": loan.total_paid,
+            "remaining_balance": max(remaining, 0),
+            "next_payment_date": safe_isoformat(loan.next_payment_date),
+            "next_payment_amount": loan.next_payment_amount,
+        },
     }
 
 
@@ -1797,9 +1845,26 @@ async def make_repayment(
                 total_fee=late_fee_platform_cut,
             ))
 
-    loan.total_paid += data.amount
-    loan.paid_instalments += 1
-    if loan.total_paid >= loan.total_repayable:
+    # A repayment doesn't have to cover the whole instalment — a borrower
+    # can pay part of it now and the rest before the due date. The
+    # instalment only "completes" (advancing paid_instalments and pushing
+    # next_payment_date out another 30 days) once cumulative payments
+    # actually reach its threshold; short of that, next_payment_amount is
+    # corrected down to the real remaining shortfall, and next_payment_date
+    # is left untouched — if it passes before the shortfall clears, the
+    # collections job flags the loan overdue and charges a late fee on
+    # that actual remaining amount, not the original full instalment
+    # (see _flag_overdue in scheduler.py).
+    new_total_paid = round(loan.total_paid + data.amount, 2)
+    # min(...) guards against float drift between monthly_payment * n and
+    # the loan's real total_repayable (e.g. rounding on the last instalment).
+    current_instalment_threshold = min(
+        round(loan.monthly_payment * (loan.paid_instalments + 1), 2), loan.total_repayable
+    )
+
+    if new_total_paid >= loan.total_repayable:
+        loan.total_paid = new_total_paid
+        loan.paid_instalments = loan.total_instalments
         loan.status = "completed"
         loan.next_payment_date = None
         loan.next_payment_amount = None
@@ -1811,13 +1876,29 @@ async def make_repayment(
             data={"loan_id": loan.id},
             pref_key="notif_repayment_received",
         )
-    else:
+    elif new_total_paid >= current_instalment_threshold:
+        loan.total_paid = new_total_paid
+        loan.paid_instalments += 1
         loan.next_payment_date = datetime.now(timezone.utc) + timedelta(days=30)
         loan.next_payment_amount = loan.monthly_payment
         _notify(
             db, loan.lender_id,
             title="Payment received",
             message=f"{user.full_name or user.username} paid UGX {data.amount:,.0f} (instalment #{repayment.instalment_number}).",
+            type="repayment",
+            pref_key="notif_repayment_received",
+            data={"loan_id": loan.id},
+        )
+    else:
+        loan.total_paid = new_total_paid
+        loan.next_payment_amount = round(current_instalment_threshold - new_total_paid, 2)
+        _notify(
+            db, loan.lender_id,
+            title="Partial payment received",
+            message=(
+                f"{user.full_name or user.username} paid UGX {data.amount:,.0f} toward instalment "
+                f"#{repayment.instalment_number} — UGX {loan.next_payment_amount:,.0f} still due."
+            ),
             type="repayment",
             pref_key="notif_repayment_received",
             data={"loan_id": loan.id},
