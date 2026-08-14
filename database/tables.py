@@ -69,6 +69,13 @@ class User(Base, TimestampMixin):
     notif_loan_overdue = Column(Boolean, default=True)
     notif_portfolio_digest = Column(Boolean, default=False)
     notif_login_alerts = Column(Boolean, default=True)
+    # Borrower-facing counterparts to the lender-facing fields above (those
+    # gate lender-only notification sites — new application/repayment/
+    # overdue/portfolio are all always sent to loan.lender_id, never
+    # borrower_id — so a borrower toggling them would have no real effect).
+    notif_offer_received = Column(Boolean, default=True)
+    notif_payment_reminder = Column(Boolean, default=True)
+    notif_application_status = Column(Boolean, default=True)
     referral_code = Column(String(20), unique=True, nullable=True, index=True)
     referred_by_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     # Click-wrap acceptance of the Platform Terms, Privacy Policy, and

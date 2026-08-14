@@ -171,6 +171,9 @@ class UserUpdate(BaseModel):
     notif_loan_overdue: Optional[bool] = None
     notif_portfolio_digest: Optional[bool] = None
     notif_login_alerts: Optional[bool] = None
+    notif_offer_received: Optional[bool] = None
+    notif_payment_reminder: Optional[bool] = None
+    notif_application_status: Optional[bool] = None
 
 
 class PushTokenUpdate(BaseModel):
@@ -185,6 +188,11 @@ class ResetPasswordModel(BaseModel):
 class ChangePasswordModel(BaseModel):
     old_password: str = Field(..., min_length=1, max_length=128)
     new_password: str = Field(..., min_length=8, max_length=128)
+
+
+class SelfDeactivateModel(BaseModel):
+    password: str = Field(..., min_length=1, max_length=128)
+    reason: Optional[str] = Field(None, max_length=500)
 
 
 class SendPasswordResetCodeModel(BaseModel):

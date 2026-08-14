@@ -22,7 +22,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func
 
 from database import SessionLocal
-from database.tables import User, Loan, LoanApplication, LoanOffer, LenderOfferTemplate, Guarantor, Wallet, WalletTransaction, PlatformFeeTransaction, PlatformSetting, AuditLog
+from database.tables import User, Loan, Repayment, LoanApplication, LoanOffer, LenderOfferTemplate, Guarantor, Wallet, WalletTransaction, PlatformFeeTransaction, PlatformSetting, AuditLog
 from helpers import safe_isoformat
 from logging_module import logger
 from repository.auth_repo import _audit, _notify, _notify_admins, _send_email, _setting_enabled
@@ -82,6 +82,7 @@ def _send_reminders(db, now, reminder_days: float) -> None:
                     f"{loan.next_payment_date.strftime('%d %b %Y')}.",
             type="payment_reminder",
             data={"loan_id": loan.id},
+            pref_key="notif_payment_reminder",
         )
 
 
@@ -669,6 +670,7 @@ def _expire_stale_applications(db, now) -> None:
                     f"You can submit a new request whenever you're ready.",
             type="application_expired",
             data={"application_id": app.id},
+            pref_key="notif_application_status",
         )
 
         still_pending_guarantors = db.query(Guarantor).filter(
@@ -739,6 +741,55 @@ def run_weekly_digest_job() -> None:
         db.close()
 
 
+def run_lender_portfolio_digest_job() -> None:
+    """Sends each lender who has the "Portfolio digest" toggle on (User.
+    notif_portfolio_digest) a weekly summary of their own book — repayments
+    received, new loans funded, and how many active/overdue loans they're
+    carrying. Unlike run_weekly_digest_job (admin-wide, one email listing
+    platform totals), this is per-lender and personal to their own
+    portfolio, delivered as an in-app notification via the same _notify
+    pref_key mechanism every other notif_* toggle already uses."""
+    db = SessionLocal()
+    try:
+        since = datetime.now(timezone.utc) - timedelta(days=7)
+        lenders = db.query(User).filter(
+            User.role == "lender", User.notif_portfolio_digest == True  # noqa: E712
+        ).all()
+        for lender in lenders:
+            active_loans = db.query(func.count(Loan.id)).filter(
+                Loan.lender_id == lender.id, Loan.status.in_(["active", "overdue"])
+            ).scalar() or 0
+            repayments_received = db.query(func.sum(Repayment.amount)).join(
+                Loan, Repayment.loan_id == Loan.id
+            ).filter(
+                Loan.lender_id == lender.id, Repayment.created_at >= since, Repayment.status == "completed"
+            ).scalar() or 0.0
+            new_loans_funded = db.query(func.count(Loan.id)).filter(
+                Loan.lender_id == lender.id, Loan.disbursed_at >= since
+            ).scalar() or 0
+
+            if not (repayments_received or new_loans_funded or active_loans):
+                continue  # nothing worth reporting this week
+
+            _notify(
+                db, lender.id,
+                title="Your weekly portfolio digest",
+                message=(
+                    f"UGX {repayments_received:,.0f} received in repayments this week"
+                    + (f", {new_loans_funded} new loan{'s' if new_loans_funded != 1 else ''} funded" if new_loans_funded else "")
+                    + f" — {active_loans} active loan{'s' if active_loans != 1 else ''} in your portfolio."
+                ),
+                type="portfolio_digest",
+                pref_key="notif_portfolio_digest",
+            )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Lender portfolio digest job failed: {e}")
+    finally:
+        db.close()
+
+
 _scheduler: BackgroundScheduler | None = None
 
 
@@ -752,6 +803,10 @@ def start_scheduler() -> None:
     # server restart never spams admins with an extra digest email.
     _scheduler.add_job(
         run_weekly_digest_job, "interval", weeks=1, id="weekly_digest_job",
+        next_run_time=datetime.now(timezone.utc) + timedelta(weeks=1),
+    )
+    _scheduler.add_job(
+        run_lender_portfolio_digest_job, "interval", weeks=1, id="lender_portfolio_digest_job",
         next_run_time=datetime.now(timezone.utc) + timedelta(weeks=1),
     )
     # Frequent (not daily) — closes the gap where a card deposit/bank withdrawal

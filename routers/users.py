@@ -9,11 +9,14 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from config import BASE_URL
-from database.tables import User, KYCDocument, BorrowerDocument
-from helpers import generateUniqueId, normalizePhoneNumber, DOCUMENT_LABEL_MAP
-from repository.auth_repo import _audit
+from database.tables import (
+    User, KYCDocument, BorrowerDocument, Wallet, WalletTransaction, Loan,
+    LoanApplication, Repayment, SupportTicket, DeactivatedAccount,
+)
+from helpers import generateUniqueId, normalizePhoneNumber, safe_isoformat, DOCUMENT_LABEL_MAP
+from repository.auth_repo import _audit, verify_password
 from repository.dependencies import get_db, current_active_user
-from repository.models import UserUpdate, PushTokenUpdate
+from repository.models import UserUpdate, PushTokenUpdate, SelfDeactivateModel
 from repository.user_repo import UserRepo
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -280,6 +283,156 @@ async def list_my_borrower_documents(
             for d in docs
         ]
     }
+
+
+@router.get("/me/export")
+async def export_my_data(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Self-service data export — a JSON snapshot of everything Mpola holds
+    tied to this account: profile, KYC/supporting documents (metadata, not
+    the files themselves), wallet + transaction history, every loan the
+    user is on as borrower or lender, applications filed, and support
+    tickets. Read-only, no side effects."""
+    wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+    transactions = []
+    if wallet:
+        transactions = db.query(WalletTransaction).filter(WalletTransaction.wallet_id == wallet.id).all()
+
+    loans_as_borrower = db.query(Loan).filter(Loan.borrower_id == user.id).all()
+    loans_as_lender = db.query(Loan).filter(Loan.lender_id == user.id).all()
+    applications = db.query(LoanApplication).filter(LoanApplication.borrower_id == user.id).all()
+    kyc_docs = db.query(KYCDocument).filter(KYCDocument.user_id == user.id).all()
+    borrower_docs = db.query(BorrowerDocument).filter(BorrowerDocument.user_id == user.id).all()
+    tickets = db.query(SupportTicket).filter(SupportTicket.user_id == user.id).all()
+
+    def _loan_summary(l: Loan) -> dict:
+        return {
+            "id": l.id,
+            "role": "borrower" if l.borrower_id == user.id else "lender",
+            "amount": l.amount,
+            "interest_rate": l.interest_rate,
+            "status": l.status,
+            "total_paid": l.total_paid,
+            "total_repayable": l.total_repayable,
+            "disbursed_at": safe_isoformat(l.disbursed_at),
+            "created_at": safe_isoformat(l.created_at),
+        }
+
+    return {
+        "exported_at": safe_isoformat(datetime.utcnow()),
+        "profile": {
+            "username": user.username,
+            "full_name": user.full_name,
+            "email": user.email,
+            "phone_number": user.phone_number,
+            "role": user.role,
+            "account_type": user.account_type,
+            "nin": user.nin,
+            "kyc_status": user.kyc_status,
+            "created_at": safe_isoformat(user.created_at),
+        },
+        "kyc_documents": [
+            {"document_type": d.document_type, "verified": d.verified, "uploaded_at": safe_isoformat(d.created_at)}
+            for d in kyc_docs
+        ],
+        "supporting_documents": [
+            {"document_type": d.document_type, "verified": d.verified, "uploaded_at": safe_isoformat(d.created_at)}
+            for d in borrower_docs
+        ],
+        "wallet": {
+            "balance": wallet.balance if wallet else 0,
+            "currency": wallet.currency if wallet else "UGX",
+            "transactions": [
+                {
+                    "amount": t.amount,
+                    "type": t.type,
+                    "direction": t.direction,
+                    "status": t.status,
+                    "description": t.description,
+                    "created_at": safe_isoformat(t.created_at),
+                }
+                for t in transactions
+            ],
+        },
+        "loans": [_loan_summary(l) for l in [*loans_as_borrower, *loans_as_lender]],
+        "applications": [
+            {
+                "id": a.id,
+                "amount": a.amount,
+                "loan_type": a.loan_type,
+                "status": a.status,
+                "created_at": safe_isoformat(a.created_at),
+            }
+            for a in applications
+        ],
+        "support_tickets": [
+            {"subject": t.subject, "category": t.category, "status": t.status, "created_at": safe_isoformat(t.created_at)}
+            for t in tickets
+        ],
+    }
+
+
+@router.post("/me/deactivate")
+async def deactivate_my_account(
+    data: SelfDeactivateModel,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Self-service account deactivation — same effect as an admin's
+    PUT /admin/users/{username}/deactivate (soft delete: wallet purged, a
+    DeactivatedAccount stub kept for 30 days, the User row itself deleted),
+    but a self-service action doesn't have an admin's judgment behind it,
+    so it adds the guardrails that matter most: confirmed password, no
+    money left in the wallet, and no loan currently in flight on either
+    side of the platform (both would otherwise be silently cascade-deleted
+    along with the account, in whichever wallet/loan owns them)."""
+    if user.has_admin_access:
+        raise HTTPException(status_code=400, detail="Admin accounts can't self-deactivate — ask another admin.")
+    if not verify_password(data.password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Incorrect password")
+
+    active_loan = db.query(Loan).filter(
+        (Loan.borrower_id == user.id) | (Loan.lender_id == user.id),
+        Loan.status.in_(["pending_disbursement", "active", "overdue"]),
+    ).first()
+    if active_loan:
+        raise HTTPException(
+            status_code=400,
+            detail="You have a loan in progress — it needs to be fully repaid or completed before you can deactivate your account.",
+        )
+
+    wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+    if wallet:
+        if wallet.is_frozen:
+            raise HTTPException(status_code=400, detail="Your wallet is frozen — contact support before deactivating.")
+        if wallet.balance and wallet.balance > 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Withdraw your wallet balance (UGX {wallet.balance:,.0f}) before deactivating your account.",
+            )
+
+    record = DeactivatedAccount(
+        original_username=user.username,
+        original_email=user.email,
+        original_phone_number=user.phone_number,
+        deactivated_by=user.username,
+        scheduled_deletion_date=datetime.utcnow() + timedelta(days=30),
+        reason=data.reason or "Self-service deactivation",
+    )
+    db.add(record)
+
+    if wallet:
+        db.query(WalletTransaction).filter(WalletTransaction.wallet_id == wallet.id).delete(synchronize_session=False)
+        db.delete(wallet)
+
+    _audit(db, "user_deactivated", username=user.username, user_id=user.id,
+           resource_type="user", details={"target_user": user.username, "reason": data.reason, "self_service": True})
+    db.delete(user)
+    db.commit()
+
+    return {"status": 200, "message": "Account deactivated. Your data will be purged in 30 days."}
 
 
 @router.get("/search-guarantor-candidate")

@@ -613,6 +613,7 @@ async def make_offer(
         ),
         type="loan_offer",
         data={"application_id": app.id},
+        pref_key="notif_offer_received",
     )
     db.commit()
     db.refresh(offer)
@@ -1304,6 +1305,7 @@ def _create_offer_from_template(db: Session, app: LoanApplication, template: Len
         ),
         type="loan_offer",
         data={"application_id": app.id},
+        pref_key="notif_offer_received",
     )
     _notify(
         db, template.lender_id,
