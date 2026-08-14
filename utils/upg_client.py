@@ -74,9 +74,16 @@ class UPGClient:
 
     def _handle_response(self, response: requests.Response) -> Dict[str, Any]:
         if response.status_code >= 400:
-            raise Exception(
-                f"UPG request failed [{response.status_code}]: {response.text[:500]}"
+            # Full detail (provider rejection text, validation errors, etc.)
+            # is logged server-side only — never embedded in the exception
+            # itself, since that exception's str() is what ends up in a
+            # user-facing HTTPException detail at the call site. Matches
+            # kumpi_api's UPGClient._handle_response.
+            logger.error(
+                f"UPG error response {response.status_code} for "
+                f"{response.request.method} {response.request.url}: {response.text[:500]}"
             )
+            raise Exception(f"HTTP_{response.status_code}")
         return response.json()
 
     @staticmethod
@@ -231,3 +238,19 @@ class UPGClient:
     def transaction_id(result: Dict[str, Any]) -> str:
         # /v1/collect and /v1/disburse respond with camelCase (transactionId).
         return result.get("transactionId") or result.get("transaction_id", "")
+
+
+def friendly_upg_error(exc: Exception) -> str:
+    """Map a raw UPG/network exception to a message safe to show the end
+    user — mirrors kumpi_api's collect_compat/disburse_compat error mapping
+    so a mobile money failure reads the same way on both platforms, instead
+    of surfacing an internal detail like 'HTTP_502' or a raw connection
+    traceback straight into an HTTPException the client renders as-is."""
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "Unable to reach the payment network. Please check your connection and try again."
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "The payment is taking longer than expected. Please check your transaction history before trying again."
+    err = str(exc)
+    if any(code in err for code in ("HTTP_502", "HTTP_503", "HTTP_504")):
+        return "Payment could not be completed at this time. Please check your transaction history before trying again."
+    return "Payment failed. Please try again."

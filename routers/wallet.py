@@ -22,7 +22,7 @@ from repository.models import (
     WalletBankWithdrawInitiateModel,
 )
 from helpers import generateUniqueId, safe_isoformat
-from utils.upg_client import UPGClient, _detect_carrier, _normalize_phone
+from utils.upg_client import UPGClient, _detect_carrier, _normalize_phone, friendly_upg_error
 from utils.fee import calc_mobile_money_withdrawal_charges, calc_bank_withdrawal_charges
 
 router = APIRouter(prefix="/wallet", tags=["Wallet"])
@@ -123,7 +123,7 @@ async def deposit(
     try:
         resp = UPGClient().collect(amount=data.amount, phone=phone, carrier=carrier)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Payment gateway error: {e}")
+        raise HTTPException(status_code=502, detail=friendly_upg_error(e))
 
     if not UPGClient.is_success(resp):
         raise HTTPException(status_code=400, detail=resp.get("message", "Mobile money collection failed"))
@@ -186,7 +186,7 @@ async def withdraw(
     try:
         resp = UPGClient().disburse(amount=data.amount, phone=phone, carrier=carrier)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Payment gateway error: {e}")
+        raise HTTPException(status_code=502, detail=friendly_upg_error(e))
 
     if not UPGClient.is_success(resp):
         raise HTTPException(status_code=400, detail=resp.get("message", "Mobile money disbursement failed"))

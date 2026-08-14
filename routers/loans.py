@@ -18,7 +18,7 @@ from repository.models import LoanApplicationCreate, LoanApplicationUpdate, Loan
 from repository.security import require_roles
 from routers.users import ALLOWED_BORROWER_DOCUMENT_EXTENSIONS, MAX_BORROWER_DOCUMENT_SIZE_BYTES
 from routers.wallet import _ensure_wallet_not_frozen
-from utils.upg_client import UPGClient, _detect_carrier
+from utils.upg_client import UPGClient, _detect_carrier, friendly_upg_error
 from utils.fee import calc_platform_fee, calc_late_fee_platform_cut
 
 # Also the exact count GuarantorAttach requires — auto-matching against lender
@@ -1812,7 +1812,7 @@ async def make_repayment(
         try:
             resp = UPGClient().collect(amount=data.amount, phone=phone, carrier=carrier)
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Payment gateway error: {e}")
+            raise HTTPException(status_code=502, detail=friendly_upg_error(e))
         if not UPGClient.is_success(resp):
             raise HTTPException(status_code=400, detail=resp.get("message", "Mobile money collection failed"))
         repayment.transaction_id = UPGClient.transaction_id(resp)
