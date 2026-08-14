@@ -1,8 +1,12 @@
+import csv
+import io
 import json
 import secrets
+import zipfile
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from sqlalchemy import func
 from sqlalchemy.orm import Session, aliased
 
@@ -1690,6 +1694,82 @@ def unfreeze_offer_template(
 #  PLATFORM SETTINGS
 # ═══════════════════════════════════════════════
 
+# Bounds for every numeric platform setting that actually drives backend
+# behavior (loan bounds, interest rate cap, the collections engine, offer/
+# payment expiry timers) — a bad value here isn't cosmetic, it directly
+# controls what borrowers/lenders can submit and how the daily scheduler
+# jobs behave platform-wide, so it's validated the same way max_interest_rate
+# always was rather than accepted as an arbitrary string.
+# Format: key -> (caster, min, max, human label)
+NUMERIC_SETTING_BOUNDS: dict[str, tuple[type, float, float, str]] = {
+    "min_loan_amount": (float, 100, 1_000_000_000, "Minimum Loan Amount"),
+    "max_loan_amount": (float, 100, 1_000_000_000, "Maximum Loan Amount"),
+    "max_interest_rate": (float, 0.1, 25, "Max Interest Rate"),
+    "reminder_days_before_due": (int, 1, 30, "Payment Reminder (days before due)"),
+    "grace_period_days": (int, 0, 90, "Grace Period"),
+    "default_after_days": (int, 1, 365, "Default After"),
+    # Stored as a fraction (0.02 == 2%) — the frontend converts the percentage
+    # a human types into this fraction before sending it here.
+    "late_fee_rate": (float, 0, 1, "Late Fee"),
+    "guarantor_reminder_after_hours": (int, 1, 168, "Guarantor Reminder After"),
+    "guarantor_reminder_cooldown_hours": (int, 1, 168, "Guarantor Reminder Cooldown"),
+    "low_balance_lookback_days": (int, 1, 90, "Low Balance Lookback"),
+    "low_balance_notify_cooldown_days": (int, 1, 30, "Low Balance Notify Cooldown"),
+    "matched_offer_expiry_days": (int, 1, 90, "Matched Offer Expiry"),
+    "payment_pending_expiry_hours": (int, 1, 168, "Payment Pending Expiry"),
+}
+
+BOOLEAN_SETTING_KEYS = {"maintenance_mode", "notif_new_applications", "notif_weekly_digest"}
+
+
+def _current_setting_value(db: Session, key: str, default: str) -> str:
+    row = db.query(PlatformSetting).filter(PlatformSetting.key == key).first()
+    return row.value if row else default
+
+
+def _validate_setting_value(db: Session, key: str, value: str) -> None:
+    if key in NUMERIC_SETTING_BOUNDS:
+        cast, lo, hi, label = NUMERIC_SETTING_BOUNDS[key]
+        try:
+            parsed = cast(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{label} must be a number")
+        if not (lo <= parsed <= hi):
+            raise HTTPException(status_code=400, detail=f"{label} must be between {lo:g} and {hi:g}")
+
+        # Cross-field sanity checks — caught against whatever the OTHER
+        # field currently holds in the DB (each field is saved via its own
+        # PUT, not a single atomic multi-field request).
+        if key == "min_loan_amount":
+            current_max = float(_current_setting_value(db, "max_loan_amount", "50000000"))
+            if parsed >= current_max:
+                raise HTTPException(status_code=400, detail="Minimum loan amount must be less than the maximum")
+        elif key == "max_loan_amount":
+            current_min = float(_current_setting_value(db, "min_loan_amount", "1000"))
+            if parsed <= current_min:
+                raise HTTPException(status_code=400, detail="Maximum loan amount must be greater than the minimum")
+        elif key == "grace_period_days":
+            current_default_after = float(_current_setting_value(db, "default_after_days", "60"))
+            if parsed >= current_default_after:
+                raise HTTPException(status_code=400, detail="Grace Period must be less than Default After (days overdue)")
+        elif key == "default_after_days":
+            current_grace = float(_current_setting_value(db, "grace_period_days", "3"))
+            if parsed <= current_grace:
+                raise HTTPException(status_code=400, detail="Default After must be greater than the Grace Period")
+
+    elif key in BOOLEAN_SETTING_KEYS:
+        if value not in ("true", "false"):
+            raise HTTPException(status_code=400, detail=f"{key} must be true or false")
+
+    elif key == "support_email":
+        if "@" not in value or "." not in value.split("@")[-1] or value.startswith("@"):
+            raise HTTPException(status_code=400, detail="Support email must be a valid email address")
+
+    elif key == "platform_name":
+        if not value.strip():
+            raise HTTPException(status_code=400, detail="Platform name can't be empty")
+
+
 @router.get("/settings")
 def get_settings(
     db: Session = Depends(get_db),
@@ -1706,13 +1786,7 @@ def update_setting(
     db: Session = Depends(get_db),
     admin: AuthUser = Depends(require_admin),
 ):
-    if key == "max_interest_rate":
-        try:
-            rate = float(data.value)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Max Interest Rate must be a number")
-        if not (0.1 <= rate <= 25):
-            raise HTTPException(status_code=400, detail="Max Interest Rate must be between 0.1% and 25%")
+    _validate_setting_value(db, key, data.value)
 
     setting = db.query(PlatformSetting).filter(PlatformSetting.key == key).first()
     if not setting:
@@ -1726,6 +1800,97 @@ def update_setting(
            details={"value": data.value})
     db.commit()
     return {"success": True, "key": key, "value": data.value}
+
+
+def _rows_to_csv_bytes(rows: list[dict]) -> bytes:
+    if not rows:
+        return b""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue().encode("utf-8")
+
+
+@router.get("/export-all-data")
+def export_all_data(
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_super_admin),
+):
+    """Danger Zone: a full platform data dump — one CSV per major table,
+    zipped together. Super-admin only (not just admin) since this is a bulk
+    export of every user's PII, unlike anything else on this page."""
+    users = db.query(User).all()
+    loans = db.query(Loan).all()
+    applications = db.query(LoanApplication).all()
+    repayments = db.query(Repayment).all()
+    transactions = db.query(WalletTransaction).all()
+    disputes = db.query(Dispute).all()
+    tickets = db.query(SupportTicket).all()
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("users.csv", _rows_to_csv_bytes([
+            {
+                "id": u.id, "username": u.username, "full_name": u.full_name,
+                "email": u.email, "phone_number": u.phone_number, "role": u.role,
+                "account_type": u.account_type, "kyc_status": u.kyc_status,
+                "is_admin": u.has_admin_access, "credit_score": u.credit_score,
+                "created_at": safe_isoformat(u.created_at),
+            } for u in users
+        ]))
+        zf.writestr("loans.csv", _rows_to_csv_bytes([
+            {
+                "id": l.id, "borrower_id": l.borrower_id, "lender_id": l.lender_id,
+                "amount": l.amount, "interest_rate": l.interest_rate, "status": l.status,
+                "total_paid": l.total_paid, "total_repayable": l.total_repayable,
+                "disbursed_at": safe_isoformat(l.disbursed_at), "created_at": safe_isoformat(l.created_at),
+            } for l in loans
+        ]))
+        zf.writestr("applications.csv", _rows_to_csv_bytes([
+            {
+                "id": a.id, "borrower_id": a.borrower_id, "reference_number": a.reference_number,
+                "amount": a.amount, "loan_type": a.loan_type, "status": a.status,
+                "interest_rate": a.interest_rate, "created_at": safe_isoformat(a.created_at),
+            } for a in applications
+        ]))
+        zf.writestr("repayments.csv", _rows_to_csv_bytes([
+            {
+                "id": r.id, "loan_id": r.loan_id, "amount": r.amount,
+                "instalment_number": r.instalment_number, "status": r.status,
+                "payment_method": r.payment_method, "created_at": safe_isoformat(r.created_at),
+            } for r in repayments
+        ]))
+        zf.writestr("wallet_transactions.csv", _rows_to_csv_bytes([
+            {
+                "id": t.id, "wallet_id": t.wallet_id, "amount": t.amount, "type": t.type,
+                "direction": t.direction, "status": t.status, "counterparty": t.counterparty,
+                "created_at": safe_isoformat(t.created_at),
+            } for t in transactions
+        ]))
+        zf.writestr("disputes.csv", _rows_to_csv_bytes([
+            {
+                "id": d.id, "user_id": d.user_id, "respondent_id": d.respondent_id,
+                "loan_id": d.loan_id, "category": d.category, "status": d.status,
+                "created_at": safe_isoformat(d.created_at),
+            } for d in disputes
+        ]))
+        zf.writestr("support_tickets.csv", _rows_to_csv_bytes([
+            {
+                "id": t.id, "user_id": t.user_id, "subject": t.subject,
+                "category": t.category, "status": t.status, "created_at": safe_isoformat(t.created_at),
+            } for t in tickets
+        ]))
+
+    _audit(db, "platform_data_exported", username=admin.username, resource_type="platform")
+    db.commit()
+
+    filename = f"mpola-platform-export-{datetime.now(timezone.utc).date().isoformat()}.zip"
+    return Response(
+        content=zip_buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ═══════════════════════════════════════════════

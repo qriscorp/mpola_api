@@ -12,3 +12,4 @@ from routers.disputes import router as disputes_router
 from routers.sessions import router as sessions_router
 from routers.webpush import router as webpush_router
 from routers.faqs import router as faqs_router, admin_router as faqs_admin_router
+from routers.public import router as public_router

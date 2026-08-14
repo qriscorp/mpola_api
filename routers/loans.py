@@ -54,7 +54,7 @@ def _platform_setting(db: Session, key: str, default: float) -> float:
 def _loan_amount_bounds(db: Session) -> tuple[float, float]:
     return (
         _platform_setting(db, "min_loan_amount", 1000),
-        _platform_setting(db, "max_loan_amount", 50000000),
+        _platform_setting(db, "max_loan_amount", 100000000),
     )
 
 
