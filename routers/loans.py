@@ -1724,6 +1724,19 @@ async def make_repayment(
     if loan.status not in ("active", "overdue"):
         raise HTTPException(status_code=400, detail="Loan is not active")
 
+    # A repayment can be partial, exact, or ahead-of-schedule, but never
+    # more than what's actually still owed — without this a borrower could
+    # send real money past their debt with no way to get it back (the loan
+    # just completes with total_paid overshooting total_repayable). The
+    # 1 UGX tolerance absorbs float rounding on the remaining-balance calc,
+    # not a real allowance to overpay.
+    remaining_balance = round((loan.total_repayable or 0) - (loan.total_paid or 0), 2)
+    if data.amount > remaining_balance + 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Amount exceeds your remaining loan balance of UGX {remaining_balance:,.0f}",
+        )
+
     # Checked regardless of payment method — a frozen wallet blocks the
     # holder's money movement platform-wide, not just direct wallet-ledger
     # transfers (mobile money repayments bypass the wallet entirely below).
@@ -1856,11 +1869,6 @@ async def make_repayment(
     # that actual remaining amount, not the original full instalment
     # (see _flag_overdue in scheduler.py).
     new_total_paid = round(loan.total_paid + data.amount, 2)
-    # min(...) guards against float drift between monthly_payment * n and
-    # the loan's real total_repayable (e.g. rounding on the last instalment).
-    current_instalment_threshold = min(
-        round(loan.monthly_payment * (loan.paid_instalments + 1), 2), loan.total_repayable
-    )
 
     if new_total_paid >= loan.total_repayable:
         loan.total_paid = new_total_paid
@@ -1876,33 +1884,64 @@ async def make_repayment(
             data={"loan_id": loan.id},
             pref_key="notif_repayment_received",
         )
-    elif new_total_paid >= current_instalment_threshold:
-        loan.total_paid = new_total_paid
-        loan.paid_instalments += 1
-        loan.next_payment_date = datetime.now(timezone.utc) + timedelta(days=30)
-        loan.next_payment_amount = loan.monthly_payment
-        _notify(
-            db, loan.lender_id,
-            title="Payment received",
-            message=f"{user.full_name or user.username} paid UGX {data.amount:,.0f} (instalment #{repayment.instalment_number}).",
-            type="repayment",
-            pref_key="notif_repayment_received",
-            data={"loan_id": loan.id},
-        )
     else:
+        # A single payment isn't necessarily capped at one instalment's
+        # worth — a free-text amount lets a borrower catch up on more than
+        # one instalment at once, or overpay the current one without fully
+        # covering the next. Walk forward through instalment thresholds
+        # (min(...) guards against float drift between monthly_payment * n
+        # and the loan's real total_repayable, e.g. rounding on the last
+        # instalment) to find how many this cumulative total now actually
+        # covers, so next_payment_amount always reflects the real,
+        # credit-aware shortfall rather than a flat monthly_payment — that
+        # figure also feeds _flag_overdue's late-fee calc (scheduler.py),
+        # so getting it wrong there would overcharge a borrower who overpaid.
+        paid_instalments = loan.paid_instalments
+        while paid_instalments < loan.total_instalments:
+            threshold = min(round(loan.monthly_payment * (paid_instalments + 1), 2), loan.total_repayable)
+            if new_total_paid >= threshold:
+                paid_instalments += 1
+            else:
+                break
+        advanced = paid_instalments > loan.paid_instalments
         loan.total_paid = new_total_paid
-        loan.next_payment_amount = round(current_instalment_threshold - new_total_paid, 2)
-        _notify(
-            db, loan.lender_id,
-            title="Partial payment received",
-            message=(
-                f"{user.full_name or user.username} paid UGX {data.amount:,.0f} toward instalment "
-                f"#{repayment.instalment_number} — UGX {loan.next_payment_amount:,.0f} still due."
-            ),
-            type="repayment",
-            pref_key="notif_repayment_received",
-            data={"loan_id": loan.id},
-        )
+        loan.paid_instalments = paid_instalments
+        next_threshold = min(round(loan.monthly_payment * (paid_instalments + 1), 2), loan.total_repayable)
+        loan.next_payment_amount = round(next_threshold - new_total_paid, 2)
+        # What the lender is still owed on the loan overall — distinct from
+        # next_payment_amount, which is just the shortfall on the current
+        # instalment. Surfaced in every repayment notification below so the
+        # lender always sees both "what came in" and "what's left" in one
+        # message, not just the former.
+        remaining_on_loan = max(0.0, round(loan.total_repayable - new_total_paid, 2))
+
+        if advanced:
+            loan.next_payment_date = datetime.now(timezone.utc) + timedelta(days=30)
+            _notify(
+                db, loan.lender_id,
+                title="Payment received",
+                message=(
+                    f"{user.full_name or user.username} paid UGX {data.amount:,.0f} "
+                    f"(instalment #{repayment.instalment_number}) — UGX {remaining_on_loan:,.0f} "
+                    f"remaining on the loan."
+                ),
+                type="repayment",
+                pref_key="notif_repayment_received",
+                data={"loan_id": loan.id},
+            )
+        else:
+            _notify(
+                db, loan.lender_id,
+                title="Partial payment received",
+                message=(
+                    f"{user.full_name or user.username} paid UGX {data.amount:,.0f} toward instalment "
+                    f"#{repayment.instalment_number} — UGX {loan.next_payment_amount:,.0f} still due on "
+                    f"this instalment (UGX {remaining_on_loan:,.0f} remaining on the loan)."
+                ),
+                type="repayment",
+                pref_key="notif_repayment_received",
+                data={"loan_id": loan.id},
+            )
 
     _audit(db, "loan_repayment", username=user.username, user_id=user.id,
            resource_type="loan", resource_id=loan.id,
