@@ -843,14 +843,17 @@ class AuthRepo:
 
         account_created = False
         if draft.phone_verified:
-            AuthRepo._finalize_signup_draft(db, draft)
+            user, access_token, refresh_token = AuthRepo._finalize_signup_draft(db, draft)
             account_created = True
             db.refresh(draft)
             return {
                 "status": 200,
-                "message": "Account created successfully. Please sign in.",
+                "message": "Account created successfully.",
                 "account_created": account_created,
                 "draft": AuthRepo._signup_draft_payload(draft),
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "user": _user_response(user),
             }
 
         db.commit()
@@ -943,6 +946,13 @@ class AuthRepo:
         if referred_by_id:
             _credit_referral_bonus(db, referred_by_id, user)
 
+        # Issue tokens immediately so the frontend can log the user straight
+        # in from the OTP-verify screen instead of bouncing them to sign-in.
+        access_token = create_access_token(_auth_claims(user))
+        refresh_token = create_refresh_token(_auth_claims(user))
+        user.refresh_token = refresh_token
+        user.refresh_token_expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+
         _audit(
             db,
             "register",
@@ -954,7 +964,7 @@ class AuthRepo:
         )
         db.commit()
         db.refresh(user)
-        return user
+        return user, access_token, refresh_token
 
     @staticmethod
     def verify_signup_phone_otp(db: Session, draft_id: str, phone_number: str, code: str, ip_address: str | None = None):
@@ -1010,13 +1020,16 @@ class AuthRepo:
                 "draft": AuthRepo._signup_draft_payload(draft),
             }
 
-        AuthRepo._finalize_signup_draft(db, draft, ip_address=ip_address)
+        user, access_token, refresh_token = AuthRepo._finalize_signup_draft(db, draft, ip_address=ip_address)
         db.refresh(draft)
         return {
             "status": 200,
-            "message": "Account created successfully. Please sign in.",
+            "message": "Account created successfully.",
             "account_created": True,
             "draft": AuthRepo._signup_draft_payload(draft),
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "user": _user_response(user),
         }
 
     # ── register ────────────────────────────────
