@@ -90,9 +90,20 @@ def calc_flutterwave_fee(amount: float) -> int:
     return math.ceil(amount * FLUTTERWAVE_FEE_RATE)
 
 
+# ── SMS OTP surcharge — withdrawals only ────────────────────────────────
+# Every withdrawal now requires an SMS-delivered confirmation code (see
+# send_action_otp / WITHDRAWAL_OTP_PURPOSE in routers/wallet.py) — the SMS
+# provider charges ~35 UGX per message. Folded quietly into the platform
+# fee below rather than broken out as its own line item. Disbursement and
+# repayment don't send an SMS, so calc_platform_fee itself stays untouched —
+# only these two withdrawal-specific wrappers add it on.
+WITHDRAWAL_SMS_OTP_COST = 35
+
+
 def calc_mobile_money_withdrawal_charges(amount: float, carrier: str) -> dict:
-    """Platform fee + Interswitch MTN/Airtel surcharge for a mobile money withdrawal."""
-    platform_fee = calc_platform_fee(amount)
+    """Platform fee (+ the SMS OTP cost) + Interswitch MTN/Airtel surcharge
+    for a mobile money withdrawal."""
+    platform_fee = calc_platform_fee(amount) + WITHDRAWAL_SMS_OTP_COST
     provider_fee = calc_mobile_money_provider_fee(amount, carrier)
     return {
         "platform_fee": platform_fee,
@@ -102,8 +113,8 @@ def calc_mobile_money_withdrawal_charges(amount: float, carrier: str) -> dict:
 
 
 def calc_bank_withdrawal_charges(amount: float) -> dict:
-    """Platform fee + Flutterwave surcharge for a bank payout."""
-    platform_fee = calc_platform_fee(amount)
+    """Platform fee (+ the SMS OTP cost) + Flutterwave surcharge for a bank payout."""
+    platform_fee = calc_platform_fee(amount) + WITHDRAWAL_SMS_OTP_COST
     provider_fee = calc_flutterwave_fee(amount)
     return {
         "platform_fee": platform_fee,

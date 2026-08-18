@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from config import BASE_URL
 from database.tables import User, Wallet, WalletTransaction, PlatformFeeTransaction
-from repository.auth_repo import get_password_hash, verify_password, _audit, _notify
+from repository.auth_repo import get_password_hash, verify_password, _audit, _notify, send_action_otp, verify_action_otp
 from repository.dependencies import get_db, current_active_user
 from repository.models import (
     WalletSetupModel,
@@ -30,6 +30,11 @@ router = APIRouter(prefix="/wallet", tags=["Wallet"])
 # Verifies inbound /deposit/card/confirm webhook calls from UPG — see that
 # route below and the CARD_CONFIRM_SECRET comment in .env.
 CARD_CONFIRM_SECRET = os.getenv("CARD_CONFIRM_SECRET", "")
+
+# OTP purpose tag shared by both withdrawal endpoints below — one code from
+# POST /wallet/withdraw/send-otp covers whichever withdrawal method the
+# borrower actually submits.
+WITHDRAWAL_OTP_PURPOSE = "wallet_withdrawal"
 
 
 def _ensure_wallet_not_frozen(wallet: Wallet | None, label: str = "Your") -> None:
@@ -153,6 +158,16 @@ async def deposit(
     return {"status": 200, "message": "Deposit successful", "balance": wallet.balance}
 
 
+@router.post("/withdraw/send-otp")
+async def send_withdraw_otp(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Sends a 6-digit SMS code to the account's own registered phone number —
+    required before either withdrawal endpoint below will process a payout."""
+    return send_action_otp(db, user, WITHDRAWAL_OTP_PURPOSE, "withdraw funds")
+
+
 @router.post("/withdraw")
 async def withdraw(
     data: WalletWithdrawModel,
@@ -171,6 +186,7 @@ async def withdraw(
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
     _ensure_wallet_not_frozen(wallet)
+    verify_action_otp(db, user, data.otp_code, WITHDRAWAL_OTP_PURPOSE)
 
     phone = _normalize_phone(data.phone_number)
     carrier = (data.carrier or _detect_carrier(phone)).upper()
@@ -645,6 +661,7 @@ async def initiate_bank_withdraw(
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
     _ensure_wallet_not_frozen(wallet)
+    verify_action_otp(db, user, data.otp_code, WITHDRAWAL_OTP_PURPOSE)
 
     charges = calc_bank_withdrawal_charges(data.amount)
     total_debit = data.amount + charges["total_fee"]

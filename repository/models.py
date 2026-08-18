@@ -441,6 +441,7 @@ class WalletWithdrawModel(BaseModel):
     amount: float = Field(..., ge=1000)
     phone_number: str
     carrier: Optional[str] = None  # MTN or AIRTEL; auto-detected if omitted
+    otp_code: str
 
 
 class WalletTransferModel(BaseModel):
@@ -468,6 +469,7 @@ class WalletBankWithdrawInitiateModel(BaseModel):
     account_number: str
     beneficiary_name: str = Field(..., min_length=1)
     narration: Optional[str] = None
+    otp_code: str
 
 
 class RepaymentCreate(BaseModel):

@@ -154,6 +154,68 @@ def _verify_otp_hash(code: str, hashed: str) -> bool:
     return bcrypt.checkpw(code.encode("utf-8"), hashed.encode("utf-8"))
 
 
+def send_action_otp(db: Session, user: User, purpose: str, action_label: str) -> dict:
+    """Generic step-up SMS OTP for confirming a sensitive already-authenticated
+    action (e.g. a wallet withdrawal) — sent to the account's own registered
+    phone number, no identifier needed from the caller. Reuses the same OTP
+    table/purpose-scoping used by signup and login OTPs."""
+    if not user.phone_number:
+        raise HTTPException(status_code=400, detail="No phone number on file for this account")
+
+    code = _generate_otp_code()
+    hashed = _hash_otp(code)
+
+    existing = db.query(OTP).filter(OTP.username == user.username, OTP.purpose == purpose).first()
+    if existing:
+        existing.code_hash = hashed
+        existing.phone_number = user.phone_number
+        existing.expires_at = datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES)
+        existing.attempts = 0
+    else:
+        db.add(OTP(
+            username=user.username,
+            phone_number=user.phone_number,
+            code_hash=hashed,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRE_MINUTES),
+            purpose=purpose,
+        ))
+    db.commit()
+
+    logger.debug(f"[DEV ONLY] {purpose} OTP for {user.username}: {code}")
+    message = f"Your Mpola verification code to {action_label} is: {code}. Expires in {OTP_EXPIRE_MINUTES} minutes."
+    threading.Thread(target=send_sms, args=(user.phone_number, message), daemon=True).start()
+
+    masked = user.phone_number[-2:] if len(user.phone_number) >= 2 else user.phone_number
+    return {"status": 200, "message": f"Code sent to your registered number ending in {masked}."}
+
+
+def verify_action_otp(db: Session, user: User, code: str, purpose: str) -> None:
+    """Raises HTTPException on a missing/expired/wrong code; consumes the OTP
+    (deletes it) on success. No return value — call sites just proceed."""
+    otp = db.query(OTP).filter(OTP.username == user.username, OTP.purpose == purpose).first()
+    if not otp:
+        raise HTTPException(status_code=400, detail="No verification code found. Request a new one.")
+    if otp.expires_at < datetime.utcnow():
+        db.delete(otp)
+        db.commit()
+        raise HTTPException(status_code=400, detail="Code expired. Request a new one.")
+    if otp.attempts >= OTP_MAX_ATTEMPTS:
+        db.delete(otp)
+        db.commit()
+        raise HTTPException(status_code=429, detail="Too many attempts. Request a new code.")
+
+    otp.attempts += 1
+    db.flush()
+
+    if not _verify_otp_hash(code, otp.code_hash):
+        db.commit()
+        remaining = OTP_MAX_ATTEMPTS - otp.attempts
+        raise HTTPException(status_code=400, detail=f"Invalid code. {remaining} attempt{'s' if remaining != 1 else ''} remaining.")
+
+    db.delete(otp)
+    db.commit()
+
+
 # ═══════════════════════════════════════════════
 #  AUDIT LOGGING
 # ═══════════════════════════════════════════════
