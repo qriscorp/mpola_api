@@ -1888,6 +1888,8 @@ class AuthRepo:
         # Invalidate refresh token to force re-auth
         user.refresh_token = None
         user.refresh_token_expires_at = None
+        # Covers the temp-password-after-restore case — see User.must_change_password.
+        user.must_change_password = False
 
         _audit(db, "password_change", username=user.username, user_id=user.id, resource_type="user")
         db.commit()
@@ -1935,4 +1937,5 @@ def _user_response(user: User) -> dict:
         "credit_score": user.credit_score,
         "bio": user.bio,
         "created_at": safe_isoformat(user.created_at),
+        "must_change_password": bool(user.must_change_password),
     }

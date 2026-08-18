@@ -22,7 +22,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func
 
 from database import SessionLocal
-from database.tables import User, Loan, Repayment, LoanApplication, LoanOffer, LenderOfferTemplate, Guarantor, Wallet, WalletTransaction, PlatformFeeTransaction, PlatformSetting, AuditLog
+from database.tables import User, Loan, Repayment, LoanApplication, LoanOffer, LenderOfferTemplate, Guarantor, Wallet, WalletTransaction, PlatformFeeTransaction, PlatformSetting, AuditLog, DeactivatedAccount
 from helpers import safe_isoformat
 from logging_module import logger
 from repository.auth_repo import _audit, _notify, _notify_admins, _send_email, _setting_enabled
@@ -56,6 +56,7 @@ def run_collections_job() -> None:
         _remind_pending_guarantors(db, now)
         _expire_stale_applications(db, now)
         _handle_stale_matched_offers(db, now)
+        _purge_deactivated_accounts(db, now)
 
         db.commit()
     except Exception as e:
@@ -689,6 +690,29 @@ def _expire_stale_applications(db, now) -> None:
                 type="guarantor_request_expired",
                 data={"application_id": app.id},
             )
+
+
+def _purge_deactivated_accounts(db, now) -> None:
+    """The 30-day grace window promised to a deactivating user (both the
+    self-service /users/me/deactivate flow and an admin's manual
+    deactivation) — the User row itself is deleted immediately on
+    deactivation, but this DeactivatedAccount stub (and the option to
+    restore via POST /admin/users/{username}/restore) sticks around until
+    its scheduled_deletion_date passes. This is the job that actually makes
+    that date mean something instead of just being a number shown in the
+    admin UI."""
+    stale = db.query(DeactivatedAccount).filter(
+        DeactivatedAccount.scheduled_deletion_date.isnot(None),
+        DeactivatedAccount.scheduled_deletion_date < now.replace(tzinfo=None),
+    ).all()
+
+    for record in stale:
+        _audit(
+            db, "deactivated_account_purged",
+            resource_type="deactivated_account", resource_id=record.id,
+            details={"original_username": record.original_username, "original_email": record.original_email},
+        )
+        db.delete(record)
 
 
 def run_weekly_digest_job() -> None:

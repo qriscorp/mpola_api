@@ -60,6 +60,12 @@ class User(Base, TimestampMixin):
     refresh_token = Column(Text, nullable=True)
     refresh_token_expires_at = Column(DateTime, nullable=True)
     two_factor_enabled = Column(Boolean, default=False)
+    # Set when an admin restores a deactivated account (see UserRepo.
+    # restore_deactivated_account) — the new account starts on a
+    # server-generated temporary password, so both frontends need to know to
+    # prompt "please change your password" right after this account's very
+    # next successful login. Cleared by PUT /users/me/change-password.
+    must_change_password = Column(Boolean, default=False)
     # Per-user notification preferences (Settings page toggles). Independent
     # of the admin-level PlatformSetting kill switches in _notify_admins —
     # those gate whether a category sends AT ALL platform-wide; these gate

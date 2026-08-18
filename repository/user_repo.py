@@ -3,6 +3,7 @@ User repository — profile CRUD + admin user management.
 """
 
 import secrets
+import threading
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
@@ -12,7 +13,7 @@ from sqlalchemy.orm import Session
 from database.tables import User, DeactivatedAccount, Wallet
 from helpers import safe_isoformat
 from logging_module import logger
-from repository.auth_repo import get_password_hash, _generate_unique_referral_code
+from repository.auth_repo import get_password_hash, _generate_unique_referral_code, send_sms
 
 # A lender's Mpola Licence is valid for 2 years from whenever they last
 # accepted the Platform Terms/Privacy Policy/Lender Code of Conduct
@@ -168,14 +169,33 @@ class UserRepo:
             role="borrower",
             is_active=True,
             referral_code=_generate_unique_referral_code(db),
+            # Forces both frontends to prompt a password change right after
+            # this account's next successful login — see User.must_change_password.
+            must_change_password=True,
         )
         db.add(user)
         db.delete(record)
         db.commit()
 
+        # The account's own registered phone is the one channel that's
+        # already been through this platform's identity checks, so it's
+        # what actually gets used to deliver the credential — not
+        # relayed by hand through the admin, who only sees it as a
+        # fallback (see the "sms_sent" flag below).
+        sms_sent = False
+        if user.phone_number:
+            message = (
+                f"Your Mpola account has been restored. Temporary password: {temp_password}. "
+                f"Sign in and you'll be asked to set a new password right away."
+            )
+            threading.Thread(target=send_sms, args=(user.phone_number, message), daemon=True).start()
+            sms_sent = True
+
         return {
             "success": True,
             "username": username,
             "temporary_password": temp_password,
+            "sms_sent": sms_sent,
+            "phone_number": user.phone_number,
             "message": "Account restored",
         }
