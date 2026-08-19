@@ -1374,6 +1374,7 @@ def get_reconciliation_report(
        disagreement with what we have stored. Best-effort: UPG errors for an
        individual reference are skipped, not fatal to the whole report.
     """
+    from concurrent.futures import ThreadPoolExecutor
     from utils.upg_client import UPGClient
 
     wallet_drift = compute_wallet_drift(db)
@@ -1386,9 +1387,14 @@ def get_reconciliation_report(
         WalletTransaction.created_at >= cutoff,
         WalletTransaction.reference.isnot(None),
     ).all()
-    gateway_mismatches = []
-    client = UPGClient()
-    for tx in recent_txs:
+
+    def _check_one(tx: WalletTransaction) -> dict | None:
+        # Runs on a worker thread — each of these is one blocking UPG call;
+        # a week's worth of transactions checked one-at-a-time serially is
+        # what made this endpoint take minutes to load (and a single slow
+        # UPG response held up every check behind it). Independent I/O, so
+        # a thread pool turns O(N × latency) into O(N / concurrency × latency).
+        client = UPGClient()
         try:
             if tx.type == "deposit":
                 resp = client.get_transaction(tx.reference)
@@ -1400,23 +1406,28 @@ def get_reconciliation_report(
                 gateway_status = (resp.get("status") or "").lower()
                 agrees = (gateway_status == "success" and tx.status == "completed") or \
                          (gateway_status == "failed" and tx.status == "failed")
-            if not agrees:
-                gateway_mismatches.append({
-                    "transaction_id": tx.id,
-                    "reference": tx.reference,
-                    "type": tx.type,
-                    "our_status": tx.status,
-                    "gateway_status": gateway_status,
-                })
-        except Exception as e:
-            logger_msg = str(e)
-            gateway_mismatches.append({
+            if agrees:
+                return None
+            return {
                 "transaction_id": tx.id,
                 "reference": tx.reference,
                 "type": tx.type,
                 "our_status": tx.status,
-                "gateway_status": f"error: {logger_msg[:200]}",
-            })
+                "gateway_status": gateway_status,
+            }
+        except Exception as e:
+            return {
+                "transaction_id": tx.id,
+                "reference": tx.reference,
+                "type": tx.type,
+                "our_status": tx.status,
+                "gateway_status": f"error: {str(e)[:200]}",
+            }
+
+    gateway_mismatches = []
+    if recent_txs:
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            gateway_mismatches = [r for r in pool.map(_check_one, recent_txs) if r is not None]
 
     return {
         "wallet_drift": wallet_drift,
