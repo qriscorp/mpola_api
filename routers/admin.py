@@ -1378,6 +1378,7 @@ def get_reconciliation_report(
     from utils.upg_client import UPGClient
 
     wallet_drift = compute_wallet_drift(db)
+    wallets_checked = db.query(Wallet).count()
 
     # ── Gateway cross-check ──────────────────────────────────────────
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
@@ -1432,7 +1433,7 @@ def get_reconciliation_report(
     return {
         "wallet_drift": wallet_drift,
         "gateway_mismatches": gateway_mismatches,
-        "checked_count": len(wallets) + len(recent_txs),
+        "checked_count": wallets_checked + len(recent_txs),
         "generated_at": safe_isoformat(datetime.now(timezone.utc)),
     }
 
