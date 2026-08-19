@@ -287,8 +287,21 @@ def _reconcile_pending_payments() -> None:
     shared functions those endpoints use — so a resolution here still fires
     _notify() -> WebSocket -> frontend invalidation, independent of whether
     the client is still around.
+
+    Mobile money deposit/withdraw normally resolve synchronously inline —
+    but a request whose response never made it back (worker restart,
+    network blip, a slow-Interswitch timeout) leaves its transaction row
+    "pending" with no client left to poll it, same class of gap as the
+    card/bank flows above. Those rows are identified by having no
+    `reference` yet (card/bank always get one immediately at initiate,
+    before going pending) and are re-checked the same way, safely, since
+    the recheck re-POSTs with the transaction's own id as the Idempotency-
+    Key rather than triggering a second real-money transfer.
     """
-    from routers.wallet import _recheck_card_deposit, _recheck_bank_withdrawal
+    from routers.wallet import (
+        _recheck_card_deposit, _recheck_bank_withdrawal,
+        _recheck_mobile_deposit, _recheck_mobile_withdrawal,
+    )
     from database.tables import Wallet, WalletTransaction
 
     db = SessionLocal()
@@ -297,28 +310,29 @@ def _reconcile_pending_payments() -> None:
         expiry_hours = _setting(db, "payment_pending_expiry_hours", 48)
         cutoff = now - timedelta(hours=expiry_hours)
 
-        pending_ids = [
-            row[0] for row in db.query(WalletTransaction.id).filter(
-                WalletTransaction.status == "pending",
-                WalletTransaction.type.in_(["deposit", "withdrawal"]),
-                WalletTransaction.created_at >= cutoff,
-            ).all()
-        ]
+        pending_rows = db.query(WalletTransaction.id, WalletTransaction.type, WalletTransaction.reference).filter(
+            WalletTransaction.status == "pending",
+            WalletTransaction.type.in_(["deposit", "withdrawal"]),
+            WalletTransaction.created_at >= cutoff,
+        ).all()
 
-        for tx_id in pending_ids:
+        for tx_id, tx_type, reference in pending_rows:
             try:
-                # Only /deposit/card and /withdraw/bank ever leave a tx "pending" —
-                # mobile money deposit/withdraw resolve synchronously — so type
-                # alone tells us which UPG endpoint to re-check. Both helpers lock
-                # the transaction row before touching it, so if the OWNER happens
-                # to be polling /status/{reference} for this exact transaction at
-                # the same moment, one of us blocks and no-ops instead of both
-                # finalizing (double-crediting) it.
-                tx_type = db.query(WalletTransaction.type).filter(WalletTransaction.id == tx_id).scalar()
+                # Both helpers for a given branch lock the transaction row
+                # before touching it, so if the owner happens to be polling
+                # /status/{reference} (card/bank) for this exact transaction
+                # at the same moment, one of us blocks and no-ops instead of
+                # both finalizing (double-crediting) it.
                 if tx_type == "deposit":
-                    _recheck_card_deposit(db, tx_id)
+                    if reference:
+                        _recheck_card_deposit(db, tx_id)
+                    else:
+                        _recheck_mobile_deposit(db, tx_id)
                 else:
-                    _recheck_bank_withdrawal(db, tx_id)
+                    if reference:
+                        _recheck_bank_withdrawal(db, tx_id)
+                    else:
+                        _recheck_mobile_withdrawal(db, tx_id)
                 db.commit()
             except Exception as e:
                 db.rollback()

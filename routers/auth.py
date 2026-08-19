@@ -35,7 +35,7 @@ async def register(data: UserCreate, request: Request, db: Session = Depends(get
 
 
 @router.post("/register_start")
-async def register_start(data: RegisterStart, request: Request, db: Session = Depends(get_db)):
+def register_start(data: RegisterStart, request: Request, db: Session = Depends(get_db)):
     return AuthRepo.register_start(db, data, ip_address=_get_ip(request))
 
 
@@ -116,7 +116,7 @@ async def verify_phone_otp(data: VerifyPhoneOTPModel, db: Session = Depends(get_
 
 
 @router.post("/send_password_reset_code")
-async def send_reset_code(data: SendPasswordResetCodeModel, db: Session = Depends(get_db)):
+def send_reset_code(data: SendPasswordResetCodeModel, db: Session = Depends(get_db)):
     return AuthRepo.send_password_reset_code(db, data.email, data.phone_number, portal=data.portal)
 
 

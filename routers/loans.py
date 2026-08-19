@@ -283,7 +283,7 @@ async def get_application(
 
 
 @router.post("/applications/{app_id}/guarantors")
-async def attach_guarantors(
+def attach_guarantors(
     app_id: str,
     data: GuarantorAttach,
     db: Session = Depends(get_db),
@@ -386,7 +386,7 @@ def _cancel_pending_offers(db: Session, app: LoanApplication, reason: str) -> No
 
 
 @router.put("/applications/{app_id}")
-async def update_application(
+def update_application(
     app_id: str,
     data: LoanApplicationUpdate,
     db: Session = Depends(get_db),
@@ -469,7 +469,7 @@ async def update_application(
 
 
 @router.delete("/applications/{app_id}")
-async def delete_application(
+def delete_application(
     app_id: str,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
@@ -611,7 +611,7 @@ async def skip_marketplace_application(
 # ═══════════════════════════════════════════════
 
 @router.post("/offers")
-async def make_offer(
+def make_offer(
     data: LoanOfferCreate,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
@@ -881,7 +881,7 @@ async def submit_custom_document_response(
 
 
 @router.put("/offers/{offer_id}")
-async def respond_to_offer(
+def respond_to_offer(
     offer_id: str,
     data: LoanOfferUpdate,
     db: Session = Depends(get_db),
@@ -1641,7 +1641,7 @@ async def get_loan(
 
 
 @router.post("/active/{loan_id}/approve-disbursement")
-async def approve_disbursement(
+def approve_disbursement(
     loan_id: str,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
@@ -1757,7 +1757,7 @@ async def approve_disbursement(
 # ═══════════════════════════════════════════════
 
 @router.post("/repayments")
-async def make_repayment(
+def make_repayment(
     data: RepaymentCreate,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),

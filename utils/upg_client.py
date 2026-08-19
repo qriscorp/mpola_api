@@ -114,7 +114,13 @@ class UPGClient:
             },
         }
         logger.info(f"UPG collect: amount={amount}, carrier={carrier}, phone={phone}")
-        response = requests.post(url, json=payload, headers=self._headers(idempotency_key), timeout=30)
+        # 120s, not 30 — UPG's own upstream call to Interswitch is allowed to
+        # take up to 90s (see unified_payment_gateway's Interswitch client),
+        # so a 30s timeout here was giving up on legitimately-slow-but-about
+        # -to-succeed collections before UPG could ever answer, reporting a
+        # false failure to the caller while Interswitch went on to actually
+        # deduct the customer's money moments later.
+        response = requests.post(url, json=payload, headers=self._headers(idempotency_key), timeout=120)
         return self._handle_response(response)
 
     def disburse(
@@ -137,7 +143,7 @@ class UPGClient:
             },
         }
         logger.info(f"UPG disburse: amount={amount}, carrier={carrier}, phone={phone}")
-        response = requests.post(url, json=payload, headers=self._headers(idempotency_key), timeout=30)
+        response = requests.post(url, json=payload, headers=self._headers(idempotency_key), timeout=120)
         return self._handle_response(response)
 
     def checkout(

@@ -66,7 +66,7 @@ async def list_guarantor_requests(
 
 
 @router.put("/{guarantor_id}/respond")
-async def respond_to_guarantor_request(
+def respond_to_guarantor_request(
     guarantor_id: str,
     data: GuarantorRespond,
     db: Session = Depends(get_db),
@@ -127,7 +127,7 @@ async def respond_to_guarantor_request(
 
 
 @router.post("/{guarantor_id}/remind")
-async def remind_guarantor(
+def remind_guarantor(
     guarantor_id: str,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
@@ -175,7 +175,7 @@ async def remind_guarantor(
 
 
 @router.put("/applications/{app_id}/{guarantor_id}/replace")
-async def replace_guarantor(
+def replace_guarantor(
     app_id: str,
     guarantor_id: str,
     data: GuarantorReplace,

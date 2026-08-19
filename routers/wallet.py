@@ -103,8 +103,62 @@ async def setup_wallet(
     return {"status": 200, "message": "Wallet set up successfully"}
 
 
+def _finalize_mobile_deposit(db: Session, tx: WalletTransaction, wallet: Wallet, user: User, resp: dict) -> None:
+    """UPG confirmed this mobile money collection succeeded — credit the
+    wallet, audit, and notify. Shared by the inline fast path in deposit()
+    below and _recheck_mobile_deposit (the reconciliation fallback), so a
+    deposit finalizes the same way regardless of which one observes success
+    first. Caller must db.commit()."""
+    wallet.balance += tx.amount
+    tx.status = "completed"
+    tx.reference = UPGClient.transaction_id(resp) or tx.id
+    tx.description = (tx.description or "").removesuffix(" — pending")
+    _audit(db, "wallet_deposit", username=user.username, user_id=user.id,
+           resource_type="wallet", details={"amount": tx.amount, "phone": tx.counterparty})
+    _notify(
+        db, user.id,
+        title="Deposit successful",
+        message=f"UGX {tx.amount:,.0f} was added to your wallet.",
+        type="payment",
+    )
+
+
+def _recheck_mobile_deposit(db: Session, tx_id: str) -> WalletTransaction | None:
+    """Single entry point for 'did this mobile money deposit actually go
+    through' — used by the scheduler's reconciliation job to resolve a
+    deposit whose original request never got a response (worker restart,
+    network blip, or a slow-Interswitch timeout). Re-POSTs /v1/collect with
+    this transaction's own id as the Idempotency-Key — UPG recognizes a
+    repeated key and returns the existing transaction's current status
+    instead of pushing a second real-money collection to the customer's
+    phone, so this is safe to call as many times as needed while the
+    transaction stays pending.
+    """
+    tx = db.query(WalletTransaction).filter(WalletTransaction.id == tx_id).with_for_update().first()
+    if not tx or tx.status != "pending":
+        return tx
+
+    wallet = db.query(Wallet).filter(Wallet.id == tx.wallet_id).with_for_update().first()
+    if not wallet:
+        return tx
+    user = db.query(User).filter(User.id == wallet.user_id).first()
+
+    phone = tx.counterparty
+    try:
+        resp = UPGClient().collect(amount=tx.amount, phone=phone, carrier=_detect_carrier(phone), idempotency_key=tx.id)
+    except Exception:
+        return tx  # transient gateway error — leave pending, next check retries
+
+    if UPGClient.is_success(resp):
+        _finalize_mobile_deposit(db, tx, wallet, user, resp)
+    elif (resp.get("status") or "").lower() not in ("pending", ""):
+        tx.status = "failed"
+        tx.description = (tx.description or "").removesuffix(" — pending") + " — failed"
+    return tx
+
+
 @router.post("/deposit")
-async def deposit(
+def deposit(
     data: WalletDepositModel,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
@@ -125,34 +179,47 @@ async def deposit(
 
     carrier = (data.carrier or _detect_carrier(phone)).upper()
 
-    try:
-        resp = UPGClient().collect(amount=data.amount, phone=phone, carrier=carrier)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=friendly_upg_error(e))
-
-    if not UPGClient.is_success(resp):
-        raise HTTPException(status_code=400, detail=resp.get("message", "Mobile money collection failed"))
-
-    wallet.balance += data.amount
+    # Created (and its id used as UPG's Idempotency-Key) *before* calling
+    # UPG — so even if this request's own response is lost (the whole reason
+    # this bug existed: a killed/restarted worker drops the connection after
+    # Interswitch has already been asked to collect), there's a persisted
+    # trace the reconciliation job can safely re-check with this exact same
+    # idempotency key, instead of the collection being silently lost (money
+    # taken, wallet never credited) or retried as a brand-new charge.
+    tx_id = generateUniqueId()
     tx = WalletTransaction(
+        id=tx_id,
         wallet_id=wallet.id,
         amount=data.amount,
         type="deposit",
         direction="credit",
-        status="completed",
-        description=f"Mobile money deposit ({carrier}) from {phone}",
-        reference=UPGClient.transaction_id(resp) or generateUniqueId(15),
+        status="pending",
+        description=f"Mobile money deposit ({carrier}) from {phone} — pending",
         counterparty=phone,
     )
     db.add(tx)
-    _audit(db, "wallet_deposit", username=user.username, user_id=user.id,
-           resource_type="wallet", details={"amount": data.amount, "phone": phone, "carrier": carrier})
-    _notify(
-        db, user.id,
-        title="Deposit successful",
-        message=f"UGX {data.amount:,.0f} was added to your wallet.",
-        type="payment",
-    )
+    db.commit()
+
+    try:
+        resp = UPGClient().collect(amount=data.amount, phone=phone, carrier=carrier, idempotency_key=tx_id)
+    except Exception as e:
+        # Ambiguous outcome — Interswitch may still complete the collection
+        # even though we never got a response. The transaction stays
+        # "pending" (not "failed"): the reconciliation job below retries
+        # with this same idempotency key every ~2min and finalizes it
+        # correctly once the real outcome is known, instead of the deposit
+        # vanishing without a trace.
+        raise HTTPException(status_code=502, detail=friendly_upg_error(e))
+
+    tx = db.query(WalletTransaction).filter(WalletTransaction.id == tx_id).with_for_update().first()
+    if not UPGClient.is_success(resp):
+        tx.status = "failed"
+        tx.description = f"Mobile money deposit ({carrier}) from {phone} — failed"
+        db.commit()
+        raise HTTPException(status_code=400, detail=resp.get("message", "Mobile money collection failed"))
+
+    wallet = db.query(Wallet).filter(Wallet.id == wallet.id).with_for_update().first()
+    _finalize_mobile_deposit(db, tx, wallet, user, resp)
     db.commit()
 
     return {"status": 200, "message": "Deposit successful", "balance": wallet.balance}
@@ -168,8 +235,76 @@ async def send_withdraw_otp(
     return send_action_otp(db, user, WITHDRAWAL_OTP_PURPOSE, "withdraw funds")
 
 
+def _finalize_mobile_withdrawal(db: Session, tx: WalletTransaction, wallet: Wallet, user: User, resp: dict) -> None:
+    """UPG confirmed this mobile money payout succeeded — debit (or fail it
+    if funds moved since the request was made), audit, and notify. Shared
+    by the inline fast path in withdraw() below and _recheck_mobile_withdrawal
+    (the reconciliation fallback). Caller must db.commit()."""
+    phone = tx.counterparty
+    carrier = _detect_carrier(phone)
+    charges = calc_mobile_money_withdrawal_charges(tx.amount, carrier)
+    total_debit = tx.amount + charges["total_fee"]
+    if wallet.balance < total_debit:
+        # Funds moved elsewhere since the request was made — flag rather
+        # than push the balance negative. Same accepted trade-off as
+        # _finalize_bank_withdrawal: the real payout already left via UPG,
+        # so this only mis-marks the *local* record, not the actual money.
+        tx.status = "failed"
+        tx.description = (tx.description or "").removesuffix(" — pending") + " (insufficient balance at settlement)"
+        return
+
+    wallet.balance -= total_debit
+    tx.status = "completed"
+    tx.reference = UPGClient.transaction_id(resp) or tx.id
+    tx.description = (tx.description or "").removesuffix(" — pending")
+    db.add(PlatformFeeTransaction(
+        user_id=user.id,
+        wallet_transaction_id=tx.id,
+        category="mobile_money_withdrawal",
+        platform_fee=charges["platform_fee"],
+        provider_fee=charges["provider_fee"],
+        total_fee=charges["total_fee"],
+    ))
+    _audit(db, "wallet_withdrawal", username=user.username, user_id=user.id,
+           resource_type="wallet", details={"amount": tx.amount, "to": phone, "carrier": carrier, "fee": charges["total_fee"]})
+    _notify(
+        db, user.id,
+        title="Withdrawal successful",
+        message=f"UGX {tx.amount:,.0f} was sent to {phone} (UGX {charges['total_fee']:,.0f} fee charged).",
+        type="payment",
+    )
+
+
+def _recheck_mobile_withdrawal(db: Session, tx_id: str) -> WalletTransaction | None:
+    """Same purpose as _recheck_mobile_deposit, for mobile money payouts —
+    re-POSTs /v1/disburse with this transaction's own id as the
+    Idempotency-Key so UPG returns the existing payout's status instead of
+    sending money out a second time."""
+    tx = db.query(WalletTransaction).filter(WalletTransaction.id == tx_id).with_for_update().first()
+    if not tx or tx.status != "pending":
+        return tx
+
+    wallet = db.query(Wallet).filter(Wallet.id == tx.wallet_id).with_for_update().first()
+    if not wallet:
+        return tx
+    user = db.query(User).filter(User.id == wallet.user_id).first()
+
+    phone = tx.counterparty
+    try:
+        resp = UPGClient().disburse(amount=tx.amount, phone=phone, carrier=_detect_carrier(phone), idempotency_key=tx.id)
+    except Exception:
+        return tx  # transient gateway error — leave pending, next check retries
+
+    if UPGClient.is_success(resp):
+        _finalize_mobile_withdrawal(db, tx, wallet, user, resp)
+    elif (resp.get("status") or "").lower() not in ("pending", ""):
+        tx.status = "failed"
+        tx.description = (tx.description or "").removesuffix(" — pending") + " — failed"
+    return tx
+
+
 @router.post("/withdraw")
-async def withdraw(
+def withdraw(
     data: WalletWithdrawModel,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
@@ -178,10 +313,6 @@ async def withdraw(
     the Interswitch MTN/Airtel surcharge is charged on top, debited from the
     wallet — the recipient still receives the full amount requested.
     """
-    # Locked for the rest of this request, held across the UPG payout call —
-    # real money leaves via UPG below, so a concurrent withdrawal on this
-    # wallet must wait rather than risk both passing the balance check and
-    # sending out more than the wallet actually has.
     wallet = db.query(Wallet).filter(Wallet.user_id == user.id).with_for_update().first()
     if not wallet or not wallet.is_wallet_setup:
         raise HTTPException(status_code=400, detail="Please set up your wallet first")
@@ -199,43 +330,52 @@ async def withdraw(
             detail=f"Insufficient funds — you need UGX {total_debit:,.0f} (UGX {charges['total_fee']:,.0f} in fees included)",
         )
 
-    try:
-        resp = UPGClient().disburse(amount=data.amount, phone=phone, carrier=carrier)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=friendly_upg_error(e))
+    # Balance isn't debited until settlement below, so block a second
+    # withdrawal (mobile, card, or bank) from starting while one is still in
+    # flight — otherwise two concurrent requests could each pass the balance
+    # check above and each trigger a real payout before either is confirmed.
+    has_pending_withdrawal = db.query(WalletTransaction).filter(
+        WalletTransaction.wallet_id == wallet.id,
+        WalletTransaction.type == "withdrawal",
+        WalletTransaction.status == "pending",
+    ).first()
+    if has_pending_withdrawal:
+        raise HTTPException(
+            status_code=400,
+            detail="You already have a withdrawal in progress — wait for it to complete first.",
+        )
 
-    if not UPGClient.is_success(resp):
-        raise HTTPException(status_code=400, detail=resp.get("message", "Mobile money disbursement failed"))
-
-    wallet.balance -= total_debit
+    # Created (and its id used as UPG's Idempotency-Key) *before* calling
+    # UPG — same reasoning as deposit() above: a lost response no longer
+    # means a silently lost (or silently duplicated) payout.
+    tx_id = generateUniqueId()
     tx = WalletTransaction(
+        id=tx_id,
         wallet_id=wallet.id,
         amount=data.amount,
         type="withdrawal",
         direction="debit",
-        status="completed",
-        description=f"Withdrawal ({carrier}) to {phone}",
-        reference=UPGClient.transaction_id(resp) or generateUniqueId(15),
+        status="pending",
+        description=f"Withdrawal ({carrier}) to {phone} — pending",
         counterparty=phone,
     )
     db.add(tx)
-    db.flush()
-    db.add(PlatformFeeTransaction(
-        user_id=user.id,
-        wallet_transaction_id=tx.id,
-        category="mobile_money_withdrawal",
-        platform_fee=charges["platform_fee"],
-        provider_fee=charges["provider_fee"],
-        total_fee=charges["total_fee"],
-    ))
-    _audit(db, "wallet_withdrawal", username=user.username, user_id=user.id,
-           resource_type="wallet", details={"amount": data.amount, "to": phone, "carrier": carrier, "fee": charges["total_fee"]})
-    _notify(
-        db, user.id,
-        title="Withdrawal successful",
-        message=f"UGX {data.amount:,.0f} was sent to {phone} (UGX {charges['total_fee']:,.0f} fee charged).",
-        type="payment",
-    )
+    db.commit()
+
+    try:
+        resp = UPGClient().disburse(amount=data.amount, phone=phone, carrier=carrier, idempotency_key=tx_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=friendly_upg_error(e))
+
+    tx = db.query(WalletTransaction).filter(WalletTransaction.id == tx_id).with_for_update().first()
+    if not UPGClient.is_success(resp):
+        tx.status = "failed"
+        tx.description = f"Withdrawal ({carrier}) to {phone} — failed"
+        db.commit()
+        raise HTTPException(status_code=400, detail=resp.get("message", "Mobile money disbursement failed"))
+
+    wallet = db.query(Wallet).filter(Wallet.id == wallet.id).with_for_update().first()
+    _finalize_mobile_withdrawal(db, tx, wallet, user, resp)
     db.commit()
 
     return {
@@ -478,7 +618,7 @@ def _recheck_bank_withdrawal(db: Session, tx_id: str) -> WalletTransaction | Non
 # ═══════════════════════════════════════
 
 @router.post("/deposit/card/initiate")
-async def initiate_card_deposit(
+def initiate_card_deposit(
     data: WalletCardDepositInitiateModel,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
@@ -599,7 +739,7 @@ async def confirm_card_deposit(
 
 
 @router.get("/deposit/card/status/{reference}")
-async def get_card_deposit_status(
+def get_card_deposit_status(
     reference: str,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
@@ -633,7 +773,7 @@ async def get_card_deposit_status(
 # ═══════════════════════════════════════
 
 @router.get("/banks/{country_code}")
-async def list_payout_banks(
+def list_payout_banks(
     country_code: str,
     user: User = Depends(current_active_user),
 ):
@@ -646,7 +786,7 @@ async def list_payout_banks(
 
 
 @router.post("/withdraw/bank/initiate")
-async def initiate_bank_withdraw(
+def initiate_bank_withdraw(
     data: WalletBankWithdrawInitiateModel,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
@@ -719,7 +859,7 @@ async def initiate_bank_withdraw(
 
 
 @router.get("/withdraw/bank/status/{reference}")
-async def get_bank_withdraw_status(
+def get_bank_withdraw_status(
     reference: str,
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
