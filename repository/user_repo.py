@@ -24,22 +24,33 @@ from repository.auth_repo import get_password_hash, _generate_unique_referral_co
 LENDER_LICENCE_VALIDITY_DAYS = 730
 
 
+def lender_licence_number(user: User) -> str:
+    """Deterministic from the user's id (stable/predictable, no separate
+    column to keep in sync) — grouped in 4s (LND-XXXX-XXXX) so it's easy to
+    read/say aloud rather than one 8-char run. Callers needing this to
+    reverse a search string should strip "LND-" and dashes and match
+    against User.id's first 8 characters (see routers/admin.py get_users)."""
+    raw = user.id[:8].upper()
+    return f"LND-{raw[:4]}-{raw[4:]}"
+
+
 def _lender_licence_info(user: User) -> dict:
     """Not a lender → no licence concept at all. A lender who isn't yet
-    KYC-verified or hasn't accepted the agreement has a licence number
-    (deterministic from their id, so it's stable/predictable) but no real
-    issuance — 'not_issued' until both conditions are met."""
+    KYC-verified or hasn't accepted the agreement gets 'not_issued' and NO
+    licence number at all — the number used to be sent early anyway (it's
+    deterministic, so it always existed), which meant an unverified lender
+    could see and quote an official-looking licence number before it was
+    actually real. Only ever returned once both conditions are met."""
     if user.role != "lender":
         return {"licence_number": None, "licence_status": None, "licence_valid_until": None}
 
-    licence_number = f"LND-{user.id[:8].upper()}"
     if user.kyc_status != "verified" or not user.terms_accepted_at:
-        return {"licence_number": licence_number, "licence_status": "not_issued", "licence_valid_until": None}
+        return {"licence_number": None, "licence_status": "not_issued", "licence_valid_until": None}
 
     valid_until = user.terms_accepted_at + timedelta(days=LENDER_LICENCE_VALIDITY_DAYS)
     status = "active" if valid_until > datetime.utcnow() else "expired"
     return {
-        "licence_number": licence_number,
+        "licence_number": lender_licence_number(user),
         "licence_status": status,
         "licence_valid_until": safe_isoformat(valid_until),
     }

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, aliased
 
 from database.tables import (
@@ -339,12 +339,22 @@ def get_users(
 
     if search:
         filt = f"%{search}%"
-        query = query.filter(
-            User.username.ilike(filt)
-            | User.email.ilike(filt)
-            | User.full_name.ilike(filt)
-            | User.phone_number.ilike(filt)
-        )
+        conditions = [
+            User.username.ilike(filt),
+            User.email.ilike(filt),
+            User.full_name.ilike(filt),
+            User.phone_number.ilike(filt),
+        ]
+        # A lender licence number (LND-XXXX-XXXX, see lender_licence_number
+        # in user_repo.py) isn't a stored column — it's derived from the
+        # user's own id — so matching it means reversing that derivation:
+        # strip the "LND-"/dashes back off and match what's left against
+        # the id's first 8 characters. Guarded at 3+ chars so a stray "-"
+        # or bare "LND-" doesn't turn into a match-everything prefix.
+        licence_search = search.upper().replace("LND-", "").replace("-", "").strip()
+        if len(licence_search) >= 3:
+            conditions.append(func.upper(User.id).like(f"{licence_search}%"))
+        query = query.filter(or_(*conditions))
 
     if status:
         if status == "active":
