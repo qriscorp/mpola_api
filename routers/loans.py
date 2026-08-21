@@ -1640,29 +1640,12 @@ async def get_loan(
     return _loan_response(loan, db, include_repayments=True)
 
 
-@router.post("/active/{loan_id}/approve-disbursement")
-def approve_disbursement(
-    loan_id: str,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_active_user),
-):
-    """Lender approves and triggers the actual wallet-to-wallet transfer for
-    a loan the borrower already accepted (see respond_to_offer, which
-    creates it as 'pending_disbursement' without moving any money). The
-    balance check happens here, not at accept time, since the lender's
-    balance can change between the borrower's acceptance and this approval."""
-    # Locked for the rest of this request — without this, two concurrent
-    # approve calls (double-click, two devices) could both pass the
-    # pending_disbursement check before either commits and both disburse,
-    # debiting the lender and crediting the borrower twice for one loan.
-    loan = db.query(Loan).filter(Loan.id == loan_id).with_for_update().first()
-    if not loan:
-        raise HTTPException(status_code=404, detail="Loan not found")
-    if loan.lender_id != user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    if loan.status != "pending_disbursement":
-        raise HTTPException(status_code=400, detail=f"Loan is not awaiting disbursement (status: {loan.status})")
-
+def _disburse_loan_core(db: Session, loan: Loan, user: User) -> None:
+    """Wallet-to-wallet transfer shared by the single-loan and batch
+    disbursement endpoints below. Caller must already hold a row lock on
+    `loan` (with_for_update) and have verified ownership/status — this
+    function locks both wallets, checks balance, and executes the credit/
+    debit. Raises HTTPException on any failure. Caller must db.commit()."""
     # Lock both wallets in a fixed order (ascending user_id) — not just
     # lender-then-borrower — so this never deadlocks against a concurrent
     # make_repayment on a *different* loan between the same two users (which
@@ -1748,8 +1731,98 @@ def approve_disbursement(
     _audit(db, "loan_disbursed", username=user.username, user_id=user.id,
            resource_type="loan", resource_id=loan.id, details={"amount": loan.amount})
 
+
+@router.post("/active/{loan_id}/approve-disbursement")
+def approve_disbursement(
+    loan_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Lender approves and triggers the actual wallet-to-wallet transfer for
+    a loan the borrower already accepted (see respond_to_offer, which
+    creates it as 'pending_disbursement' without moving any money). The
+    balance check happens here, not at accept time, since the lender's
+    balance can change between the borrower's acceptance and this approval."""
+    # Locked for the rest of this request — without this, two concurrent
+    # approve calls (double-click, two devices) could both pass the
+    # pending_disbursement check before either commits and both disburse,
+    # debiting the lender and crediting the borrower twice for one loan.
+    loan = db.query(Loan).filter(Loan.id == loan_id).with_for_update().first()
+    if not loan:
+        raise HTTPException(status_code=404, detail="Loan not found")
+    if loan.lender_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    if loan.status != "pending_disbursement":
+        raise HTTPException(status_code=400, detail=f"Loan is not awaiting disbursement (status: {loan.status})")
+
+    _disburse_loan_core(db, loan, user)
     db.commit()
     return {"status": 200, "message": "Loan disbursed", "loan": _loan_response(loan, db)}
+
+
+@router.get("/disbursement-queue")
+def disbursement_queue(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Powers the lender's Disbursement page: loans awaiting disbursement,
+    plus today's disbursement activity and the lender's own wallet balance —
+    everything the queue/stat-card UI needs in one call."""
+    pending_loans = db.query(Loan).filter(
+        Loan.lender_id == user.id, Loan.status == "pending_disbursement",
+    ).order_by(Loan.created_at.asc()).all()
+
+    wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    disbursed_today = db.query(WalletTransaction).filter(
+        WalletTransaction.wallet_id == (wallet.id if wallet else None),
+        WalletTransaction.type == "disbursement",
+        WalletTransaction.direction == "debit",
+        WalletTransaction.status == "completed",
+        WalletTransaction.created_at >= today_start,
+    ).all() if wallet else []
+
+    return {
+        "pending": [_loan_response(l, db) for l in pending_loans],
+        "pending_count": len(pending_loans),
+        "pending_total": sum(l.amount for l in pending_loans),
+        "disbursed_today_count": len(disbursed_today),
+        "disbursed_today_amount": sum(tx.amount for tx in disbursed_today),
+        "wallet_balance": wallet.balance if wallet else 0,
+    }
+
+
+@router.post("/disbursement/batch")
+def batch_approve_disbursement(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Disburses every loan currently awaiting this lender's approval.
+    Each loan is processed (and committed) independently — one running out
+    of wallet balance partway through a batch stops that loan, not the rest,
+    since by then earlier loans in the batch have already really moved money
+    and can't be silently undone."""
+    loan_ids = [
+        row[0] for row in db.query(Loan.id).filter(
+            Loan.lender_id == user.id, Loan.status == "pending_disbursement",
+        ).order_by(Loan.created_at.asc()).all()
+    ]
+
+    disbursed, failed = [], []
+    for loan_id in loan_ids:
+        try:
+            loan = db.query(Loan).filter(Loan.id == loan_id).with_for_update().first()
+            if not loan or loan.status != "pending_disbursement":
+                continue
+            _disburse_loan_core(db, loan, user)
+            db.commit()
+            disbursed.append(loan_id)
+        except HTTPException as e:
+            db.rollback()
+            failed.append({"loan_id": loan_id, "reason": e.detail})
+
+    return {"status": 200, "disbursed": disbursed, "failed": failed}
 
 
 # ═══════════════════════════════════════════════
