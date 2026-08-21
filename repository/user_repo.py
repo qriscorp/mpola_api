@@ -69,6 +69,7 @@ class UserRepo:
             "email": user.email,
             "full_name": user.full_name,
             "phone_number": user.phone_number,
+            "city": user.city,
             "role": user.role,
             "is_active": user.is_active,
             "is_admin": user.has_admin_access,

@@ -36,6 +36,12 @@ class User(Base, TimestampMixin):
     gender = Column(String(20), nullable=True)
     profile_pic = Column(String(500), nullable=True)
     bio = Column(Text, nullable=True)
+    # District/town, e.g. "Kampala", "Mbarara" — shown alongside a lender's
+    # offer or borrower's request on the public marketplace preview
+    # (routers/public.py). Optional and editable from profile settings;
+    # accounts created before this field existed are simply null, and the
+    # frontend omits the location line entirely rather than showing a blank.
+    city = Column(String(100), nullable=True)
     account_type = Column(String(20), default="individual")  # individual, business, company
     role = Column(String(30), default="borrower")  # borrower, lender, admin, super_admin
     # Admin access is orthogonal to `role`: an account keeps its borrower/lender
