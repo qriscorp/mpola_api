@@ -6,7 +6,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from config import BASE_URL
@@ -16,6 +16,7 @@ from repository.auth_repo import _audit, _notify, _notify_admins
 from repository.dependencies import get_db, current_active_user
 from repository.models import LoanApplicationCreate, LoanApplicationUpdate, LoanOfferCreate, LoanOfferUpdate, LenderOfferTemplateCreate, LenderOfferTemplateUpdate, LenderOfferTemplateExpiryUpdate, RepaymentCreate, GuarantorAttach
 from repository.security import require_roles
+from routers.public import RATE_BANDS, _offer_loan_types
 from routers.users import ALLOWED_BORROWER_DOCUMENT_EXTENSIONS, MAX_BORROWER_DOCUMENT_SIZE_BYTES
 from routers.wallet import _ensure_wallet_not_frozen
 from utils.upg_client import UPGClient, _detect_carrier, friendly_upg_error
@@ -1277,6 +1278,99 @@ async def extend_offer_template_expiry(
     return {"status": 200, "message": "Expiry updated", "template": _offer_template_response(template, db)}
 
 
+def _borrower_related_template_ids(db: Session, borrower_id: str) -> set:
+    """Every LenderOfferTemplate the borrower already has a real LoanOffer
+    from (pending, accepted, or declined) — browsing it again in 'Browse
+    Lender Offers' is pointless (and confusing when it's one they already
+    declined): they should act on the existing offer via My Requests /
+    Offers Received instead of being shown a second, unrelated invitation
+    to apply to the same lender's standing criteria."""
+    rows = (
+        db.query(LoanOffer.template_id)
+        .join(LoanApplication, LoanOffer.application_id == LoanApplication.id)
+        .filter(LoanApplication.borrower_id == borrower_id, LoanOffer.template_id.isnot(None))
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
+@router.get("/offer-templates/browse")
+def browse_offer_templates(
+    search: str = Query(None),
+    rate: str = Query(None, description="comma-separated: under5,5to7,7to10,above10"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=50),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Authenticated borrower-facing list for 'Browse Lender Offers' —
+    distinct from the anonymous GET /public/marketplace-preview the
+    homepage uses, because this one needs to know WHO is browsing so it can
+    exclude any template the borrower already has a real LoanOffer from
+    (see _borrower_related_template_ids)."""
+    excluded = _borrower_related_template_ids(db, user.id)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    all_templates = (
+        db.query(LenderOfferTemplate, User)
+        .join(User, LenderOfferTemplate.lender_id == User.id)
+        .filter(
+            LenderOfferTemplate.status == "approved",
+            LenderOfferTemplate.is_frozen == False,  # noqa: E712
+            or_(LenderOfferTemplate.valid_until.is_(None), LenderOfferTemplate.valid_until > now),
+        )
+        .all()
+    )
+    candidates = [(t, l) for t, l in all_templates if t.id not in excluded]
+
+    search_lower = (search or "").strip().lower()
+    rate_bands = {b for b in (rate or "").split(",") if b in RATE_BANDS}
+
+    def matches(template: LenderOfferTemplate, lender: User) -> bool:
+        if search_lower:
+            haystack = " ".join([
+                template.description or "",
+                lender.full_name or lender.username or "",
+                " ".join(_offer_loan_types(template)),
+            ]).lower()
+            if search_lower not in haystack:
+                return False
+        if rate_bands and not any(RATE_BANDS[b](template.interest_rate) for b in rate_bands):
+            return False
+        return True
+
+    filtered = [(t, l) for t, l in candidates if matches(t, l)]
+    filtered.sort(key=lambda row: row[0].created_at or datetime.min, reverse=True)
+
+    total = len(filtered)
+    page = filtered[offset:offset + limit]
+
+    offer_counts = dict(
+        db.query(LoanOffer.template_id, func.count(LoanOffer.id))
+        .filter(LoanOffer.template_id.isnot(None))
+        .group_by(LoanOffer.template_id)
+        .all()
+    )
+
+    listings = [
+        {
+            "id": t.id,
+            "lender_name": l.full_name or l.username,
+            "city": l.city,
+            "description": t.description,
+            "min_amount": t.min_amount,
+            "max_amount": t.max_amount,
+            "interest_rate": t.interest_rate,
+            "loan_types": t.accepted_loan_types,
+            "max_duration": t.max_duration,
+            "max_duration_days": t.max_duration_days,
+            "offer_count": offer_counts.get(t.id, 0),
+            "created_at": safe_isoformat(t.created_at),
+        }
+        for t, l in page
+    ]
+    return {"listings": listings, "total": total, "has_more": offset + limit < total}
+
+
 @router.get("/offer-templates/{template_id}/public-detail")
 def get_offer_template_public_detail(
     template_id: str,
@@ -1300,6 +1394,11 @@ def get_offer_template_public_detail(
     # _template_matches below.
     if template.valid_until and template.valid_until <= datetime.now(timezone.utc).replace(tzinfo=None):
         raise HTTPException(status_code=404, detail="Offer not found")
+    if template.id in _borrower_related_template_ids(db, user.id):
+        raise HTTPException(
+            status_code=404,
+            detail="You already have an offer from this lender — check My Requests or Offers Received.",
+        )
 
     lender = db.query(User).filter(User.id == template.lender_id).first()
     applications_count = (
@@ -1318,6 +1417,7 @@ def get_offer_template_public_detail(
         "max_duration_days": template.max_duration_days,
         "accepted_loan_types": json.loads(template.accepted_loan_types) if template.accepted_loan_types else [],
         "required_documents": json.loads(template.required_documents) if template.required_documents else [],
+        "required_documents_status": _required_documents_status(db, user.id, template.required_documents),
         "description": template.description,
         "valid_until": safe_isoformat(template.valid_until),
         "applications_count": applications_count,
