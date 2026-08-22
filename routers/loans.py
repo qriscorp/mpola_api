@@ -1277,6 +1277,53 @@ async def extend_offer_template_expiry(
     return {"status": 200, "message": "Expiry updated", "template": _offer_template_response(template, db)}
 
 
+@router.get("/offer-templates/{template_id}/public-detail")
+def get_offer_template_public_detail(
+    template_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_active_user),
+):
+    """Read-only detail for a borrower browsing an individual lender's
+    standing offer before applying ('Browse Lender Offers' on both
+    frontends) — distinct from _offer_template_response, which is the
+    lender's own management view and leaks internals (frozen state,
+    matched-offer counts) a borrower has no business seeing. Only ever
+    exposes an offer that could actually still match something, and never
+    a licence number (see _lender_licence_info — that stays private until
+    actually issued)."""
+    template = db.query(LenderOfferTemplate).filter(LenderOfferTemplate.id == template_id).first()
+    if not template or template.status != "approved" or template.is_frozen:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    # template.valid_until round-trips through MySQL as a naive datetime even
+    # though it's always written as UTC — compare naive-to-naive rather than
+    # against an aware `now` (mixing the two raises TypeError), same as
+    # _template_matches below.
+    if template.valid_until and template.valid_until <= datetime.now(timezone.utc).replace(tzinfo=None):
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    lender = db.query(User).filter(User.id == template.lender_id).first()
+    applications_count = (
+        db.query(func.count(LoanOffer.id)).filter(LoanOffer.template_id == template.id).scalar() or 0
+    )
+    return {
+        "id": template.id,
+        "lender_name": (lender.full_name or lender.username) if lender else None,
+        "city": lender.city if lender else None,
+        "lender_member_since": safe_isoformat(lender.created_at) if lender else None,
+        "lender_kyc_status": lender.kyc_status if lender else None,
+        "interest_rate": template.interest_rate,
+        "min_amount": template.min_amount,
+        "max_amount": template.max_amount,
+        "max_duration": template.max_duration,
+        "max_duration_days": template.max_duration_days,
+        "accepted_loan_types": json.loads(template.accepted_loan_types) if template.accepted_loan_types else [],
+        "required_documents": json.loads(template.required_documents) if template.required_documents else [],
+        "description": template.description,
+        "valid_until": safe_isoformat(template.valid_until),
+        "applications_count": applications_count,
+    }
+
+
 @router.get("/offer-templates/{template_id}/matches")
 async def offer_template_matches(
     template_id: str,
