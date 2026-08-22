@@ -1812,6 +1812,34 @@ def _disburse_loan_core(db: Session, loan: Loan, user: User) -> None:
     _ensure_wallet_not_frozen(lender_wallet)
     _ensure_wallet_not_frozen(borrower_wallet, label="The borrower's")
 
+    # A borrower can have several accepted-but-not-yet-disbursed loans in
+    # flight at once (accepting an offer only auto-declines rival offers on
+    # the SAME application — a different lender's offer on a different
+    # application is untouched). Whichever lender disburses first is fine;
+    # every other lender's pending_disbursement loan for this same borrower
+    # must be blocked from also disbursing once one has gone active — same
+    # "one outstanding loan at a time" rule create_application already
+    # enforces on the borrower's side (OUTSTANDING_LOAN_STATUSES), just
+    # applied here too since that check alone can't stop THIS. Safe against
+    # a genuine race (two lenders disbursing to the same borrower at once):
+    # every disbursement locks the borrower's own wallet row above, so a
+    # concurrent attempt for the same borrower always serializes on that
+    # lock and re-evaluates this check with the other one's commit visible.
+    other_active_loan = (
+        db.query(Loan)
+        .filter(
+            Loan.borrower_id == loan.borrower_id,
+            Loan.id != loan.id,
+            Loan.status.in_(("active", "overdue", "defaulted")),
+        )
+        .first()
+    )
+    if other_active_loan:
+        raise HTTPException(
+            status_code=400,
+            detail="This borrower already has an active loan with another lender — they can't be disbursed a second loan until it's fully repaid.",
+        )
+
     platform_fee = calc_platform_fee(loan.amount)
     total_debit = loan.amount + platform_fee
     if lender_wallet.balance < total_debit:
@@ -1875,6 +1903,28 @@ def _disburse_loan_core(db: Session, loan: Loan, user: User) -> None:
         data={"loan_id": loan.id},
     )
 
+    # Proactively warn every OTHER lender with a loan still awaiting
+    # disbursement to this same borrower — their disbursement will now be
+    # blocked by the check above until this loan is repaid, and they
+    # shouldn't have to find that out only by trying and getting a 400.
+    other_pending_loans = (
+        db.query(Loan)
+        .filter(
+            Loan.borrower_id == loan.borrower_id,
+            Loan.id != loan.id,
+            Loan.status == "pending_disbursement",
+        )
+        .all()
+    )
+    for blocked in other_pending_loans:
+        _notify(
+            db, blocked.lender_id,
+            title="Disbursement on hold",
+            message=f"{borrower.full_name or borrower.username} just took an active loan with another lender — your pending disbursement of UGX {blocked.amount:,.0f} is on hold until they repay it.",
+            type="disbursement_blocked",
+            data={"loan_id": blocked.id},
+        )
+
     _audit(db, "loan_disbursed", username=user.username, user_id=user.id,
            resource_type="loan", resource_id=loan.id, details={"amount": loan.amount})
 
@@ -1919,6 +1969,19 @@ def disbursement_queue(
         Loan.lender_id == user.id, Loan.status == "pending_disbursement",
     ).order_by(Loan.created_at.asc()).all()
 
+    # Flag any queue entry that would actually be rejected right now by the
+    # same check in _disburse_loan_core — a borrower with several accepted
+    # offers can already have gone active with a different lender, and this
+    # lender should see that before tapping Disburse, not just get a 400.
+    borrower_ids = {l.borrower_id for l in pending_loans}
+    borrowers_with_active_loan = {
+        row[0]
+        for row in db.query(Loan.borrower_id)
+        .filter(Loan.borrower_id.in_(borrower_ids), Loan.status.in_(("active", "overdue", "defaulted")))
+        .distinct()
+        .all()
+    } if borrower_ids else set()
+
     wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
 
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1931,7 +1994,13 @@ def disbursement_queue(
     ).all() if wallet else []
 
     return {
-        "pending": [_loan_response(l, db) for l in pending_loans],
+        "pending": [
+            {
+                **_loan_response(l, db),
+                "borrower_has_active_loan_elsewhere": l.borrower_id in borrowers_with_active_loan,
+            }
+            for l in pending_loans
+        ],
         "pending_count": len(pending_loans),
         "pending_total": sum(l.amount for l in pending_loans),
         "disbursed_today_count": len(disbursed_today),
