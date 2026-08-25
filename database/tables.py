@@ -68,6 +68,13 @@ class User(Base, TimestampMixin):
     # column exists: any admin sees the same shared inbox, same as the
     # SupportTicket system.
     admin_chat_read_at = Column(DateTime, nullable=True)
+    # "Has any admin opened this user's Mpola Support thread" — the admin
+    # side's counterpart to admin_chat_read_at, but shared across every
+    # admin/super admin rather than owned by one, since any of them can
+    # reply (see AdminChatMessage). Set whenever any admin views the
+    # thread (GET /chat/admin/conversations/{user_id}); read by this
+    # user's own client to show read-receipt ticks on their sent messages.
+    admin_chat_seen_by_admin_at = Column(DateTime, nullable=True)
     # JWT refresh tokens can exceed 255 chars once claims/signature are included.
     refresh_token = Column(Text, nullable=True)
     refresh_token_expires_at = Column(DateTime, nullable=True)

@@ -101,7 +101,24 @@ def get_chat_conversations(
         })
 
     conversations.sort(key=lambda c: c["last_message_at"] or "", reverse=True)
-    return {"conversations": conversations}
+
+    admin_last = (
+        db.query(AdminChatMessage)
+        .filter(AdminChatMessage.user_id == user.id)
+        .order_by(AdminChatMessage.created_at.desc())
+        .first()
+    )
+    return {
+        "conversations": conversations,
+        # Powers the pinned "Mpola Support" row's preview — deliberately
+        # never touches admin_chat_read_at (unlike GET /chat/admin), since
+        # just seeing this list shouldn't clear the unread badge.
+        "admin_chat": {
+            "last_message": _preview_text(admin_last.message, admin_last.file_name) if admin_last else None,
+            "last_message_at": safe_isoformat(admin_last.created_at) if admin_last else None,
+            "unread_count": _admin_unread_count(db, user),
+        },
+    }
 
 
 def _admin_unread_count(db: Session, user: User) -> int:
@@ -146,12 +163,18 @@ def get_loan_chat(
         loan.lender_chat_read_at = datetime.now(timezone.utc)
     db.commit()
 
+    other_read_at = loan.lender_chat_read_at if user.id == loan.borrower_id else loan.borrower_chat_read_at
+
     return {
         "other_party": {
             "id": other.id if other else None,
             "name": (other.full_name or other.username) if other else None,
             "kyc_status": other.kyc_status if other else None,
         },
+        # The OTHER party's read timestamp — lets the caller's own client
+        # show a read tick on messages IT sent (compare against each
+        # message's created_at), not on what it received.
+        "other_party_read_at": safe_isoformat(other_read_at),
         "messages": [_loan_message_response(m) for m in loan.chat_messages],
     }
 
@@ -235,6 +258,9 @@ def get_my_admin_chat(
 
     return {
         "other_party": {"name": "Mpola Support"},
+        # Has any admin opened this thread — lets the caller see a read
+        # tick on messages THEY sent to support.
+        "admin_last_seen_at": safe_isoformat(user.admin_chat_seen_by_admin_at),
         "messages": [_admin_message_response(m) for m in messages],
     }
 
@@ -317,6 +343,13 @@ def get_admin_chat_conversation(
         .order_by(AdminChatMessage.created_at)
         .all()
     )
+
+    # Mark "seen by an admin" — shared across every admin (no per-admin
+    # ownership), exact counterpart to how get_my_admin_chat/get_loan_chat
+    # mark their own caller's side.
+    u.admin_chat_seen_by_admin_at = datetime.now(timezone.utc)
+    db.commit()
+
     return {
         "other_party": {
             "id": u.id,
@@ -324,6 +357,9 @@ def get_admin_chat_conversation(
             "role": u.role,
             "kyc_status": u.kyc_status,
         },
+        # Lets the admin see a read tick on THEIR OWN replies once this
+        # user opens the thread.
+        "user_read_at": safe_isoformat(u.admin_chat_read_at),
         "messages": [_admin_message_response(m) for m in messages],
     }
 
