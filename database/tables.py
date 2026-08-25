@@ -123,7 +123,7 @@ class User(Base, TimestampMixin):
     loan_applications = relationship("LoanApplication", back_populates="borrower", foreign_keys="LoanApplication.borrower_id")
     offers_made = relationship("LoanOffer", back_populates="lender", foreign_keys="LoanOffer.lender_id")
     notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan")
-    referred_by = relationship("User", remote_side=[id])
+    referred_by = relationship("User", remote_side=[id], foreign_keys=[referred_by_id])
 
     @property
     def has_admin_access(self) -> bool:
