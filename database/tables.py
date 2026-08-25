@@ -75,6 +75,13 @@ class User(Base, TimestampMixin):
     # thread (GET /chat/admin/conversations/{user_id}); read by this
     # user's own client to show read-receipt ticks on their sent messages.
     admin_chat_seen_by_admin_at = Column(DateTime, nullable=True)
+    # Which admin currently handles this user's Mpola Support conversation
+    # — a real queue instead of a free-for-all shared inbox: the first
+    # admin to open an unassigned conversation claims it (see
+    # get_admin_chat_conversation), everyone else can still see it but
+    # not reply, and a super admin can always jump in (reassigning it to
+    # themselves the moment they actually reply).
+    admin_chat_assigned_to_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     # JWT refresh tokens can exceed 255 chars once claims/signature are included.
     refresh_token = Column(Text, nullable=True)
     refresh_token_expires_at = Column(DateTime, nullable=True)

@@ -227,6 +227,13 @@ async def post_loan_chat_message(
 #  model SupportTicket already uses.
 # ═══════════════════════════════════════
 
+def _assigned_admin_name(db: Session, u: User) -> str | None:
+    if not u.admin_chat_assigned_to_id:
+        return None
+    assignee = db.query(User).filter(User.id == u.admin_chat_assigned_to_id).first()
+    return (assignee.full_name or assignee.username) if assignee else None
+
+
 def _admin_message_response(m: AdminChatMessage) -> dict:
     return {
         "id": m.id,
@@ -281,7 +288,7 @@ async def post_my_admin_chat_message(
 
     _notify_admins(
         db,
-        title=f"New message from {user.full_name or user.username}",
+        title=f"New message from {user.full_name or user.username} ({user.role})",
         message=_preview_text(message, file_name)[:150],
         type="admin_chat_message",
         data={"user_id": user.id},
@@ -321,6 +328,8 @@ def get_admin_chat_conversations(
             "last_message": _preview_text(last_message.message, last_message.file_name),
             "last_message_at": safe_isoformat(last_message.created_at),
             "needs_reply": last_message.is_admin is False,
+            "assigned_to_id": u.admin_chat_assigned_to_id if u else None,
+            "assigned_to_name": _assigned_admin_name(db, u) if u else None,
         })
 
     conversations.sort(key=lambda c: c["last_message_at"] or "", reverse=True)
@@ -348,7 +357,23 @@ def get_admin_chat_conversation(
     # ownership), exact counterpart to how get_my_admin_chat/get_loan_chat
     # mark their own caller's side.
     u.admin_chat_seen_by_admin_at = datetime.now(timezone.utc)
+
+    admin_user = db.query(User).filter(User.username == admin.username).first()
+
+    # Auto-claim: the first admin to open an unassigned conversation
+    # becomes its handler. Viewing an already-claimed one never reassigns
+    # it — only a super admin actually replying does that (see
+    # reply_admin_chat_conversation), so casual browsing can't steal it.
+    if not u.admin_chat_assigned_to_id and admin_user:
+        u.admin_chat_assigned_to_id = admin_user.id
+
     db.commit()
+
+    can_reply = (
+        not u.admin_chat_assigned_to_id
+        or (admin_user is not None and u.admin_chat_assigned_to_id == admin_user.id)
+        or admin.is_super_admin
+    )
 
     return {
         "other_party": {
@@ -360,6 +385,9 @@ def get_admin_chat_conversation(
         # Lets the admin see a read tick on THEIR OWN replies once this
         # user opens the thread.
         "user_read_at": safe_isoformat(u.admin_chat_read_at),
+        "assigned_to_id": u.admin_chat_assigned_to_id,
+        "assigned_to_name": _assigned_admin_name(db, u),
+        "can_reply": can_reply,
         "messages": [_admin_message_response(m) for m in messages],
     }
 
@@ -379,6 +407,23 @@ async def reply_admin_chat_conversation(
         raise HTTPException(status_code=404, detail="User not found")
 
     admin_user = db.query(User).filter(User.username == admin.username).first()
+
+    if not u.admin_chat_assigned_to_id:
+        # Safety net for a client that posts without a prior GET — same
+        # auto-claim get_admin_chat_conversation does on open.
+        if admin_user:
+            u.admin_chat_assigned_to_id = admin_user.id
+    elif admin_user and u.admin_chat_assigned_to_id != admin_user.id:
+        if not admin.is_super_admin:
+            assignee_name = _assigned_admin_name(db, u)
+            raise HTTPException(
+                status_code=403,
+                detail=f"This conversation is being handled by {assignee_name or 'another admin'}.",
+            )
+        # A super admin replying takes it over — deliberately tied to the
+        # reply action, not to viewing (see get_admin_chat_conversation).
+        u.admin_chat_assigned_to_id = admin_user.id
+
     file_url, file_name = (await _save_chat_attachment(file)) if file else (None, None)
     msg = AdminChatMessage(
         user_id=user_id,
@@ -401,3 +446,25 @@ async def reply_admin_chat_conversation(
     db.commit()
     db.refresh(msg)
     return {"status": 200, "message_data": _admin_message_response(msg)}
+
+
+@router.post("/admin/conversations/{user_id}/release")
+def release_admin_chat_conversation(
+    user_id: str,
+    db: Session = Depends(get_db),
+    admin: AuthUser = Depends(require_admin),
+):
+    """Hands a claimed conversation back to the shared queue — the
+    currently-assigned admin or any super admin can do this."""
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    admin_user = db.query(User).filter(User.username == admin.username).first()
+    is_assignee = admin_user is not None and u.admin_chat_assigned_to_id == admin_user.id
+    if not is_assignee and not admin.is_super_admin:
+        raise HTTPException(status_code=403, detail="Only the assigned admin or a super admin can release this conversation")
+
+    u.admin_chat_assigned_to_id = None
+    db.commit()
+    return {"status": 200}
