@@ -22,6 +22,7 @@ def send_web_push(
     body: str,
     data: dict | None = None,
     urgent: bool = False,
+    type: str | None = None,
 ) -> bool:
     """Best-effort — a failed push should never block the caller. Returns
     False (instead of raising) on a 404/410 from the push service, which
@@ -41,6 +42,7 @@ def send_web_push(
                 "body": body,
                 "data": data or {},
                 "urgent": urgent,
+                "type": type,
             }),
             vapid_private_key=VAPID_PRIVATE_KEY,
             vapid_claims={"sub": VAPID_SUBJECT},

@@ -62,6 +62,12 @@ class User(Base, TimestampMixin):
     kyc_verified_at = Column(DateTime, nullable=True)
     credit_score = Column(Integer, default=0)
     push_token = Column(Text, nullable=True)  # Expo push token
+    # This user's own read timestamp for their one persistent conversation
+    # with Mpola Support (see AdminChatMessage) — mirrors Loan's
+    # borrower_chat_read_at/lender_chat_read_at. No equivalent per-admin
+    # column exists: any admin sees the same shared inbox, same as the
+    # SupportTicket system.
+    admin_chat_read_at = Column(DateTime, nullable=True)
     # JWT refresh tokens can exceed 255 chars once claims/signature are included.
     refresh_token = Column(Text, nullable=True)
     refresh_token_expires_at = Column(DateTime, nullable=True)
@@ -753,6 +759,25 @@ class LoanChatMessage(Base, TimestampMixin):
 
     loan = relationship("Loan", back_populates="chat_messages")
     sender = relationship("User")
+
+
+class AdminChatMessage(Base, TimestampMixin):
+    """A message in a user's live conversation with Mpola Support. Keyed by
+    user_id, not a ticket — one persistent thread per user, any admin/super
+    admin can reply (no per-admin ownership), same shared-inbox model the
+    SupportTicket system already uses. Runs alongside SupportTicket rather
+    than replacing it: tickets stay for formal/categorized issues, this is
+    for quick live back-and-forth."""
+    __tablename__ = "admin_chat_messages"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    user_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    sender_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    is_admin = Column(Boolean, nullable=False, default=False)
+    message = Column(Text, nullable=False)
+
+    user = relationship("User", foreign_keys=[user_id])
+    sender = relationship("User", foreign_keys=[sender_id])
 
 
 # ═══════════════════════════════════════

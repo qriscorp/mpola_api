@@ -15,6 +15,7 @@ from database.tables import (
     LoanApplication, LoanOffer, LenderOfferTemplate, Loan, Repayment,
     Notification, PlatformSetting, AuditLog, LoginAttempt, PlatformFeeTransaction,
     Dispute, SupportTicket, SupportMessage, LoanDocument, KYCDocument,
+    AdminChatMessage,
 )
 from helpers import safe_isoformat
 from repository.auth_repo import get_password_hash, _audit, _notify
@@ -106,6 +107,19 @@ def get_dashboard_stats(
     # admin already replied and is on it, so it doesn't need the badge's
     # attention the way a fresh, untouched "open" ticket does.
     open_support_tickets = db.query(func.count(SupportTicket.id)).filter(SupportTicket.status == "open").scalar()
+
+    # Live-chat conversations whose most recent message is still waiting on
+    # an admin — same "needs_reply" rule as GET /chat/admin/conversations.
+    awaiting_admin_chat_reply = 0
+    for (uid,) in db.query(AdminChatMessage.user_id).distinct().all():
+        last = (
+            db.query(AdminChatMessage)
+            .filter(AdminChatMessage.user_id == uid)
+            .order_by(AdminChatMessage.created_at.desc())
+            .first()
+        )
+        if last and not last.is_admin:
+            awaiting_admin_chat_reply += 1
 
     # Real platform revenue — the 0.5% fee only (see utils/fee.py). Excludes
     # Interswitch/Flutterwave provider surcharges: those are collected from
@@ -227,6 +241,7 @@ def get_dashboard_stats(
             "pending_offer_templates": pending_offer_templates,
             "open_disputes": open_disputes,
             "open_support_tickets": open_support_tickets,
+            "awaiting_admin_chat_reply": awaiting_admin_chat_reply,
         },
         "loan_type_mix": loan_type_mix,
         "application_status_breakdown": application_status_breakdown,

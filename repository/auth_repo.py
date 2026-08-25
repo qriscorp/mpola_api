@@ -360,7 +360,12 @@ def _notify(db: Session, user_id: str, title: str, message: str,
         user = target_user if target_user is not None else db.query(User).filter(User.id == user_id).first()
         if user and user.push_token:
             from utils.push import send_expo_push
-            send_expo_push(user.push_token, title, message, data, urgent=type in URGENT_NOTIFICATION_TYPES)
+            # Folded into one flat dict — Expo's push payload has no
+            # separate "type" field, and the app's notification-tap
+            # handler needs the type to know where to deep-link (see
+            # src/services/notificationRouting.ts).
+            send_expo_push(user.push_token, title, message, {**(data or {}), "type": type},
+                            urgent=type in URGENT_NOTIFICATION_TYPES)
     except Exception as e:
         logger.error(f"Push notify failed: {e}")
 
@@ -372,7 +377,7 @@ def _notify(db: Session, user_id: str, title: str, message: str,
             try:
                 send_web_push(
                     sub.endpoint, sub.p256dh, sub.auth, title, message, data,
-                    urgent=type in URGENT_NOTIFICATION_TYPES,
+                    urgent=type in URGENT_NOTIFICATION_TYPES, type=type,
                 )
             except WebPushException:
                 # 404/410 from the push service — the browser revoked or
