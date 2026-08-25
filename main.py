@@ -10,6 +10,7 @@ from routers import (
     ws_router, referrals_router, support_router,
     disputes_router, sessions_router, webpush_router,
     faqs_router, faqs_admin_router, public_router,
+    chat_router,
 )
 from database import ENGINE
 from database.tables import Base
@@ -101,6 +102,7 @@ app.include_router(webpush_router)
 app.include_router(faqs_router)
 app.include_router(faqs_admin_router)
 app.include_router(public_router)
+app.include_router(chat_router)
 
 # ─── Static files ───────────────────────────────────────────
 os.makedirs("static", exist_ok=True)

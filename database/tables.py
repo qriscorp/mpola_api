@@ -574,11 +574,19 @@ class Loan(Base, TimestampMixin):
     # accepting the offer — e.g. context on a custom document requirement,
     # or anything else worth flagging before the lender approves disbursement.
     borrower_note = Column(Text, nullable=True)
+    # Chat read-receipt timestamps — a loan has exactly two possible
+    # readers, known in advance, so two columns here are simpler than a
+    # junction table. Updated to now() whenever that side's GET
+    # /loans/{id}/chat runs; unread count is messages from the OTHER
+    # party newer than the caller's own column.
+    borrower_chat_read_at = Column(DateTime, nullable=True)
+    lender_chat_read_at = Column(DateTime, nullable=True)
 
     application = relationship("LoanApplication", back_populates="loan")
     borrower = relationship("User", foreign_keys=[borrower_id])
     lender_user = relationship("User", foreign_keys=[lender_id])
     repayments = relationship("Repayment", back_populates="loan", cascade="all, delete-orphan")
+    chat_messages = relationship("LoanChatMessage", back_populates="loan", cascade="all, delete-orphan", order_by="LoanChatMessage.created_at")
 
 
 # ═══════════════════════════════════════
@@ -727,6 +735,23 @@ class DisputeMessage(Base, TimestampMixin):
     message = Column(Text, nullable=False)
 
     dispute = relationship("Dispute", back_populates="messages")
+    sender = relationship("User")
+
+
+class LoanChatMessage(Base, TimestampMixin):
+    """A message between a loan's borrower and lender — scoped to that one
+    loan (not an open DM system), same reasoning as disputes: a real-money
+    platform needs an evidence trail, not unscoped messaging that invites
+    off-platform circumvention. Mirrors DisputeMessage, minus the
+    admin/resolution-lock concepts that don't apply here."""
+    __tablename__ = "loan_chat_messages"
+
+    id = Column(String(50), primary_key=True, default=generateUniqueId)
+    loan_id = Column(String(50), ForeignKey("loans.id", ondelete="CASCADE"), nullable=False, index=True)
+    sender_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    message = Column(Text, nullable=False)
+
+    loan = relationship("Loan", back_populates="chat_messages")
     sender = relationship("User")
 
 
