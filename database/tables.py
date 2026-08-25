@@ -755,7 +755,9 @@ class LoanChatMessage(Base, TimestampMixin):
     id = Column(String(50), primary_key=True, default=generateUniqueId)
     loan_id = Column(String(50), ForeignKey("loans.id", ondelete="CASCADE"), nullable=False, index=True)
     sender_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    message = Column(Text, nullable=False)
+    message = Column(Text, nullable=True)
+    file_url = Column(String(500), nullable=True)
+    file_name = Column(String(255), nullable=True)
 
     loan = relationship("Loan", back_populates="chat_messages")
     sender = relationship("User")
@@ -774,7 +776,9 @@ class AdminChatMessage(Base, TimestampMixin):
     user_id = Column(String(50), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     sender_id = Column(String(50), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     is_admin = Column(Boolean, nullable=False, default=False)
-    message = Column(Text, nullable=False)
+    message = Column(Text, nullable=True)
+    file_url = Column(String(500), nullable=True)
+    file_name = Column(String(255), nullable=True)
 
     user = relationship("User", foreign_keys=[user_id])
     sender = relationship("User", foreign_keys=[sender_id])

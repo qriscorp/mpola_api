@@ -7,19 +7,45 @@ Mirrors disputes.py's message flow closely, minus the admin/resolution-lock
 concepts that don't apply here.
 """
 
+import os
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
+from config import BASE_URL
 from database.tables import User, Loan, LoanChatMessage, AdminChatMessage
-from helpers import safe_isoformat
+from helpers import generateUniqueId, safe_isoformat
 from repository.auth_repo import _notify, _notify_admins
 from repository.dependencies import get_db, current_active_user
-from repository.models import ChatMessageCreate, AuthUser
+from repository.models import AuthUser
 from repository.security import require_admin
+from routers.users import ALLOWED_BORROWER_DOCUMENT_EXTENSIONS, MAX_BORROWER_DOCUMENT_SIZE_BYTES
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
+
+
+def _preview_text(message: str | None, file_name: str | None) -> str:
+    if message:
+        return message
+    return f"Sent an attachment: {file_name}" if file_name else "Sent an attachment"
+
+
+async def _save_chat_attachment(file: UploadFile) -> tuple[str, str]:
+    """Mirrors submit_custom_document_response's save block (routers/loans.py)
+    — same disk location, same size/extension limits as every other upload
+    in this codebase."""
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_BORROWER_DOCUMENT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext or 'unknown'}")
+    contents = await file.read()
+    if len(contents) > MAX_BORROWER_DOCUMENT_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="File exceeds 10MB limit")
+    os.makedirs("uploads", exist_ok=True)
+    stored_name = f"{generateUniqueId(20)}{ext}"
+    with open(os.path.join("uploads", stored_name), "wb") as f:
+        f.write(contents)
+    return f"{BASE_URL}/uploads/{stored_name}", file.filename
 
 
 def _get_loan_as_party(db: Session, loan_id: str, user: User) -> Loan:
@@ -69,7 +95,7 @@ def get_chat_conversations(
             "other_party_name": (other.full_name or other.username) if other else None,
             "loan_amount": loan.amount,
             "loan_status": loan.status,
-            "last_message": last_message.message if last_message else None,
+            "last_message": _preview_text(last_message.message, last_message.file_name) if last_message else None,
             "last_message_at": safe_isoformat(last_message.created_at) if last_message else safe_isoformat(loan.created_at),
             "unread_count": _unread_count(loan, user),
         })
@@ -126,51 +152,49 @@ def get_loan_chat(
             "name": (other.full_name or other.username) if other else None,
             "kyc_status": other.kyc_status if other else None,
         },
-        "messages": [
-            {
-                "id": m.id,
-                "sender_id": m.sender_id,
-                "sender_name": (m.sender.full_name or m.sender.username) if m.sender else None,
-                "message": m.message,
-                "created_at": safe_isoformat(m.created_at),
-            }
-            for m in loan.chat_messages
-        ],
+        "messages": [_loan_message_response(m) for m in loan.chat_messages],
+    }
+
+
+def _loan_message_response(m: LoanChatMessage) -> dict:
+    return {
+        "id": m.id,
+        "sender_id": m.sender_id,
+        "sender_name": (m.sender.full_name or m.sender.username) if m.sender else None,
+        "message": m.message,
+        "file_url": m.file_url,
+        "file_name": m.file_name,
+        "created_at": safe_isoformat(m.created_at),
     }
 
 
 @router.post("/loans/{loan_id}")
-def post_loan_chat_message(
+async def post_loan_chat_message(
     loan_id: str,
-    data: ChatMessageCreate,
+    message: str | None = Form(None),
+    file: UploadFile | None = File(None),
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
 ):
+    if not message and not file:
+        raise HTTPException(status_code=400, detail="Provide a message, a file, or both")
     loan = _get_loan_as_party(db, loan_id, user)
 
-    msg = LoanChatMessage(loan_id=loan.id, sender_id=user.id, message=data.message)
+    file_url, file_name = (await _save_chat_attachment(file)) if file else (None, None)
+    msg = LoanChatMessage(loan_id=loan.id, sender_id=user.id, message=message, file_url=file_url, file_name=file_name)
     db.add(msg)
 
     _notify(
         db, _other_party_id(loan, user),
         title="New message",
-        message=f"{user.full_name or user.username}: {data.message[:150]}",
+        message=f"{user.full_name or user.username}: {_preview_text(message, file_name)[:150]}",
         type="chat_message",
         data={"loan_id": loan.id},
     )
 
     db.commit()
     db.refresh(msg)
-    return {
-        "status": 200,
-        "message_data": {
-            "id": msg.id,
-            "sender_id": msg.sender_id,
-            "sender_name": user.full_name or user.username,
-            "message": msg.message,
-            "created_at": safe_isoformat(msg.created_at),
-        },
-    }
+    return {"status": 200, "message_data": _loan_message_response(msg)}
 
 
 # ═══════════════════════════════════════
@@ -187,6 +211,8 @@ def _admin_message_response(m: AdminChatMessage) -> dict:
         "sender_name": (m.sender.full_name or m.sender.username) if m.sender else None,
         "is_admin": m.is_admin,
         "message": m.message,
+        "file_url": m.file_url,
+        "file_name": m.file_name,
         "created_at": safe_isoformat(m.created_at),
     }
 
@@ -214,18 +240,23 @@ def get_my_admin_chat(
 
 
 @router.post("/admin")
-def post_my_admin_chat_message(
-    data: ChatMessageCreate,
+async def post_my_admin_chat_message(
+    message: str | None = Form(None),
+    file: UploadFile | None = File(None),
     db: Session = Depends(get_db),
     user: User = Depends(current_active_user),
 ):
-    msg = AdminChatMessage(user_id=user.id, sender_id=user.id, is_admin=False, message=data.message)
+    if not message and not file:
+        raise HTTPException(status_code=400, detail="Provide a message, a file, or both")
+
+    file_url, file_name = (await _save_chat_attachment(file)) if file else (None, None)
+    msg = AdminChatMessage(user_id=user.id, sender_id=user.id, is_admin=False, message=message, file_url=file_url, file_name=file_name)
     db.add(msg)
 
     _notify_admins(
         db,
         title=f"New message from {user.full_name or user.username}",
-        message=data.message[:150],
+        message=_preview_text(message, file_name)[:150],
         type="admin_chat_message",
         data={"user_id": user.id},
     )
@@ -261,7 +292,7 @@ def get_admin_chat_conversations(
             "user_id": uid,
             "name": (u.full_name or u.username) if u else None,
             "role": u.role if u else None,
-            "last_message": last_message.message,
+            "last_message": _preview_text(last_message.message, last_message.file_name),
             "last_message_at": safe_isoformat(last_message.created_at),
             "needs_reply": last_message.is_admin is False,
         })
@@ -298,29 +329,35 @@ def get_admin_chat_conversation(
 
 
 @router.post("/admin/conversations/{user_id}")
-def reply_admin_chat_conversation(
+async def reply_admin_chat_conversation(
     user_id: str,
-    data: ChatMessageCreate,
+    message: str | None = Form(None),
+    file: UploadFile | None = File(None),
     db: Session = Depends(get_db),
     admin: AuthUser = Depends(require_admin),
 ):
+    if not message and not file:
+        raise HTTPException(status_code=400, detail="Provide a message, a file, or both")
     u = db.query(User).filter(User.id == user_id).first()
     if not u:
         raise HTTPException(status_code=404, detail="User not found")
 
     admin_user = db.query(User).filter(User.username == admin.username).first()
+    file_url, file_name = (await _save_chat_attachment(file)) if file else (None, None)
     msg = AdminChatMessage(
         user_id=user_id,
         sender_id=admin_user.id if admin_user else None,
         is_admin=True,
-        message=data.message,
+        message=message,
+        file_url=file_url,
+        file_name=file_name,
     )
     db.add(msg)
 
     _notify(
         db, user_id,
         title="New message from Mpola Support",
-        message=data.message[:150],
+        message=_preview_text(message, file_name)[:150],
         type="admin_chat_message",
         data={},
     )

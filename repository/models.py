@@ -510,10 +510,6 @@ class DisputeMessageCreate(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
 
 
-class ChatMessageCreate(BaseModel):
-    message: str = Field(..., min_length=1, max_length=2000)
-
-
 class DisputeProposalCreate(BaseModel):
     note: str = Field(..., min_length=1, max_length=2000)
     settlement_amount: Optional[float] = Field(None, gt=0)
